@@ -91,7 +91,7 @@ _HQ_CONSOLE = [
 def render_beauty(camera_actor, output_dir, width, height,
                   use_exr=False, spatial_samples=1, temporal_samples=8,
                   warmup=32, file_basename="beauty", hidden_actors=None, on_done=None,
-                  near_clip_cm=None):
+                  near_clip_cm=None, overscan=0.0):
     """対象カメラを MRQ で Beauty レンダリング（非同期）。executor を返す。
     hidden_actors を渡すと、そのアクターを非表示にしてレンダ（Beauty 品質のクリーンプレート）。
     near_clip_cm を渡すと、その距離(cm)より手前を描画時クリップする（fronto-parallel 近似の behind-matte）。
@@ -99,6 +99,11 @@ def render_beauty(camera_actor, output_dir, width, height,
     output_dir = os.path.normpath(output_dir)
     if not os.path.isdir(output_dir):
         os.makedirs(output_dir)
+
+    # 多重起動防止: 既に MRQ レンダ中なら弾く（PIE 衝突で破損 PNG が出るのを防ぐ）
+    _sub = unreal.get_editor_subsystem(unreal.MoviePipelineQueueSubsystem)
+    if _sub.is_rendering() or _KEEP.get("executor") is not None:
+        raise RuntimeError("MRQ は既にレンダリング中です。完了までお待ちください（多重起動防止）。")
 
     # 対象を非表示（レンダ後に復元）
     restore = []
@@ -138,6 +143,10 @@ def render_beauty(camera_actor, output_dir, width, height,
     out.set_editor_property("file_name_format", file_basename)   # 単一フレームなのでフレーム番号なし
     out.set_editor_property("override_existing_output", True)
     out.set_editor_property("zero_pad_frame_numbers", 4)
+    try:
+        out.set_editor_property("flush_disk_writes_per_shot", True)  # 完了前に確実に書き出す
+    except Exception:
+        pass
     # 1 フレームだけ出す（end は排他的なので [0,1) = フレーム0 のみ）
     out.set_editor_property("use_custom_playback_range", True)
     out.set_editor_property("custom_start_frame", 0)
@@ -154,6 +163,13 @@ def render_beauty(camera_actor, output_dir, width, height,
                                unreal.AntiAliasingMethod.AAM_TSR)
     except Exception:
         pass
+
+    # Overscan（元カメラを変えずレンダ時だけ余白を追加。解像度も増える＝周囲にピクセルを足す）
+    if overscan and float(overscan) > 0.0:
+        camset = cfg.find_or_add_setting_by_class(unreal.MoviePipelineCameraSetting)
+        camset.set_editor_property("override_camera_overscan", True)
+        camset.set_editor_property("overscan_percentage", float(overscan))
+        _log("overscan = %.1f%%" % (float(overscan) * 100.0))
 
     go = cfg.find_or_add_setting_by_class(unreal.MoviePipelineGameOverrideSetting)
     go.set_editor_property("use_high_quality_shadows", True)

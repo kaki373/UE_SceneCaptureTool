@@ -17,6 +17,7 @@ UE の RenderTarget は全画素を Python から高速に読み取る API が�
 """
 
 import os
+import re
 import datetime
 
 import unreal
@@ -71,6 +72,9 @@ class CaptureSettings(object):
         self.base_height = 1080            # use_camera_resolution 時の基準高さ
         self.aa_factor = 2                 # 1 / 2 / 4 （Spatial Supersample 倍率）
         self.output_dir = ""               # 出力フォルダ
+        self.take_suffix = None            # ファイル名の通し番号(例 "001")。None なら日時を使う
+        self.name_prefix = ""              # 任意名（空なら付けない）
+        self.name_include_camera = True    # カメラ名をファイル名に含めるか
 
         self.do_color = True
         self.do_depth = False
@@ -83,6 +87,7 @@ class CaptureSettings(object):
         self.objid_fill_alpha = False      # Fill + Object ID カバレッジをアルファにした RGBA も出力
         self.objid_hide_render = False     # Object ID 対象を非表示にして Fill をレンダリング
         self.do_behind_matte = False       # マット対象の向こう側だけ（窓抜き）。Beauty合成は MRQ 側
+        self.overscan = 0.0                # オーバースキャン率 f（FOVを(1+f)倍に広げる。解像度は呼び側で×(1+f)）
 
         self.depth_bit = "16bit"           # "8bit"(PNG) / "16bit"(PNG) / "exr"(float)
         self.depth_near = 0.0              # cm
@@ -156,6 +161,27 @@ def get_selected_actors():
 def _camera_component(camera_actor):
     # ACameraActor / ACineCameraActor とも camera_component プロパティを持つ
     return camera_actor.camera_component
+
+
+def set_camera_overscan_filmback(camera_actor, fx, fy):
+    """カメラの filmback を 横×(1+fx)/縦×(1+fy) に拡大して overscan（縦横独立可）。
+    焦点距離は変えないので FOV が広がり、元フレームは中央に保たれる。元の (sw,sh) を返す。"""
+    comp = camera_actor.camera_component
+    fb = comp.get_editor_property("filmback")
+    sw = float(fb.get_editor_property("sensor_width"))
+    sh = float(fb.get_editor_property("sensor_height"))
+    fb.set_editor_property("sensor_width", sw * (1.0 + float(fx)))
+    fb.set_editor_property("sensor_height", sh * (1.0 + float(fy)))
+    comp.set_editor_property("filmback", fb)
+    return (sw, sh)
+
+
+def restore_camera_filmback(camera_actor, sw, sh):
+    comp = camera_actor.camera_component
+    fb = comp.get_editor_property("filmback")
+    fb.set_editor_property("sensor_width", float(sw))
+    fb.set_editor_property("sensor_height", float(sh))
+    comp.set_editor_property("filmback", fb)
 
 
 def get_camera_settings(camera_actor):
@@ -466,9 +492,40 @@ def _timestamp():
     return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
-def _out_path(output_dir, cam_name, ts, pass_type, ext):
-    safe = "".join(c if (c.isalnum() or c in "._-") else "_" for c in cam_name)
-    return os.path.join(output_dir, "%s_%s_%s%s" % (safe, ts, pass_type, ext))
+def next_take_number(output_dir):
+    """出力フォルダ内の既存の連番(_NNN_ または _NNN.)を調べ、次の take 番号を返す。
+    設定違いを上書きせず複数出力するための通し番号。"""
+    if not output_dir or not os.path.isdir(output_dir):
+        return 1
+    mx = 0
+    pat = re.compile(r"_(\d{3})(?=[._])")
+    for f in os.listdir(output_dir):
+        if f.lower().endswith((".png", ".exr", ".json")):
+            for m in pat.finditer(f):
+                mx = max(mx, int(m.group(1)))
+    return mx + 1
+
+
+def _safe_name(s):
+    return "".join(c if (c.isalnum() or c in "._-") else "_" for c in str(s)).strip("_")
+
+
+def out_basename(settings, pass_type, take):
+    """ファイル名（拡張子なし）を 任意名_カメラ名_素材名_NNN で組む。
+    任意名(name_prefix) と カメラ名(name_include_camera) は設定で含める/含めないを切替。"""
+    parts = []
+    pre = (getattr(settings, "name_prefix", "") or "").strip()
+    if pre:
+        parts.append(_safe_name(pre))
+    if getattr(settings, "name_include_camera", True) and settings.camera_actor is not None:
+        parts.append(_safe_name(settings.camera_actor.get_actor_label()))
+    parts.append(pass_type)
+    parts.append(str(take))
+    return "_".join(parts)
+
+
+def _out_path(settings, ts, pass_type, ext):
+    return os.path.join(settings.output_dir, out_basename(settings, pass_type, ts) + ext)
 
 
 # ----------------------------------------------------------------------------
@@ -565,8 +622,7 @@ def _capture_color(world, settings, cam, w, h, ts, spawned):
     # Color パスは不透明画像として出すためアルファを 255 に固定する。
     if arr.ndim == 3 and arr.shape[2] == 4:
         arr[:, :, 3] = 255.0
-    out = _out_path(settings.output_dir, settings.camera_actor.get_actor_label(),
-                    ts, "color", ".png")
+    out = _out_path(settings, ts, "Color", ".png")
     _write_png_u8(out, arr)
     _log("Color 出力: %s" % out)
     return out
@@ -604,24 +660,24 @@ def _capture_depth(world, settings, cam, w, h, ts, spawned):
     bit = (settings.depth_bit or "16bit").lower()
 
     if bit in ("8bit", "8", "8bit_png", "8bitpng", "png8"):
-        out = _out_path(settings.output_dir, label, ts, "depth", ".png")
+        out = _out_path(settings, ts, "Depth", ".png")
         _write_png_u8(out, _normalized() * 255.0)
         _log("Depth(8bit PNG%s) 出力: %s" % (" 反転" if settings.depth_invert else "", out))
         return out
 
     if bit in ("16bit", "16", "16bit_png", "16bitpng", "png16"):
-        out = _out_path(settings.output_dir, label, ts, "depth", ".png")
+        out = _out_path(settings, ts, "Depth", ".png")
         _write_png_u16_gray(out, _normalized())
         _log("Depth(16bit PNG%s) 出力: %s" % (" 反転" if settings.depth_invert else "", out))
         return out
 
     # EXR（float リニア距離 cm をそのまま。データ用途のため反転/正規化はしない）
-    out = _out_path(settings.output_dir, label, ts, "depth", ".exr")
+    out = _out_path(settings, ts, "Depth", ".exr")
     if _write_exr_gray(out, depth):
         _log("Depth(EXR float, 生cm) 出力: %s" % out)
         return out
     # EXR ライブラリが無い → 16bit PNG（Near/Far 正規化）にフォールバック
-    out = _out_path(settings.output_dir, label, ts, "depth", ".png")
+    out = _out_path(settings, ts, "Depth", ".png")
     _write_png_u16_gray(out, _normalized())
     _warn("EXR 書き出しライブラリが無いため 16bit PNG で出力しました: %s" % out)
     return out
@@ -690,7 +746,7 @@ def _capture_matte(world, settings, cam, w, h, ts, spawned):
         mask = _downscale(mask, aa)  # 縁が AA される
         label = settings.camera_actor.get_actor_label()
         outs = []
-        out = _out_path(settings.output_dir, label, ts, "matte", ".png")
+        out = _out_path(settings, ts, "Matte", ".png")
         _write_png_u8(out, mask)
         _log("Matte(白黒) 出力: %s" % out)
         outs.append(out)
@@ -698,7 +754,7 @@ def _capture_matte(world, settings, cam, w, h, ts, spawned):
         if getattr(settings, "matte_fill_alpha", False):
             rgb = _render_fill_rgb(world, settings, cam, w, h, aa, spawned)
             rgba = _np.dstack([rgb, mask[:, :, None]]) if mask.ndim == 2 else _np.dstack([rgb, mask])
-            out_fill = _out_path(settings.output_dir, label, ts, "matte_fill", ".png")
+            out_fill = _out_path(settings, ts, "MatteBeauty", ".png")
             _write_png_u8(out_fill, rgba)
             _log("Matte(Fill+α) 出力: %s" % out_fill)
             outs.append(out_fill)
@@ -756,7 +812,7 @@ def _capture_object_id(world, settings, cam, w, h, ts, spawned):
 
     label0 = settings.camera_actor.get_actor_label()
     outs = []
-    out = _out_path(settings.output_dir, label0, ts, "objectid", ".png")
+    out = _out_path(settings, ts, "ObjectID", ".png")
     _write_png_u8(out, id_rgb)
     try:
         with open(os.path.splitext(out)[0] + ".json", "w", encoding="utf-8") as f:
@@ -772,7 +828,7 @@ def _capture_object_id(world, settings, cam, w, h, ts, spawned):
         rgb = _render_fill_rgb(world, settings, cam, w, h, 1, spawned)  # objid は等倍運用
         alpha = (coverage.astype(_np.float32) * 255.0)[:, :, None]
         rgba = _np.dstack([rgb, alpha])
-        out_fa = _out_path(settings.output_dir, label0, ts, "objectid_fill", ".png")
+        out_fa = _out_path(settings, ts, "ObjectIDBeauty", ".png")
         _write_png_u8(out_fa, rgba)
         _log("Object ID(Fill+α) 出力: %s" % out_fa)
         outs.append(out_fa)
@@ -789,7 +845,7 @@ def _capture_object_id(world, settings, cam, w, h, ts, spawned):
         arr = _downscale(arr, aa)
         if arr.ndim == 3 and arr.shape[2] == 4:
             arr[:, :, 3] = 255
-        out_hd = _out_path(settings.output_dir, label0, ts, "objectid_hidden", ".png")
+        out_hd = _out_path(settings, ts, "ObjectIDClean", ".png")
         _write_png_u8(out_hd, arr)
         _log("Object ID 非表示レンダー 出力: %s" % out_hd)
         outs.append(out_hd)
@@ -922,7 +978,7 @@ def capture_behind_matte(world, settings, cam, w, h, ts, spawned):
     rgb = rgb[:, :, :3] if (rgb.ndim == 3 and rgb.shape[2] >= 3) else rgb
 
     # 4a) 全画面クリップ版（マット面より手前は全部消える）
-    out_full = _out_path(settings.output_dir, label, ts, "behindmatte_full", ".png")
+    out_full = _out_path(settings, ts, "BehindFull", ".png")
     _write_png_u8(out_full, rgb)
     _log("behind-matte(全画面クリップ) 出力: %s" % out_full)
     outs.append(out_full)
@@ -930,7 +986,7 @@ def capture_behind_matte(world, settings, cam, w, h, ts, spawned):
     # 4b) マット形状に切り抜いた RGBA（α=マットシルエット）
     alpha = _downscale(matte_vis * 255.0, aa)
     rgba = _np.dstack([rgb, alpha[:, :, None]]) if alpha.ndim == 2 else _np.dstack([rgb, alpha])
-    out = _out_path(settings.output_dir, label, ts, "behindmatte", ".png")
+    out = _out_path(settings, ts, "Behind", ".png")
     _write_png_u8(out, rgba)
     _log("behind-matte(マット形状切抜き) 出力: %s" % out)
     outs.append(out)
@@ -953,8 +1009,7 @@ def capture_behind_matte_mask(world, settings, cam, w, h, ts, spawned):
     grp = _read_rt_raw_r(world, rt, w * aa, h * aa)
     mask = (grp < 60000.0).astype(_np.float32) * 255.0     # 全シルエット（手前遮蔽は無視）
     mask = _downscale(mask, aa)
-    out = _out_path(settings.output_dir, settings.camera_actor.get_actor_label(),
-                    ts, "behindmatte_mask", ".png")
+    out = _out_path(settings, ts, "BehindMask", ".png")
     _write_png_u8(out, mask)
     _log("behind-matte シルエット出力: %s" % out)
     return out
@@ -978,9 +1033,11 @@ def compose_rgba(rgb_path, mask_path, out_path):
     return out_path
 
 
-def blend_with_beauty(beauty_path, matte_path=None, objid_path=None):
+def blend_with_beauty(beauty_path, matte_path=None, objid_path=None,
+                      matte_out=None, objid_out=None):
     """MRQ Beauty(レンダ画像) の RGB に、matte/objid のカバレッジをアルファとして合成し
-    RGBA cutout を書き出す（Fill ではなく Beauty とブレンドする版）。出力パスのリストを返す。"""
+    RGBA cutout を書き出す（Fill ではなく Beauty とブレンドする版）。出力パスのリストを返す。
+    matte_out / objid_out で出力名を明示できる（クリーンな素材名用）。"""
     outs = []
     if not (_HAS_NUMPY and _HAS_PIL):
         return outs
@@ -998,14 +1055,14 @@ def blend_with_beauty(beauty_path, matte_path=None, objid_path=None):
 
     if matte_path and os.path.isfile(matte_path):
         m = _fit(_np.asarray(_PILImage.open(matte_path).convert("L"), dtype=_np.float32))
-        out = matte_path.replace("_matte.png", "_matte_fill.png")
+        out = matte_out or (matte_path[:-4] + "_fill.png")
         _write_png_u8(out, _np.dstack([brgb, m]))
         _log("Matte(Beauty+α) 出力: %s" % out)
         outs.append(out)
     if objid_path and os.path.isfile(objid_path):
         idimg = _np.asarray(_PILImage.open(objid_path).convert("RGB"), dtype=_np.float32)
         cov = _fit((idimg.max(axis=2) > 1.0).astype(_np.float32) * 255.0)
-        out = objid_path.replace("_objectid.png", "_objectid_fill.png")
+        out = objid_out or (objid_path[:-4] + "_fill.png")
         _write_png_u8(out, _np.dstack([brgb, cov]))
         _log("Object ID(Beauty+α) 出力: %s" % out)
         outs.append(out)
@@ -1035,7 +1092,9 @@ def run_capture(settings):
 
     cam = get_camera_settings(settings.camera_actor)
     w, h = _resolve_resolution(settings, cam)
-    ts = _timestamp()
+    # Overscan はカメラの filmback を呼び側で一時拡大して実現するため、ここでは何もしない
+    # （get_camera_settings が拡大後の FOV を読み、RT のアスペクトで縦横が決まる）。
+    ts = getattr(settings, "take_suffix", None) or _timestamp()
     spawned = []
     outputs = []
 
