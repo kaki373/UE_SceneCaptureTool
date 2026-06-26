@@ -1,0 +1,25 @@
+# UE Scene Capture Tool - Python dependencies
+#
+# Install into Unreal Engine 5.7's bundled Python, NOT the OS Python:
+#   "<UE_5.7>/Engine/Binaries/ThirdParty/Python3/Win64/python.exe" -m pip install -r requirements.txt
+#
+# Or from inside the editor (Output Log console set to "Python"):
+#   import subprocess, sys
+#   subprocess.check_call([sys.executable, "-m", "pip", "install", "numpy", "pillow"])
+
+# --- Required ---
+numpy
+Pillow
+
+# --- Optional: only needed to output Z-Depth as EXR (float). ---
+# Any one of these enables EXR; without them, 16bit depth falls back to 16bit PNG.
+# imageio
+# OpenEXR
+# Imath
+# opencv-python
+
+# --- Not pip-installable (environment requirements) ---
+# - Unreal Engine 5.7 (editor + bundled Python, Python Editor Script Plugin)
+# - Movie Render Queue plugin enabled (required for Beauty / Behind matte)
+# - tkinter / tcl-tk: ships with most Python builds; only needed for the GUI
+#   (falls back to CONFIG/CUI mode if absent)
