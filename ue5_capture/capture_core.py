@@ -88,6 +88,7 @@ class CaptureSettings(object):
         self.objid_hide_render = False     # Object ID 対象を非表示にして Fill をレンダリング
         self.do_behind_matte = False       # マット対象の向こう側だけ（窓抜き）。Beauty合成は MRQ 側
         self.overscan = 0.0                # オーバースキャン率 f（FOVを(1+f)倍に広げる。解像度は呼び側で×(1+f)）
+        self.fog_off = False               # True で Fog を OFF にして書き出す
 
         self.depth_bit = "16bit"           # "8bit"(PNG) / "16bit"(PNG) / "exr"(float)
         self.depth_near = 0.0              # cm
@@ -217,11 +218,15 @@ _EDITOR_ONLY_SHOW_FLAGS = [
 ]
 
 
-def _apply_game_show_flags(comp):
-    """キャプチャコンポーネントのエディタ専用表示を OFF にする（ゲーム表示相当）。"""
+def _apply_game_show_flags(comp, fog_off=False):
+    """キャプチャコンポーネントのエディタ専用表示を OFF にする（ゲーム表示相当）。
+    fog_off=True なら Fog / 大気 / ボリューメトリックフォグ も OFF にする。"""
     try:
+        names = list(_EDITOR_ONLY_SHOW_FLAGS)
+        if fog_off:
+            names += ["Fog", "AtmosphericFog", "VolumetricFog"]
         settings = []
-        for name in _EDITOR_ONLY_SHOW_FLAGS:
+        for name in names:
             try:
                 fs = unreal.EngineShowFlagsSetting()
                 fs.set_editor_property("show_flag_name", name)
@@ -237,9 +242,10 @@ def _apply_game_show_flags(comp):
 
 def _spawn_capture(world, transform, fov, rt, source,
                    show_only_actors=None, hidden_actors=None, post_process=None,
-                   clip_base=None, clip_normal=None):
+                   clip_base=None, clip_normal=None, fog_off=False):
     """SceneCapture2D アクターを Spawn して1フレームキャプチャし、アクターを返す。
-    clip_base/clip_normal を渡すと、その平面の normal-負側（手前）を描画時にクリップする。"""
+    clip_base/clip_normal を渡すと、その平面の normal-負側（手前）を描画時にクリップする。
+    fog_off=True で Fog を OFF にして撮る。"""
     loc = transform.translation
     rot = transform.rotation.rotator()
     actor = _actor_subsystem().spawn_actor_from_class(unreal.SceneCapture2D, loc, rot)
@@ -252,7 +258,7 @@ def _spawn_capture(world, transform, fov, rt, source,
     comp.set_editor_property("capture_source", source)
     comp.set_editor_property("capture_every_frame", False)
     comp.set_editor_property("capture_on_movement", False)
-    _apply_game_show_flags(comp)   # エディタ専用表示（アイコン/ギズモ/グリッド等）を消す
+    _apply_game_show_flags(comp, fog_off=fog_off)   # エディタ専用表示（＋任意でFog）を消す
 
     if clip_base is not None and clip_normal is not None:
         # クリッププレーン: normal の指す側（＝奥）を残し、反対側（＝手前）を描画時に除去する。
@@ -613,7 +619,8 @@ def _capture_color(world, settings, cam, w, h, ts, spawned):
                              unreal.TextureRenderTargetFormat.RTF_RGBA8, False)
     actor = _spawn_capture(world, cam["transform"], cam["fov"], rt,
                            unreal.SceneCaptureSource.SCS_FINAL_COLOR_LDR,
-                           hidden_actors=hidden, post_process=pp)
+                           hidden_actors=hidden, post_process=pp,
+                           fog_off=getattr(settings, "fog_off", False))
     spawned.append(actor)
     tmp = _export_rt(world, rt, ".png")
     arr = _read_ldr(tmp)

@@ -91,7 +91,7 @@ _HQ_CONSOLE = [
 def render_beauty(camera_actor, output_dir, width, height,
                   use_exr=False, spatial_samples=1, temporal_samples=8,
                   warmup=32, file_basename="beauty", hidden_actors=None, on_done=None,
-                  near_clip_cm=None, overscan=0.0):
+                  near_clip_cm=None, overscan=0.0, fog_off=False):
     """対象カメラを MRQ で Beauty レンダリング（非同期）。executor を返す。
     hidden_actors を渡すと、そのアクターを非表示にしてレンダ（Beauty 品質のクリーンプレート）。
     near_clip_cm を渡すと、その距離(cm)より手前を描画時クリップする（fronto-parallel 近似の behind-matte）。
@@ -187,6 +187,9 @@ def render_beauty(camera_actor, output_dir, width, height,
         # マット面までの距離より手前をクリップ（fronto-parallel 近似）。形状は後段でαマスク。
         cmds.append("r.SetNearClipPlane %f" % float(near_clip_cm))
         _log("near clip = %.1f cm" % float(near_clip_cm))
+    if fog_off:
+        cmds += ["r.Fog 0", "r.VolumetricFog 0"]   # Fog を OFF にして書き出す
+        _log("fog off")
     cv = cfg.find_or_add_setting_by_class(unreal.MoviePipelineConsoleVariableSetting)
     cv.set_editor_property("start_console_commands", cmds)
 

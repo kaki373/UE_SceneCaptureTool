@@ -253,11 +253,15 @@ class CaptureWindow(object):
         ttk.Label(frm, text="Beauty (MRQ = ビューポート露出＋シーケンサ品質)").grid(
             row=row, column=0, columnspan=3, sticky="w", padx=8)
         row += 1
+        self.fog_off_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frm, text="  Fogなし", variable=self.fog_off_var).grid(
+            row=row, column=0, columnspan=3, sticky="w", padx=24)
+        row += 1
         mrqf = ttk.Frame(frm)
-        ttk.Label(mrqf, text="Warmup:").pack(side="left")
+        ttk.Label(mrqf, text="ウォームアップ:").pack(side="left")
         self.mrq_warmup_var = tk.StringVar(value="32")
         tk.Entry(mrqf, textvariable=self.mrq_warmup_var, width=5).pack(side="left", padx=2)
-        ttk.Label(mrqf, text="Temporal:").pack(side="left", padx=(8, 0))
+        ttk.Label(mrqf, text="サンプリングフレーム:").pack(side="left", padx=(8, 0))
         self.mrq_ts_var = tk.StringVar(value="8")
         tk.Entry(mrqf, textvariable=self.mrq_ts_var, width=5).pack(side="left", padx=2)
         self.mrq_exr_var = tk.BooleanVar(value=False)
@@ -483,7 +487,8 @@ class CaptureWindow(object):
                                           temporal_samples=ts, warmup=warm,
                                           file_basename=j["base"],
                                           hidden_actors=j["hidden"],
-                                          near_clip_cm=j.get("near_clip"), on_done=_jdone)
+                                          near_clip_cm=j.get("near_clip"),
+                                          fog_off=self.fog_off_var.get(), on_done=_jdone)
             except Exception as e:
                 self.status_var.set("追加 MRQ 失敗: %s" % e)
 
@@ -512,7 +517,7 @@ class CaptureWindow(object):
                                       temporal_samples=ts, warmup=warm,
                                       file_basename=self._basename("Beauty", suf, cam),
                                       hidden_actors=beauty_hidden,
-                                      on_done=_after_beauty)
+                                      fog_off=self.fog_off_var.get(), on_done=_after_beauty)
         except Exception as e:
             _restore_fb()
             self.status_var.set("MRQ 起動失敗: %s" % e)
@@ -740,6 +745,7 @@ class CaptureWindow(object):
                 "mrq_ts": self.mrq_ts_var.get(),
                 "mrq_exr": self.mrq_exr_var.get(),
                 "mrq_camasp": self.mrq_camasp_var.get(),
+                "fog_off": self.fog_off_var.get(),
             }
             with open(self._settings_path(), "w", encoding="utf-8") as f:
                 json.dump(state, f, ensure_ascii=False, indent=2)
@@ -808,6 +814,7 @@ class CaptureWindow(object):
         _setvar(self.mrq_ts_var, "mrq_ts")
         _setvar(self.mrq_exr_var, "mrq_exr")
         _setvar(self.mrq_camasp_var, "mrq_camasp")
+        _setvar(self.fog_off_var, "fog_off")
 
     def _collect_settings(self):
         s = core.CaptureSettings()
@@ -822,6 +829,7 @@ class CaptureWindow(object):
         s.output_dir = self.out_var.get().strip()
         s.name_prefix = self.name_custom_var.get().strip() if self.name_usecustom_var.get() else ""
         s.name_include_camera = self.name_usecam_var.get()
+        s.fog_off = self.fog_off_var.get()
         s.do_color = self.color_var.get()
         s.do_depth = self.depth_var.get()
         s.do_matte = self.matte_var.get()
