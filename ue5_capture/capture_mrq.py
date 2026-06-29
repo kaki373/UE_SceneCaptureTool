@@ -210,6 +210,14 @@ def render_beauty(camera_actor, output_dir, width, height,
                 unreal.SystemLibrary.execute_console_command(w, "r.SetNearClipPlane 10")
             except Exception:
                 pass
+        if fog_off:
+            # r.Fog/r.VolumetricFog もグローバルに残るので必ず ON へ戻す
+            try:
+                w = _editor_world()
+                unreal.SystemLibrary.execute_console_command(w, "r.Fog 1")
+                unreal.SystemLibrary.execute_console_command(w, "r.VolumetricFog 1")
+            except Exception:
+                pass
         _KEEP.clear()                           # 先にクリア（on_done がチェインで次の render を張る場合があるため）
         if on_done:
             try:
