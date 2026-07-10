@@ -223,8 +223,8 @@ class CaptureWindow(object):
         fmtf = ttk.Frame(frm)
         ttk.Label(fmtf, text="出力形式:").pack(side="left")
         self.beauty_fmt_var = tk.StringVar(master=self.root, value="PNG 8bit")
-        ttk.Combobox(fmtf, textvariable=self.beauty_fmt_var, state="readonly", width=11,
-                     values=["PNG 8bit", "PNG 16bit", "JPG", "EXR (float)"]).pack(
+        ttk.Combobox(fmtf, textvariable=self.beauty_fmt_var, state="readonly", width=14,
+                     values=["PNG 8bit", "JPG 8bit", "EXR 16bit (float)"]).pack(
             side="left", padx=4)
         ttk.Label(fmtf, text="（Beauty の形式。Matte系合成/ObjectID は PNG）",
                   foreground="#888").pack(side="left")
@@ -579,13 +579,9 @@ class CaptureWindow(object):
         except Exception as e:
             self.status_var.set("データパス出力でエラー: %s" % e)
 
-        # Beauty の出力形式（PNG 16bit は MRQ 非対応のため 8bit にフォールバック）
-        fmt_label = self.beauty_fmt_var.get()
-        if fmt_label == "PNG 16bit":
-            self.status_var.set("PNG 16bit は Beauty 未対応のため PNG 8bit で出力します"
-                                "（Z-Depth は Format で 16bit 可）")
-            fmt_label = "PNG 8bit"
-        img_fmt = {"PNG 8bit": "png", "JPG": "jpg", "EXR (float)": "exr"}.get(fmt_label, "png")
+        # Beauty の出力形式（実際に出せるものだけを提示している）
+        img_fmt = {"PNG 8bit": "png", "JPG 8bit": "jpg",
+                   "EXR 16bit (float)": "exr"}.get(self.beauty_fmt_var.get(), "png")
         beauty_path = os.path.join(out, _name("Beauty") +
                                    {"png": ".png", "jpg": ".jpg", "exr": ".exr"}[img_fmt])
         # Matte 系合成は PIL で読める画像が必要。EXR のときは PNG も内部出力して使う。
@@ -1339,7 +1335,7 @@ class CaptureWindow(object):
         _setvar(self.near_var, "near"); _setvar(self.far_var, "far")
         _setvar(self.mrq_warmup_var, "mrq_warmup")
         _setvar(self.mrq_ts_var, "mrq_ts")
-        if st.get("beauty_fmt") in ("PNG 8bit", "PNG 16bit", "JPG", "EXR (float)"):
+        if st.get("beauty_fmt") in ("PNG 8bit", "JPG 8bit", "EXR 16bit (float)"):
             self.beauty_fmt_var.set(st["beauty_fmt"])
         _setvar(self.mrq_camasp_var, "mrq_camasp")
         _setvar(self.fog_off_var, "fog_off")

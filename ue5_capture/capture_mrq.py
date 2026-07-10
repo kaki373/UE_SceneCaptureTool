@@ -125,7 +125,8 @@ def render_beauty(camera_actor, output_dir, width, height,
 
     try:
         return _start_render(sub, camera_actor, output_dir, width, height,
-                             use_exr, spatial_samples, temporal_samples, warmup,
+                             use_exr, image_format, also_png,
+                             spatial_samples, temporal_samples, warmup,
                              file_basename, on_done, near_clip_cm, overscan,
                              fog_off, _restore_hidden)
     except Exception:
@@ -137,7 +138,8 @@ def render_beauty(camera_actor, output_dir, width, height,
 
 
 def _start_render(sub, camera_actor, output_dir, width, height,
-                  use_exr, spatial_samples, temporal_samples, warmup,
+                  use_exr, image_format, also_png,
+                  spatial_samples, temporal_samples, warmup,
                   file_basename, on_done, near_clip_cm, overscan,
                   fog_off, restore_hidden):
     seq, seq_path = _create_temp_sequence(camera_actor)
