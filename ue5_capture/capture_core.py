@@ -501,14 +501,20 @@ def _timestamp():
 
 
 def next_take_number(output_dir):
-    """出力フォルダ内の既存の連番(_NNN_ または _NNN.)を調べ、次の take 番号を返す。
-    設定違いを上書きせず複数出力するための通し番号。"""
+    """出力フォルダ内の既存の連番(_NNN_ / _NNN. / フォルダ名末尾 _NNN)を調べ、
+    次の take 番号を返す。設定違いを上書きせず複数出力するための通し番号。
+    テイク毎サブフォルダ（シーケンスレンダ）もフォルダ名で走査する。"""
     if not output_dir or not os.path.isdir(output_dir):
         return 1
     mx = 0
     pat = re.compile(r"_(\d{3})(?=[._])")
+    dirpat = re.compile(r"_(\d{3})$")
     for f in os.listdir(output_dir):
-        if f.lower().endswith((".png", ".exr", ".json")):
+        if os.path.isdir(os.path.join(output_dir, f)):
+            m = dirpat.search(f)
+            if m:
+                mx = max(mx, int(m.group(1)))
+        elif f.lower().endswith((".png", ".exr", ".json", ".mp4")):
             for m in pat.finditer(f):
                 mx = max(mx, int(m.group(1)))
     return mx + 1
@@ -1001,6 +1007,82 @@ def blend_with_beauty(beauty_path, matte_path=None, objid_path=None,
         _log("Object ID(Beauty+α) 出力: %s" % out)
         outs.append(out)
     return outs
+
+
+# ----------------------------------------------------------------------------
+# 一時 正規化深度 PostProcess マテリアル（シーケンスレンダの Z-Depth AOV 用）
+#   MRQ の additional_post_process_materials は正規化されない生深度だと
+#   8bit PNG / MP4 で白飛びするため、(SceneDepth - near)/(far - near) を
+#   0..1 に clamp したマテリアルをレンダ時に一時生成し、完了後に削除する。
+# ----------------------------------------------------------------------------
+_TMP_MAT_PKG = "/Game/_UE5Capture_Tmp"
+_TMP_MAT_NAME = "M_UE5Cap_DepthNorm"
+
+
+def delete_temp_depth_material():
+    full = _TMP_MAT_PKG + "/" + _TMP_MAT_NAME
+    try:
+        if not unreal.EditorAssetLibrary.does_asset_exist(full):
+            return
+        # 参照が残っていると delete_asset が False を返すため GC 後に再試行する
+        if not unreal.EditorAssetLibrary.delete_asset(full):
+            unreal.SystemLibrary.collect_garbage()
+            if not unreal.EditorAssetLibrary.delete_asset(full):
+                _warn("一時深度マテリアルを削除できませんでした: %s" % full)
+    except Exception as e:
+        _warn("一時深度マテリアル削除に失敗: %s" % e)
+
+
+def create_temp_depth_material(near, far, invert=True):
+    """正規化深度を EmissiveColor に出す PostProcess マテリアルを用意して返す。
+    invert=True で 手前=白/奥=黒（既存 Depth パスと同じ既定）。
+    既存の一時アセットがあれば再利用して式だけ作り直す（undo バッファ等の参照で
+    delete_asset が失敗することがあるため、削除前提にしない）。
+    注意: MRQ 経由の PNG/MP4 は表示用エンコード（sRGB）で書かれるため視覚確認用。
+    リニア厳密な深度が要る場合は従来の単発 Depth パス（16bit PNG）を使う。"""
+    full = _TMP_MAT_PKG + "/" + _TMP_MAT_NAME
+    mat = None
+    if unreal.EditorAssetLibrary.does_asset_exist(full):
+        mat = unreal.EditorAssetLibrary.load_asset(full)
+    if mat is None:
+        at = unreal.AssetToolsHelpers.get_asset_tools()
+        mat = at.create_asset(_TMP_MAT_NAME, _TMP_MAT_PKG,
+                              unreal.Material, unreal.MaterialFactoryNew())
+    if mat is None:
+        raise RuntimeError("一時深度マテリアルの生成に失敗しました。")
+    mat.set_editor_property("material_domain", unreal.MaterialDomain.MD_POST_PROCESS)
+    mat.set_editor_property(
+        "blendable_location",
+        unreal.BlendableLocation.BL_SCENE_COLOR_AFTER_TONEMAPPING)
+
+    MEL = unreal.MaterialEditingLibrary
+    MEL.delete_all_material_expressions(mat)   # 再利用時は式を全消しして作り直す
+    depth = MEL.create_material_expression(mat, unreal.MaterialExpressionSceneDepth, -800, 0)
+    c_near = MEL.create_material_expression(mat, unreal.MaterialExpressionConstant, -800, 200)
+    c_near.set_editor_property("r", float(near))
+    sub = MEL.create_material_expression(mat, unreal.MaterialExpressionSubtract, -600, 100)
+    MEL.connect_material_expressions(depth, "", sub, "A")
+    MEL.connect_material_expressions(c_near, "", sub, "B")
+    c_inv = MEL.create_material_expression(mat, unreal.MaterialExpressionConstant, -600, 300)
+    c_inv.set_editor_property("r", 1.0 / max(float(far) - float(near), 1e-6))
+    mul = MEL.create_material_expression(mat, unreal.MaterialExpressionMultiply, -400, 200)
+    MEL.connect_material_expressions(sub, "", mul, "A")
+    MEL.connect_material_expressions(c_inv, "", mul, "B")
+    clamp = MEL.create_material_expression(mat, unreal.MaterialExpressionClamp, -250, 200)
+    MEL.connect_material_expressions(mul, "", clamp, "")
+    last = clamp
+    if invert:
+        inv = MEL.create_material_expression(mat, unreal.MaterialExpressionOneMinus, -120, 200)
+        MEL.connect_material_expressions(clamp, "", inv, "")
+        last = inv
+    MEL.connect_material_property(last, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+    MEL.recompile_material(mat)
+    try:
+        unreal.EditorAssetLibrary.save_loaded_asset(mat)
+    except Exception as e:
+        _warn("一時深度マテリアルの保存に失敗（未保存のまま続行）: %s" % e)
+    _log("一時深度マテリアル生成: near=%.0f far=%.0f invert=%s" % (near, far, invert))
+    return mat
 
 
 # ----------------------------------------------------------------------------
