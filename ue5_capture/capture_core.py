@@ -882,6 +882,109 @@ def composite_behind_in_matte(world, cam, matte_actors, beauty_path, behind_path
     return out_path
 
 
+def find_ffmpeg(explicit=None):
+    """ffmpeg 実行ファイルを探す。優先: 明示パス → imageio_ffmpeg 同梱 → PATH。"""
+    import glob as _glob
+    import shutil as _shutil
+    if explicit and os.path.isfile(explicit):
+        return explicit
+    pat = os.path.expanduser(
+        r"~\AppData\Local\Programs\Python\*\Lib\site-packages"
+        r"\imageio_ffmpeg\binaries\ffmpeg-*.exe")
+    hits = sorted(_glob.glob(pat))
+    if hits:
+        return hits[-1]
+    return _shutil.which("ffmpeg")
+
+
+def encode_mp4_cmd(ffmpeg, output_dir, name_body, pass_name, take_str,
+                   fps_num, fps_den, crf, start_number):
+    """PNG 連番 → H.264 MP4 の ffmpeg コマンド（リスト）と出力パスを返す。
+    フレームレートはシーケンスの Display Rate をそのまま使う（fps ずれ防止）。"""
+    fps = "%d/%d" % (int(fps_num), max(int(fps_den), 1))
+    src = os.path.join(output_dir, "%s_%s_%s.%%04d.png" % (name_body, pass_name, take_str))
+    dst = os.path.join(output_dir, "%s_%s_%s.mp4" % (name_body, pass_name, take_str))
+    return [ffmpeg, "-y", "-framerate", fps, "-start_number", str(int(start_number)),
+            "-i", src, "-c:v", "libx264", "-crf", str(int(crf)),
+            "-pix_fmt", "yuv420p", "-r", fps, dst], dst
+
+
+def trim_sequence_frames(output_dir, name_body, take_str, pass_names, start, end_excl):
+    """[start, end_excl) 範囲外のフレーム PNG を削除する。
+    MRQ はテンポラルサンプル使用時に終端へ1フレーム余分に書くことがあるため、
+    合成・エンコード前に必ず範囲を揃える。削除数を返す。"""
+    n = 0
+    for pn in pass_names:
+        pat = re.compile(re.escape("%s_%s_%s." % (name_body, pn, take_str)) + r"(\d+)\.png$")
+        for f in os.listdir(output_dir):
+            m = pat.match(f)
+            if m and not (int(start) <= int(m.group(1)) < int(end_excl)):
+                try:
+                    os.remove(os.path.join(output_dir, f))
+                    n += 1
+                except Exception:
+                    pass
+    if n:
+        _log("範囲外フレームを削除: %d" % n)
+    return n
+
+
+def delete_pass_frames(output_dir, name_body, take_str, pass_names):
+    """指定パスのフレーム PNG を削除（中間素材や PNG 不要指定の後始末）。"""
+    n = 0
+    for pn in pass_names:
+        pat = re.compile(re.escape("%s_%s_%s." % (name_body, pn, take_str)) + r"\d+\.png$")
+        for f in os.listdir(output_dir):
+            if pat.match(f):
+                try:
+                    os.remove(os.path.join(output_dir, f))
+                    n += 1
+                except Exception:
+                    pass
+    return n
+
+
+def composite_mattefront_sequence(output_dir, name_body, take_str):
+    """Beauty（クリーン）に Matte をアルファとして焼いた MatteBeauty 連番を書く
+    （Matteの前＝マット部分が穴。選択=黒がアルファ0）。RGB はアルファ乗算済みなので
+    MP4 化しても穴が黒になる。出力フレーム数を返す。"""
+    if not (_HAS_NUMPY and _HAS_PIL):
+        return 0
+    pat = re.compile(re.escape("%s_Beauty_%s." % (name_body, take_str)) + r"(\d+)\.png$")
+    n = 0
+    for f in sorted(os.listdir(output_dir)):
+        m = pat.match(f)
+        if not m:
+            continue
+        fr = m.group(1)
+        matte_p = os.path.join(output_dir, "%s_Matte_%s.%s.png" % (name_body, take_str, fr))
+        if not os.path.isfile(matte_p):
+            _warn("MatteBeauty 合成: フレーム %s の Matte が無い" % fr)
+            continue
+        beauty = _np.asarray(_PILImage.open(os.path.join(output_dir, f)).convert("RGB"),
+                             dtype=_np.float32)
+        matte = _np.asarray(_PILImage.open(matte_p).convert("L"), dtype=_np.float32)
+        rgb = beauty * (matte / 255.0)[:, :, None]
+        rgba = _np.dstack([rgb, matte])
+        out = os.path.join(output_dir, "%s_MatteBeauty_%s.%s.png" % (name_body, take_str, fr))
+        _write_png_u8(out, rgba)
+        n += 1
+    _log("MatteBeauty 合成: %d フレーム出力" % n)
+    return n
+
+
+def objid_stencil_color(stencil):
+    """ステンシル値の ObjectID 色 (r,g,b 0-255)。ObjectID マテリアルの
+    コサインパレットと同じ式を sRGB エンコードした値（PNG/MP4 は表示用
+    エンコードで書かれるため、マニフェストもエンコード後の色で合わせる）。"""
+    h = (stencil * 0.6180339887498949) % 1.0
+    def _c(x):
+        lin = 0.5 + 0.5 * math.cos(2.0 * math.pi * x)
+        srgb = lin * 12.92 if lin <= 0.0031308 else 1.055 * (lin ** (1.0 / 2.4)) - 0.055
+        return int(round(255.0 * max(0.0, min(1.0, srgb))))
+    return (_c(h), _c(h - 1.0 / 3.0), _c(h - 2.0 / 3.0))
+
+
 def composite_behind_sequence(output_dir, name_body, take_str):
     """シーケンスレンダの behind 合成。各フレームで Matte（選択=黒）をマスクに、
     黒い部分は BehindPlate、白い部分は Beauty を合成した Behind 連番を書く。
@@ -1116,6 +1219,60 @@ def create_temp_depth_material(near, far, invert=True):
     return mat
 
 
+# --- マテリアルノード構築の共通ヘルパ（接続失敗は例外にする） ---
+def _mx_conn(frm, out_name, to, in_name):
+    """接続失敗（ピン名不一致）は False が返るだけなので必ず検証する。"""
+    MEL = unreal.MaterialEditingLibrary
+    if MEL.connect_material_expressions(frm, out_name, to, in_name):
+        return
+    if out_name and MEL.connect_material_expressions(frm, "", to, in_name):
+        return
+    raise RuntimeError("マテリアルのノード接続に失敗: %s.%s -> %s.%s"
+                       % (type(frm).__name__, out_name, type(to).__name__, in_name))
+
+
+def _mx_expr(mat, cls, x, y):
+    return unreal.MaterialEditingLibrary.create_material_expression(mat, cls, x, y)
+
+
+def _mx_const(mat, v, x, y):
+    c = _mx_expr(mat, unreal.MaterialExpressionConstant, x, y)
+    c.set_editor_property("r", float(v))
+    return c
+
+
+def _mx_scene_r(mat, tex_id, x, y):
+    """SceneTexture の R チャンネルを取り出すノード対を作って Mask ノードを返す。"""
+    st = _mx_expr(mat, unreal.MaterialExpressionSceneTexture, x, y)
+    st.set_editor_property("scene_texture_id", tex_id)
+    m = _mx_expr(mat, unreal.MaterialExpressionComponentMask, x + 150, y)
+    m.set_editor_property("r", True)
+    m.set_editor_property("g", False)
+    m.set_editor_property("b", False)
+    m.set_editor_property("a", False)
+    _mx_conn(st, "Color", m, "")
+    return m
+
+
+def _mx_get_or_create_pp_material(name):
+    """一時 PostProcess マテリアルを取得または新規作成し、式を全消しして返す。"""
+    full = _TMP_MAT_PKG + "/" + name
+    mat = None
+    if unreal.EditorAssetLibrary.does_asset_exist(full):
+        mat = unreal.EditorAssetLibrary.load_asset(full)
+    if mat is None:
+        at = unreal.AssetToolsHelpers.get_asset_tools()
+        mat = at.create_asset(name, _TMP_MAT_PKG, unreal.Material, unreal.MaterialFactoryNew())
+    if mat is None:
+        raise RuntimeError("一時マテリアルの生成に失敗しました: %s" % name)
+    mat.set_editor_property("material_domain", unreal.MaterialDomain.MD_POST_PROCESS)
+    mat.set_editor_property(
+        "blendable_location",
+        unreal.BlendableLocation.BL_SCENE_COLOR_AFTER_TONEMAPPING)
+    unreal.MaterialEditingLibrary.delete_all_material_expressions(mat)
+    return mat
+
+
 _TMP_MATTE_NAME = "M_UE5Cap_Matte"
 
 
@@ -1138,48 +1295,11 @@ def create_temp_matte_material():
     対象アクターは render_in_main_pass=False + render_custom_depth=True にしておく前提
     （ビューティには写らず CustomDepth にだけ写る＝クリーンプレートと両立）。
     既存の一時アセットがあれば再利用して式だけ作り直す。"""
-    full = _TMP_MAT_PKG + "/" + _TMP_MATTE_NAME
-    mat = None
-    if unreal.EditorAssetLibrary.does_asset_exist(full):
-        mat = unreal.EditorAssetLibrary.load_asset(full)
-    if mat is None:
-        at = unreal.AssetToolsHelpers.get_asset_tools()
-        mat = at.create_asset(_TMP_MATTE_NAME, _TMP_MAT_PKG,
-                              unreal.Material, unreal.MaterialFactoryNew())
-    if mat is None:
-        raise RuntimeError("一時 Matte マテリアルの生成に失敗しました。")
-    mat.set_editor_property("material_domain", unreal.MaterialDomain.MD_POST_PROCESS)
-    mat.set_editor_property(
-        "blendable_location",
-        unreal.BlendableLocation.BL_SCENE_COLOR_AFTER_TONEMAPPING)
-
+    mat = _mx_get_or_create_pp_material(_TMP_MATTE_NAME)
     MEL = unreal.MaterialEditingLibrary
-    MEL.delete_all_material_expressions(mat)
-
-    def _conn(frm, out_name, to, in_name):
-        """接続失敗（ピン名不一致）は False が返るだけなので必ず検証する。"""
-        if MEL.connect_material_expressions(frm, out_name, to, in_name):
-            return
-        if out_name and MEL.connect_material_expressions(frm, "", to, in_name):
-            return
-        raise RuntimeError("Matte マテリアルのノード接続に失敗: %s.%s -> %s.%s"
-                           % (type(frm).__name__, out_name, type(to).__name__, in_name))
-
-    def _const(v, x, y):
-        c = MEL.create_material_expression(mat, unreal.MaterialExpressionConstant, x, y)
-        c.set_editor_property("r", float(v))
-        return c
-
-    def _scene_r(tex_id, x, y):
-        st = MEL.create_material_expression(mat, unreal.MaterialExpressionSceneTexture, x, y)
-        st.set_editor_property("scene_texture_id", tex_id)
-        m = MEL.create_material_expression(mat, unreal.MaterialExpressionComponentMask, x + 150, y)
-        m.set_editor_property("r", True)
-        m.set_editor_property("g", False)
-        m.set_editor_property("b", False)
-        m.set_editor_property("a", False)
-        _conn(st, "Color", m, "")
-        return m
+    _conn = _mx_conn
+    _const = lambda v, x, y: _mx_const(mat, v, x, y)
+    _scene_r = lambda tex_id, x, y: _mx_scene_r(mat, tex_id, x, y)
 
     # black = in_front * valid,  out = 1 - black（選択=黒 / 周囲=白）
     #   in_front = clamp((sd + tol - cd) * 1000)   対象がシーンより手前
@@ -1229,6 +1349,109 @@ def create_temp_matte_material():
     except Exception as e:
         _warn("一時 Matte マテリアルの保存に失敗（未保存のまま続行）: %s" % e)
     _log("一時 Matte マテリアル生成（選択=黒/周囲=白）")
+    return mat
+
+
+_TMP_OBJID_NAME = "M_UE5Cap_ObjectID"
+
+
+def delete_temp_objid_material():
+    full = _TMP_MAT_PKG + "/" + _TMP_OBJID_NAME
+    try:
+        if not unreal.EditorAssetLibrary.does_asset_exist(full):
+            return
+        if not unreal.EditorAssetLibrary.delete_asset(full):
+            unreal.SystemLibrary.collect_garbage()
+            if not unreal.EditorAssetLibrary.delete_asset(full):
+                _warn("一時 ObjectID マテリアルを削除できませんでした: %s" % full)
+    except Exception as e:
+        _warn("一時 ObjectID マテリアル削除に失敗: %s" % e)
+
+
+def create_temp_objid_material():
+    """CustomStencil の値をコサインパレットで色分けし、対象以外を黒にする
+    PostProcess マテリアル。対象は main pass に写ったまま（CustomDepth と
+    SceneDepth の一致でオクルージョンを解決）。レンダ中は r.CustomDepth=3
+    （ステンシル有効）が必要（capture_mrq 側で切替・復元）。
+    色は objid_stencil_color() と同式で、マニフェスト JSON と対応する。"""
+    mat = _mx_get_or_create_pp_material(_TMP_OBJID_NAME)
+    s = _mx_scene_r(mat, unreal.SceneTextureId.PPI_CUSTOM_STENCIL, -1500, 0)
+    cd = _mx_scene_r(mat, unreal.SceneTextureId.PPI_CUSTOM_DEPTH, -1500, 220)
+    sd = _mx_scene_r(mat, unreal.SceneTextureId.PPI_SCENE_DEPTH, -1500, 440)
+    # occ = clamp((tol - |cd - sd|) * 1000)   対象が実際に最前面に見える画素のみ
+    mul = _mx_expr(mat, unreal.MaterialExpressionMultiply, -1150, 440)
+    _mx_conn(sd, "", mul, "A")
+    _mx_conn(_mx_const(mat, 0.02, -1300, 540), "", mul, "B")
+    mx = _mx_expr(mat, unreal.MaterialExpressionMax, -1000, 440)
+    _mx_conn(mul, "", mx, "A")
+    _mx_conn(_mx_const(mat, 10.0, -1150, 560), "", mx, "B")
+    dsub = _mx_expr(mat, unreal.MaterialExpressionSubtract, -1150, 300)
+    _mx_conn(cd, "", dsub, "A")
+    _mx_conn(sd, "", dsub, "B")
+    dabs = _mx_expr(mat, unreal.MaterialExpressionAbs, -1000, 300)
+    _mx_conn(dsub, "", dabs, "")
+    osub = _mx_expr(mat, unreal.MaterialExpressionSubtract, -850, 360)
+    _mx_conn(mx, "", osub, "A")
+    _mx_conn(dabs, "", osub, "B")
+    oscale = _mx_expr(mat, unreal.MaterialExpressionMultiply, -700, 360)
+    _mx_conn(osub, "", oscale, "A")
+    _mx_conn(_mx_const(mat, 1000.0, -850, 480), "", oscale, "B")
+    occ = _mx_expr(mat, unreal.MaterialExpressionClamp, -560, 360)
+    _mx_conn(oscale, "", occ, "")
+    # smask = clamp((s - 0.5) * 2)   ステンシル未書き込み(0)は黒
+    ssub = _mx_expr(mat, unreal.MaterialExpressionSubtract, -1150, 80)
+    _mx_conn(s, "", ssub, "A")
+    _mx_conn(_mx_const(mat, 0.5, -1300, 160), "", ssub, "B")
+    sscale = _mx_expr(mat, unreal.MaterialExpressionMultiply, -1000, 80)
+    _mx_conn(ssub, "", sscale, "A")
+    _mx_conn(_mx_const(mat, 2.0, -1150, 180), "", sscale, "B")
+    smask = _mx_expr(mat, unreal.MaterialExpressionClamp, -860, 80)
+    _mx_conn(sscale, "", smask, "")
+    # コサインパレット: h = frac(s * 黄金比), ch = 0.5 + 0.5*cos(h + offset)
+    hmul = _mx_expr(mat, unreal.MaterialExpressionMultiply, -1150, -60)
+    _mx_conn(s, "", hmul, "A")
+    _mx_conn(_mx_const(mat, 0.6180339887, -1300, -20), "", hmul, "B")
+    h = _mx_expr(mat, unreal.MaterialExpressionFrac, -1000, -60)
+    _mx_conn(hmul, "", h, "")
+    chans = []
+    for i, off in enumerate((0.0, -1.0 / 3.0, -2.0 / 3.0)):
+        y = -220 + i * 90
+        src = h
+        if off != 0.0:
+            adder = _mx_expr(mat, unreal.MaterialExpressionAdd, -860, y)
+            _mx_conn(h, "", adder, "A")
+            _mx_conn(_mx_const(mat, off, -1000, y + 40), "", adder, "B")
+            src = adder
+        cosn = _mx_expr(mat, unreal.MaterialExpressionCosine, -700, y)
+        cosn.set_editor_property("period", 1.0)
+        _mx_conn(src, "", cosn, "")
+        halfm = _mx_expr(mat, unreal.MaterialExpressionMultiply, -560, y)
+        _mx_conn(cosn, "", halfm, "A")
+        _mx_conn(_mx_const(mat, 0.5, -700, y + 40), "", halfm, "B")
+        halfa = _mx_expr(mat, unreal.MaterialExpressionAdd, -430, y)
+        _mx_conn(halfm, "", halfa, "A")
+        _mx_conn(_mx_const(mat, 0.5, -560, y + 40), "", halfa, "B")
+        chans.append(halfa)
+    ap1 = _mx_expr(mat, unreal.MaterialExpressionAppendVector, -300, -180)
+    _mx_conn(chans[0], "", ap1, "A")
+    _mx_conn(chans[1], "", ap1, "B")
+    ap2 = _mx_expr(mat, unreal.MaterialExpressionAppendVector, -180, -160)
+    _mx_conn(ap1, "", ap2, "A")
+    _mx_conn(chans[2], "", ap2, "B")
+    gate = _mx_expr(mat, unreal.MaterialExpressionMultiply, -400, 200)
+    _mx_conn(occ, "", gate, "A")
+    _mx_conn(smask, "", gate, "B")
+    outm = _mx_expr(mat, unreal.MaterialExpressionMultiply, -60, 40)
+    _mx_conn(ap2, "", outm, "A")
+    _mx_conn(gate, "", outm, "B")
+    unreal.MaterialEditingLibrary.connect_material_property(
+        outm, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+    unreal.MaterialEditingLibrary.recompile_material(mat)
+    try:
+        unreal.EditorAssetLibrary.save_loaded_asset(mat)
+    except Exception as e:
+        _warn("一時 ObjectID マテリアルの保存に失敗（未保存のまま続行）: %s" % e)
+    _log("一時 ObjectID マテリアル生成（ステンシル色分け・他は黒）")
     return mat
 
 

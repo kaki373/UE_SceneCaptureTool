@@ -289,11 +289,45 @@ def _restore_matte_render_mode(saved):
             _warn("Matte レンダモード復元に失敗: %s" % e)
 
 
+def _set_objid_render_mode(actors):
+    """ObjectID 対象に CustomDepth+ステンシル値（リスト順に 1..N）を付与する。
+    main pass の表示はそのまま（オクルージョンはマテリアル側で深度一致判定）。
+    返り値は復元用の (component, custom_depth, stencil) リスト。"""
+    saved = []
+    for idx, a in enumerate(actors or []):
+        if a is None:
+            continue
+        stencil = idx + 1
+        if stencil > 255:
+            _warn("ObjectID 対象が 255 を超えたため以降をスキップします")
+            break
+        for comp in a.get_components_by_class(unreal.PrimitiveComponent):
+            try:
+                saved.append((comp,
+                              comp.get_editor_property("render_custom_depth"),
+                              comp.get_editor_property("custom_depth_stencil_value")))
+                comp.set_editor_property("render_custom_depth", True)
+                comp.set_editor_property("custom_depth_stencil_value", stencil)
+            except Exception as e:
+                _warn("ObjectID レンダモード設定に失敗: %s" % e)
+    return saved
+
+
+def _restore_objid_render_mode(saved):
+    for comp, cd, st in saved or []:
+        try:
+            comp.set_editor_property("render_custom_depth", cd)
+            comp.set_editor_property("custom_depth_stencil_value", st)
+        except Exception as e:
+            _warn("ObjectID レンダモード復元に失敗: %s" % e)
+
+
 def render_sequence(level_sequence, output_dir, width, height, name_body, take_str,
                     do_png=True, do_mp4=False, mp4_crf=20,
                     temporal_samples=8, warmup=32,
                     custom_start=None, custom_end=None,
                     depth_material=None, matte_material=None, matte_actors=None,
+                    objid_material=None, objid_actors=None,
                     hidden_actors=None, near_clip_cm=None, beauty_label="Beauty",
                     fog_off=False, on_done=None):
     """開いている/指定の LevelSequence を MRQ でレンダリング（非同期）。
@@ -318,6 +352,8 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
         raise RuntimeError("PNG連番 / MP4 のどちらも選ばれていません。")
     if matte_material is not None and not matte_actors:
         raise RuntimeError("Matte 出力には対象アクターが必要です。")
+    if objid_material is not None and not objid_actors:
+        raise RuntimeError("ObjectID 出力には対象アクターが必要です。")
 
     sub = unreal.get_editor_subsystem(unreal.MoviePipelineQueueSubsystem)
     if sub.is_rendering() or _KEEP.get("executor") is not None:
@@ -335,6 +371,7 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
 
     # シーン状態の変更（レンダ後・起動失敗時に必ず復元）
     saved_matte = None
+    saved_objid = None
     hidden = []
     if matte_material is not None:
         saved_matte = _set_matte_render_mode(matte_actors)
@@ -345,10 +382,14 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
                 hidden.append(a)
             except Exception:
                 pass
+    if objid_material is not None:
+        saved_objid = _set_objid_render_mode(objid_actors)
 
     def _restore_scene():
         if saved_matte:
             _restore_matte_render_mode(saved_matte)
+        if saved_objid:
+            _restore_objid_render_mode(saved_objid)
         for a in hidden:
             try:
                 a.set_actor_hidden_in_game(False)
@@ -359,8 +400,9 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
         return _start_sequence_render(sub, level_sequence, output_dir, width, height,
                                       name_body, take_str, do_png, do_mp4, mp4_crf,
                                       temporal_samples, warmup, custom_start, custom_end,
-                                      depth_material, matte_material, near_clip_cm,
-                                      beauty_label, fog_off, _restore_scene, on_done)
+                                      depth_material, matte_material, objid_material,
+                                      near_clip_cm, beauty_label, fog_off,
+                                      _restore_scene, on_done)
     except Exception:
         _restore_scene()
         _KEEP.clear()      # 起動失敗時に次回レンダを塞がない
@@ -370,8 +412,8 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
 def _start_sequence_render(sub, level_sequence, output_dir, width, height,
                            name_body, take_str, do_png, do_mp4, mp4_crf,
                            temporal_samples, warmup, custom_start, custom_end,
-                           depth_material, matte_material, near_clip_cm,
-                           beauty_label, fog_off, restore_scene, on_done):
+                           depth_material, matte_material, objid_material,
+                           near_clip_cm, beauty_label, fog_off, restore_scene, on_done):
     queue = sub.get_queue()
     for j in list(queue.get_jobs()):
         queue.delete_job(j)
@@ -383,7 +425,8 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
     cfg = job.get_configuration()
     deferred = cfg.find_or_add_setting_by_class(unreal.MoviePipelineDeferredPassBase)
     extra_passes = []
-    for pass_name, pass_mat in (("Depth", depth_material), ("Matte", matte_material)):
+    for pass_name, pass_mat in (("Depth", depth_material), ("Matte", matte_material),
+                                ("ObjectID", objid_material)):
         if pass_mat is None:
             continue
         ppp = unreal.MoviePipelinePostProcessPass()
@@ -408,6 +451,15 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
     out = cfg.find_or_add_setting_by_class(unreal.MoviePipelineOutputSetting)
     out.set_editor_property("output_directory", unreal.DirectoryPath(output_dir))
     out.set_editor_property("output_resolution", unreal.IntPoint(int(width), int(height)))
+    # フレームレートはシーケンスの Display Rate を明示指定する（既定継承に任せず
+    # 24fps 等を確実に反映。エンコード側も同じ値を使う）
+    try:
+        fr = unreal.MovieSceneSequenceExtensions.get_display_rate(level_sequence)
+        out.set_editor_property("use_custom_frame_rate", True)
+        out.set_editor_property("output_frame_rate", fr)
+        _log("output frame rate = %d/%d" % (fr.numerator, fr.denominator))
+    except Exception as e:
+        _warn("フレームレート明示指定に失敗（シーケンス既定を使用）: %s" % e)
     # 動画出力側は {frame_number} を自動で外して1ファイルにする（エンジン仕様）
     out.set_editor_property("file_name_format",
                             "%s_{render_pass}_%s.{frame_number}" % (name_body, take_str))
@@ -451,6 +503,11 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
     if near_clip_cm is not None:
         cmds.append("r.SetNearClipPlane %f" % float(near_clip_cm))
         _log("near clip = %.1f cm" % float(near_clip_cm))
+    prev_custom_depth = None
+    if objid_material is not None:
+        # ステンシル書き込みには r.CustomDepth=3 が必要（レンダ中のみ・後で復元）
+        prev_custom_depth = unreal.SystemLibrary.get_console_variable_int_value("r.CustomDepth")
+        cmds.append("r.CustomDepth 3")
     if fog_off:
         cmds += ["r.Fog 0", "r.VolumetricFog 0"]
         _log("fog off")
@@ -461,12 +518,15 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
 
     def _on_finished(exec_obj, success):
         _log("MRQ シーケンスレンダ完了 success=%s -> %s" % (success, output_dir))
-        restore_scene()                     # matte/hidden の状態を元に戻す
+        restore_scene()                     # matte/objid/hidden の状態を元に戻す
         try:
             w = _editor_world()
             if near_clip_cm is not None:
                 # near clip はグローバルに残るので必ず既定(10cm)へ戻す
                 unreal.SystemLibrary.execute_console_command(w, "r.SetNearClipPlane 10")
+            if prev_custom_depth is not None:
+                unreal.SystemLibrary.execute_console_command(
+                    w, "r.CustomDepth %d" % prev_custom_depth)
             if fog_off:
                 unreal.SystemLibrary.execute_console_command(w, "r.Fog 1")
                 unreal.SystemLibrary.execute_console_command(w, "r.VolumetricFog 1")
@@ -500,7 +560,7 @@ def _rename_final_image(output_dir, beauty_label="Beauty"):
             if "_FinalImage" not in f:
                 continue
             nf = f
-            for pass_name in ("Depth", "Matte"):
+            for pass_name in ("Depth", "Matte", "ObjectID"):
                 nf = nf.replace("_FinalImage" + pass_name, "_" + pass_name)
             nf = nf.replace("_FinalImage", "_" + beauty_label)
             try:
