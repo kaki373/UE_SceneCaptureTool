@@ -80,12 +80,19 @@ subprocess.check_call([sys.executable, "-m", "pip", "install", "numpy", "pillow"
 
 ## 使い方
 
-### ツールバーから起動（推奨）
+### メニュー / ツールバーから起動（推奨）
 
-`Documents/UnrealEngine/Python/init_unreal.py` が `startup_menu.register()` を呼ぶことで、
-レベルエディタのツールバー右端に **SceneCapture** ボタンが常設される（全プロジェクト共通・
-プロジェクトファイルには手を入れない）。ボタンはモジュールを reload してから GUI を
-開くので、コード修正後もボタンを押すだけで最新版が立ち上がる。
+導入は ue2max と同じ方式（プロジェクト毎に1回）:
+
+1. `Project Settings > Plugins > Python > Startup Scripts` の「+Add」に
+   `D:/webui/ClaudeCode/UE_capture/ue5_capture/capture_menu.py` を追加
+2. エディタを再起動 → メニューバーに **SceneCapture** メニューと、
+   ツールバー右端に **SceneCapture** ボタンが出る
+
+メニューは `Panel...`（ツールを開く）/ `Open Output Folder` / `Settings...` の3項目。
+起動時にモジュールを reload するので、コード修正後もメニュー/ボタンから開くだけで
+最新版が立ち上がる。再起動せずに即席で登録する場合は
+`py ".../ue5_capture/capture_menu.py"` を一度実行すればよい（再実行しても重複しない）。
 
 ### コンソールから起動
 
@@ -115,7 +122,8 @@ UE_SceneCaptureTool/
     ├── capture_core.py          # キャプチャロジック（Spawn・キャプチャ・後処理・破棄・合成）
     ├── capture_mrq.py           # Movie Render Queue による Beauty / Behind / シーケンスレンダ
     ├── capture_ui.py            # tkinter GUI（画像 / 映像タブ）
-    ├── startup_menu.py          # ツールバー起動ボタン登録（init_unreal.py から呼ぶ）
+    ├── capture_menu.py          # メニューバー登録 + 導入用 Startup Script（ここを +Add する）
+    ├── startup_menu.py          # ツールバーボタン登録（capture_menu から呼ばれる）
     └── README.md                # エディタ内詳細仕様
 ```
 
