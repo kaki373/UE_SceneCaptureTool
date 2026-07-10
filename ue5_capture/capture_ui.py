@@ -223,15 +223,18 @@ class CaptureWindow(object):
         ttk.Label(mrqf, text="サンプリングフレーム:").pack(side="left", padx=(8, 0))
         self.mrq_ts_var = tk.StringVar(master=self.root, value="8")
         tk.Entry(mrqf, textvariable=self.mrq_ts_var, width=5).pack(side="left", padx=2)
+        mrqf.grid(row=row, column=0, columnspan=3, sticky="w", padx=24)
+        row += 1
+        mrqf2 = ttk.Frame(frm)
         self.mrq_exr_var = tk.BooleanVar(master=self.root, value=False)
-        ttk.Checkbutton(mrqf, text="EXR", variable=self.mrq_exr_var).pack(side="left", padx=(8, 0))
+        ttk.Checkbutton(mrqf2, text="EXR", variable=self.mrq_exr_var).pack(side="left")
         self.mrq_camasp_var = tk.BooleanVar(master=self.root, value=True)
-        ttk.Checkbutton(mrqf, text="カメラのアスペクト",
+        ttk.Checkbutton(mrqf2, text="カメラのアスペクト",
                         variable=self.mrq_camasp_var).pack(side="left", padx=(8, 0))
         self.fog_off_var = tk.BooleanVar(master=self.root, value=False)
-        ttk.Checkbutton(mrqf, text="Fogなし", variable=self.fog_off_var).pack(
+        ttk.Checkbutton(mrqf2, text="Fogなし", variable=self.fog_off_var).pack(
             side="left", padx=(8, 0))
-        mrqf.grid(row=row, column=0, columnspan=3, sticky="w", padx=24)
+        mrqf2.grid(row=row, column=0, columnspan=3, sticky="w", padx=24)
         row += 1
 
         # Z-Depth（手前=白/奥=黒 固定）
