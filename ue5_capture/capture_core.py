@@ -1085,6 +1085,103 @@ def create_temp_depth_material(near, far, invert=True):
     return mat
 
 
+_TMP_MATTE_NAME = "M_UE5Cap_Matte"
+
+
+def delete_temp_matte_material():
+    full = _TMP_MAT_PKG + "/" + _TMP_MATTE_NAME
+    try:
+        if not unreal.EditorAssetLibrary.does_asset_exist(full):
+            return
+        if not unreal.EditorAssetLibrary.delete_asset(full):
+            unreal.SystemLibrary.collect_garbage()
+            if not unreal.EditorAssetLibrary.delete_asset(full):
+                _warn("一時 Matte マテリアルを削除できませんでした: %s" % full)
+    except Exception as e:
+        _warn("一時 Matte マテリアル削除に失敗: %s" % e)
+
+
+def create_temp_matte_material():
+    """CustomDepth と SceneDepth の比較で「対象が最前面に見える画素」を出力する
+    PostProcess マテリアルを用意して返す（選択=黒 / 周囲=白。画像タブの Matte と同じ）。
+    対象アクターは render_in_main_pass=False + render_custom_depth=True にしておく前提
+    （ビューティには写らず CustomDepth にだけ写る＝クリーンプレートと両立）。
+    既存の一時アセットがあれば再利用して式だけ作り直す。"""
+    full = _TMP_MAT_PKG + "/" + _TMP_MATTE_NAME
+    mat = None
+    if unreal.EditorAssetLibrary.does_asset_exist(full):
+        mat = unreal.EditorAssetLibrary.load_asset(full)
+    if mat is None:
+        at = unreal.AssetToolsHelpers.get_asset_tools()
+        mat = at.create_asset(_TMP_MATTE_NAME, _TMP_MAT_PKG,
+                              unreal.Material, unreal.MaterialFactoryNew())
+    if mat is None:
+        raise RuntimeError("一時 Matte マテリアルの生成に失敗しました。")
+    mat.set_editor_property("material_domain", unreal.MaterialDomain.MD_POST_PROCESS)
+    mat.set_editor_property(
+        "blendable_location",
+        unreal.BlendableLocation.BL_SCENE_COLOR_AFTER_TONEMAPPING)
+
+    MEL = unreal.MaterialEditingLibrary
+    MEL.delete_all_material_expressions(mat)
+
+    def _const(v, x, y):
+        c = MEL.create_material_expression(mat, unreal.MaterialExpressionConstant, x, y)
+        c.set_editor_property("r", float(v))
+        return c
+
+    def _scene_r(tex_id, x, y):
+        st = MEL.create_material_expression(mat, unreal.MaterialExpressionSceneTexture, x, y)
+        st.set_editor_property("scene_texture_id", tex_id)
+        m = MEL.create_material_expression(mat, unreal.MaterialExpressionComponentMask, x + 150, y)
+        m.set_editor_property("r", True)
+        m.set_editor_property("g", False)
+        m.set_editor_property("b", False)
+        m.set_editor_property("a", False)
+        MEL.connect_material_expressions(st, "Color", m, "")
+        return m
+
+    cd = _scene_r(unreal.SceneTextureId.PPI_CUSTOM_DEPTH, -1100, 0)
+    sd = _scene_r(unreal.SceneTextureId.PPI_SCENE_DEPTH, -1100, 250)
+    # tol = max(sd * 0.02, 10cm)
+    mul = MEL.create_material_expression(mat, unreal.MaterialExpressionMultiply, -800, 250)
+    MEL.connect_material_expressions(sd, "", mul, "A")
+    MEL.connect_material_expressions(_const(0.02, -950, 350), "", mul, "B")
+    mx = MEL.create_material_expression(mat, unreal.MaterialExpressionMax, -650, 250)
+    MEL.connect_material_expressions(mul, "", mx, "A")
+    MEL.connect_material_expressions(_const(10.0, -800, 380), "", mx, "B")
+    add = MEL.create_material_expression(mat, unreal.MaterialExpressionAdd, -500, 250)
+    MEL.connect_material_expressions(sd, "", add, "A")
+    MEL.connect_material_expressions(mx, "", add, "B")
+    one = _const(1.0, -500, 60)
+    zero = _const(0.0, -500, 130)
+    # cd < sd + tol → 1（対象が最前面）
+    if1 = MEL.create_material_expression(mat, unreal.MaterialExpressionIf, -320, 120)
+    MEL.connect_material_expressions(cd, "", if1, "A")
+    MEL.connect_material_expressions(add, "", if1, "B")
+    MEL.connect_material_expressions(zero, "", if1, "AGreaterThanB")
+    MEL.connect_material_expressions(one, "", if1, "AEqualsB")
+    MEL.connect_material_expressions(one, "", if1, "ALessThanB")
+    # cd < 1e7 → 上の結果（CustomDepth 未書き込み画素を除外）
+    if2 = MEL.create_material_expression(mat, unreal.MaterialExpressionIf, -160, 120)
+    MEL.connect_material_expressions(cd, "", if2, "A")
+    MEL.connect_material_expressions(_const(1.0e7, -320, 320), "", if2, "B")
+    MEL.connect_material_expressions(zero, "", if2, "AGreaterThanB")
+    MEL.connect_material_expressions(zero, "", if2, "AEqualsB")
+    MEL.connect_material_expressions(if1, "", if2, "ALessThanB")
+    # 画像タブの Matte と同じく 選択=黒 / 周囲=白
+    inv = MEL.create_material_expression(mat, unreal.MaterialExpressionOneMinus, -30, 120)
+    MEL.connect_material_expressions(if2, "", inv, "")
+    MEL.connect_material_property(inv, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+    MEL.recompile_material(mat)
+    try:
+        unreal.EditorAssetLibrary.save_loaded_asset(mat)
+    except Exception as e:
+        _warn("一時 Matte マテリアルの保存に失敗（未保存のまま続行）: %s" % e)
+    _log("一時 Matte マテリアル生成（選択=黒/周囲=白）")
+    return mat
+
+
 # ----------------------------------------------------------------------------
 # エントリポイント
 # ----------------------------------------------------------------------------
