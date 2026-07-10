@@ -36,7 +36,16 @@ except Exception:
     _HAS_TK = False
 
 
-# MP4 レートプリセット（内蔵 H.264 エンコーダの CRF。小さいほど高品質・大容量）
+# 映像タブの出力素材: (キー, UI ラベル, ファイル素材名)
+_SEQ_OUTPUTS = [
+    ("beauty", "Beauty", "Beauty"),
+    ("depth", "Z-Depth", "Depth"),
+    ("mfront", "Beauty+Matte（Matteの前）", "MatteBeauty"),
+    ("behind", "Matteの奥", "Behind"),
+    ("objid", "ObjectID", "ObjectID"),
+]
+
+# MP4 レートプリセット（H.264 の CRF。小さいほど高品質・大容量）
 _MP4_RATE_PRESETS = {
     "最高 (CRF 17)": 17,
     "高 (CRF 20)": 20,
@@ -375,44 +384,33 @@ class CaptureWindow(object):
             row=row, column=0, columnspan=3, sticky="we", pady=8)
         row += 1
 
-        fmt = ttk.Frame(frm)
-        ttk.Label(fmt, text="Format:").pack(side="left")
-        self.seq_png_var = tk.BooleanVar(master=self.root, value=True)
-        ttk.Checkbutton(fmt, text="PNG連番", variable=self.seq_png_var).pack(
-            side="left", padx=(4, 0))
-        self.seq_mp4_var = tk.BooleanVar(master=self.root, value=True)
-        ttk.Checkbutton(fmt, text="MP4", variable=self.seq_mp4_var).pack(side="left", padx=(8, 0))
-        ttk.Label(fmt, text="レート:").pack(side="left", padx=(8, 0))
+        ttk.Label(frm, text="出力（素材ごとに PNG連番 / MP4 を選択。MP4 はシーケンスの fps で ffmpeg エンコード）:").grid(
+            row=row, column=0, columnspan=3, sticky="w", **pad)
+        row += 1
+        mtx = ttk.Frame(frm)
+        ttk.Label(mtx, text="PNG連番").grid(row=0, column=1, padx=8)
+        ttk.Label(mtx, text="MP4").grid(row=0, column=2, padx=8)
+        self.seq_out_vars = {}
+        for i, (key, label, _pass) in enumerate(_SEQ_OUTPUTS):
+            ttk.Label(mtx, text=label).grid(row=i + 1, column=0, sticky="w", pady=1)
+            pv = tk.BooleanVar(master=self.root, value=(key == "beauty"))
+            mv = tk.BooleanVar(master=self.root, value=(key == "beauty"))
+            ttk.Checkbutton(mtx, variable=pv).grid(row=i + 1, column=1)
+            ttk.Checkbutton(mtx, variable=mv).grid(row=i + 1, column=2)
+            self.seq_out_vars[key] = (pv, mv)
+        mtx.grid(row=row, column=0, columnspan=3, sticky="w", padx=24)
+        row += 1
+        rate = ttk.Frame(frm)
+        ttk.Label(rate, text="レート:").pack(side="left")
         self.seq_rate_var = tk.StringVar(master=self.root, value="高 (CRF 20)")
-        ttk.Combobox(fmt, textvariable=self.seq_rate_var, state="normal", width=12,
+        ttk.Combobox(rate, textvariable=self.seq_rate_var, state="normal", width=12,
                      values=list(_MP4_RATE_PRESETS.keys())).pack(side="left", padx=2)
-        ttk.Label(fmt, text="(CRF 16-51 直接入力可)", foreground="#888").pack(side="left", padx=(2, 0))
-        fmt.grid(row=row, column=0, columnspan=3, sticky="w", **pad)
+        ttk.Label(rate, text="(CRF 16-51 直接入力可)", foreground="#888").pack(
+            side="left", padx=(2, 0))
+        rate.grid(row=row, column=0, columnspan=3, sticky="w", padx=24)
         row += 1
-
-        mt = ttk.Frame(frm)
-        self.seq_matte_hide_var = tk.BooleanVar(master=self.root, value=False)
-        ttk.Checkbutton(mt, text="Matte 対象を隠す（クリーンプレート）",
-                        variable=self.seq_matte_hide_var).pack(side="left")
-        self.seq_matte_var = tk.BooleanVar(master=self.root, value=False)
-        ttk.Checkbutton(mt, text="+ Matte（白黒）を出力",
-                        variable=self.seq_matte_var).pack(side="left", padx=(8, 0))
-        mt.grid(row=row, column=0, columnspan=3, sticky="w", **pad)
-        row += 1
-        self.seq_behind_var = tk.BooleanVar(master=self.root, value=False)
-        ttk.Checkbutton(frm, text="+ Matteの奥を描画",
-                        variable=self.seq_behind_var).grid(
-            row=row, column=0, columnspan=3, sticky="w", padx=24)
-        row += 1
-        ttk.Label(frm, text="（対象は画像タブの Matte targets、空ならエディタ選択。Matte/奥描画は対象を自動で隠す。"
-                            "奥描画は2本目のレンダ＋合成連番。near-clip は開始フレームのカメラ位置基準）",
-                  foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", padx=24)
-        row += 1
-
         dep = ttk.Frame(frm)
-        self.seq_depth_var = tk.BooleanVar(master=self.root, value=False)
-        ttk.Checkbutton(dep, text="Z-Depth", variable=self.seq_depth_var).pack(side="left")
-        ttk.Label(dep, text="Near:").pack(side="left", padx=(8, 0))
+        ttk.Label(dep, text="Z-Depth 設定:  Near:").pack(side="left")
         self.seq_near_var = tk.StringVar(master=self.root, value="0")
         tk.Entry(dep, textvariable=self.seq_near_var, width=6).pack(side="left", padx=2)
         ttk.Label(dep, text="Far:").pack(side="left", padx=(6, 0))
@@ -422,9 +420,15 @@ class CaptureWindow(object):
         self.seq_inv_var = tk.BooleanVar(master=self.root, value=True)
         ttk.Checkbutton(dep, text="Invert (near=white / far=black)",
                         variable=self.seq_inv_var).pack(side="left", padx=(8, 0))
-        dep.grid(row=row, column=0, columnspan=3, sticky="w", **pad)
+        dep.grid(row=row, column=0, columnspan=3, sticky="w", padx=24)
         row += 1
-        ttk.Label(frm, text="（Z-Depth 連番/MP4 は表示用エンコード。厳密なリニア深度は画像タブの Z-Depth を使用）",
+        self.seq_matte_hide_var = tk.BooleanVar(master=self.root, value=False)
+        ttk.Checkbutton(frm, text="Matte 対象を隠す（クリーンプレートのみ。Matte系出力時は自動で隠れる）",
+                        variable=self.seq_matte_hide_var).grid(
+            row=row, column=0, columnspan=3, sticky="w", padx=24)
+        row += 1
+        ttk.Label(frm, text="（Matte系の対象=画像タブの Matte targets / ObjectID の対象=画像タブの Object ID targets。"
+                            "空ならエディタ選択。Matteの奥は2本目レンダ＋合成、ObjectID は色↔名前の JSON 付き）",
                   foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", padx=24)
         row += 1
 
@@ -750,7 +754,10 @@ class CaptureWindow(object):
             self.seq_name_var.set(seq.get_name())
 
     def _on_seq_render(self):
-        """Sequencer で開いている LevelSequence を PNG連番 / MP4 でレンダ（非同期・PIE）。"""
+        """Sequencer で開いている LevelSequence をレンダ（非同期・PIE）。
+        MRQ は PNG 連番（マスター）のみを出力し、MP4 はシーケンスの Display Rate で
+        ffmpeg エンコードする（fps を確実に一致させるため）。余剰フレームは
+        エンコード前にトリムする。素材ごとに PNG連番/MP4 を選択できる。"""
         import capture_mrq
         importlib.reload(capture_mrq)
         seq = self._current_sequence()
@@ -771,6 +778,7 @@ class CaptureWindow(object):
         H = self._int_var(self.seq_h_var, 1080)
         warm = self._int_var(self.seq_warm_var, 32)
         ts = self._int_var(self.seq_ts_var, 8)
+        ext = unreal.MovieSceneSequenceExtensions
         cs = ce = None
         if self.seq_range_mode.get() == "custom":
             cs = self._int_var(self.seq_start_var, 0)
@@ -778,6 +786,53 @@ class CaptureWindow(object):
             if ce <= cs:
                 self.status_var.set("シーケンスレンダ: フレーム範囲が不正です (End は Start 以上)")
                 return
+            cs_eff, ce_eff = cs, ce
+        else:
+            cs_eff = ext.get_playback_start(seq)
+            ce_eff = ext.get_playback_end(seq)
+        fr = ext.get_display_rate(seq)
+        fps_num, fps_den = fr.numerator, max(fr.denominator, 1)
+
+        wants = {k: (pv.get(), mv.get()) for k, (pv, mv) in self.seq_out_vars.items()}
+        if not any(p or m for p, m in wants.values()):
+            self.status_var.set("シーケンスレンダ: 出力素材が1つも選ばれていません")
+            return
+
+        def _need(key):
+            return wants[key][0] or wants[key][1]
+
+        mp4_any = any(m for _, m in wants.values())
+        ffmpeg = None
+        if mp4_any:
+            ffmpeg = core.find_ffmpeg(getattr(self, "_ffmpeg_hint", None))
+            if not ffmpeg:
+                self.status_var.set("MP4 出力には ffmpeg が必要です（見つかりません。"
+                                    "設定 JSON の ffmpeg_path か PATH を確認）")
+                return
+            self._ffmpeg_hint = ffmpeg
+        crf = self._resolve_crf()
+
+        matte_needed = _need("mfront") or _need("behind")
+        depth_needed = _need("depth")
+        objid_needed = _need("objid")
+
+        matte_actors = None
+        if matte_needed or self.seq_matte_hide_var.get():
+            matte_actors = core._resolve_target_actors(
+                None, self._pick_targets_resolved(self.matte_pick) or None)
+            if not matte_actors:
+                self.status_var.set("シーケンスレンダ: Matte 対象が見つかりません"
+                                    "（画像タブの Matte targets か選択を確認）")
+                return
+        objid_actors = None
+        if objid_needed:
+            objid_actors = core._resolve_target_actors(
+                None, self._pick_targets_resolved(self.objid_pick) or None)
+            if not objid_actors:
+                self.status_var.set("シーケンスレンダ: ObjectID 対象が見つかりません"
+                                    "（画像タブの Object ID targets か選択を確認）")
+                return
+
         take_str = "%03d" % core.next_take_number(base_out)
         parts = []
         if self.seq_usecustom_var.get():
@@ -789,30 +844,22 @@ class CaptureWindow(object):
         out = base_out
         if self.seq_subdir_var.get():
             out = os.path.join(base_out, "%s_%s" % (name_body, take_str))
-        crf = self._resolve_crf()
         self._save_ui_state()
-        # Matte 対象（画像タブの Matte targets を共用。空ならエディタ選択）
-        want_behind = self.seq_behind_var.get()
-        matte_actors = None
-        if self.seq_matte_var.get() or self.seq_matte_hide_var.get() or want_behind:
-            matte_actors = core._resolve_target_actors(
-                None, self._pick_targets_resolved(self.matte_pick) or None)
-            if not matte_actors:
-                self.status_var.set("シーケンスレンダ: Matte 対象が見つかりません"
-                                    "（画像タブの Matte targets か選択を確認）")
-                return
-        depth_mat = matte_mat = None
+
+        depth_mat = matte_mat = objid_mat = None
         hide_actors = None
         try:
-            if self.seq_depth_var.get():
+            if depth_needed:
                 depth_mat = core.create_temp_depth_material(
                     self._float_var(self.seq_near_var, 0.0),
                     self._float_var(self.seq_far_var, 10000.0),
                     invert=self.seq_inv_var.get())
-            if self.seq_matte_var.get() or want_behind:
-                matte_mat = core.create_temp_matte_material()   # Behind は合成にマットが必要
+            if matte_needed:
+                matte_mat = core.create_temp_matte_material()
             elif self.seq_matte_hide_var.get():
                 hide_actors = matte_actors
+            if objid_needed:
+                objid_mat = core.create_temp_objid_material()
         except Exception as e:
             self.status_var.set("一時マテリアル生成失敗: %s" % e)
             return
@@ -822,71 +869,156 @@ class CaptureWindow(object):
                 core.delete_temp_depth_material()
             if matte_mat is not None:
                 core.delete_temp_matte_material()
+            if objid_mat is not None:
+                core.delete_temp_objid_material()
 
         def _final(ok, od):
             _cleanup_materials()
             self.status_var.set(("シーケンスレンダ完了: %s" % od) if ok
                                 else "シーケンスレンダ失敗 (Output Log 参照)")
 
-        def _after_main(ok, od):
-            if not (ok and want_behind):
-                _final(ok, od)
+        pass_files_main = ["Beauty"]
+        if depth_needed:
+            pass_files_main.append("Depth")
+        if matte_mat is not None:
+            pass_files_main.append("Matte")
+        if objid_needed:
+            pass_files_main.append("ObjectID")
+
+        def _finish_outputs(ok, od):
+            """トリム → 合成 → マニフェスト → MP4 エンコード → 不要 PNG 削除。"""
+            if not ok:
+                _final(False, od)
                 return
-            # ② Behind プレート: 開始フレームのカメラ→マット距離で near-clip して手前を除去
             try:
-                start_f = cs if cs is not None else \
-                    unreal.MovieSceneSequenceExtensions.get_playback_start(seq)
-                cam_actor = self._sequence_camera_at(seq, start_f)
+                trim_list = list(pass_files_main)
+                if _need("behind"):
+                    trim_list.append("BehindPlate")
+                core.trim_sequence_frames(out, name_body, take_str,
+                                          trim_list, cs_eff, ce_eff)
+                if _need("mfront"):
+                    core.composite_mattefront_sequence(out, name_body, take_str)
+                if _need("behind"):
+                    core.composite_behind_sequence(out, name_body, take_str)
+                if objid_needed and objid_actors:
+                    man = {}
+                    for i, a in enumerate(objid_actors[:255]):
+                        r, g, b = core.objid_stencil_color(i + 1)
+                        try:
+                            man["#%02X%02X%02X" % (r, g, b)] = a.get_actor_label()
+                        except Exception:
+                            pass
+                    with open(os.path.join(out, "%s_ObjectID_%s.json" % (name_body, take_str)),
+                              "w", encoding="utf-8") as f:
+                        json.dump(man, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                self.status_var.set("後処理エラー: %s" % e)
+                _final(False, od)
+                return
+
+            cmds = []
+            for key, _label, pass_name in _SEQ_OUTPUTS:
+                if wants[key][1]:
+                    cmd, _dst = core.encode_mp4_cmd(ffmpeg, out, name_body, pass_name,
+                                                    take_str, fps_num, fps_den, crf, cs_eff)
+                    cmds.append(cmd)
+
+            def _after_encode(enc_ok):
+                drop = ["Matte", "BehindPlate"]      # 中間素材は常に削除
+                for key, _label, pass_name in _SEQ_OUTPUTS:
+                    if not wants[key][0]:
+                        drop.append(pass_name)
+                core.delete_pass_frames(out, name_body, take_str, drop)
+                _final(enc_ok, od)
+
+            if cmds:
+                self._run_ffmpeg_jobs(cmds, _after_encode)
+            else:
+                _after_encode(True)
+
+        def _after_main(ok, od):
+            if not (ok and _need("behind")):
+                _finish_outputs(ok, od)
+                return
+            # Matteの奥: 開始フレームのカメラ→マット距離で near-clip した2本目ジョブ
+            try:
+                cam_actor = self._sequence_camera_at(seq, cs_eff)
                 if cam_actor is None:
                     raise RuntimeError("シーケンスカメラを特定できません")
                 nc = core.matte_near_clip_cm(
                     matte_actors, {"transform": cam_actor.get_actor_transform()})
             except Exception as e:
-                self.status_var.set("Behind: near-clip 計算失敗: %s" % e)
+                self.status_var.set("Matteの奥: near-clip 計算失敗: %s" % e)
                 _final(False, od)
                 return
-
-            def _after_plate(ok2, od2):
-                if ok2:
-                    try:
-                        n = core.composite_behind_sequence(out, name_body, take_str)
-                        if n == 0:
-                            self.status_var.set("Behind 合成: 素材不足で 0 フレーム")
-                    except Exception as e:
-                        self.status_var.set("Behind 合成エラー: %s" % e)
-                _final(ok2, od2)
-
-            self.status_var.set("Behind プレートをレンダ中… (near-clip %.0fcm)" % nc)
+            self.status_var.set("Matteの奥プレートをレンダ中… (near-clip %.0fcm)" % nc)
             self.root.update()
             try:
                 capture_mrq.render_sequence(
                     seq, out, W, H, name_body, take_str,
-                    do_png=True, do_mp4=self.seq_mp4_var.get(), mp4_crf=crf,
+                    do_png=True, do_mp4=False,
                     temporal_samples=ts, warmup=warm,
                     custom_start=cs, custom_end=ce,
                     hidden_actors=matte_actors, near_clip_cm=nc,
                     beauty_label="BehindPlate",
-                    fog_off=self.seq_fog_var.get(), on_done=_after_plate)
+                    fog_off=self.seq_fog_var.get(), on_done=_finish_outputs)
             except Exception as e:
-                self.status_var.set("Behind プレート起動失敗: %s" % e)
+                self.status_var.set("Matteの奥プレート起動失敗: %s" % e)
                 _final(False, od)
 
-        self.status_var.set("シーケンスレンダ中… (PIE に入ります / MP4 CRF %d)" % crf)
+        self.status_var.set("シーケンスレンダ中… (PIE / %d〜%dF @%gfps)"
+                            % (cs_eff, ce_eff - 1, float(fps_num) / fps_den))
         self.root.update()
         try:
             capture_mrq.render_sequence(
                 seq, out, W, H, name_body, take_str,
-                do_png=self.seq_png_var.get() or want_behind,   # Behind 合成は PNG が必要
-                do_mp4=self.seq_mp4_var.get(),
-                mp4_crf=crf, temporal_samples=ts, warmup=warm,
+                do_png=True, do_mp4=False,
+                temporal_samples=ts, warmup=warm,
                 custom_start=cs, custom_end=ce,
                 depth_material=depth_mat,
                 matte_material=matte_mat, matte_actors=matte_actors,
+                objid_material=objid_mat, objid_actors=objid_actors,
                 hidden_actors=hide_actors, fog_off=self.seq_fog_var.get(),
                 on_done=_after_main)
         except Exception as e:
             _cleanup_materials()
             self.status_var.set("シーケンスレンダ起動失敗: %s" % e)
+
+    def _run_ffmpeg_jobs(self, cmds, on_done):
+        """ffmpeg を1本ずつ非同期実行し、全完了で on_done(ok)。
+        Slate tick でポーリングするのでエディタをブロックしない。"""
+        import subprocess
+        state = {"i": 0, "p": None, "h": None}
+
+        def _tick(dt):
+            p = state["p"]
+            if p is None:
+                if state["i"] >= len(cmds):
+                    unreal.unregister_slate_post_tick_callback(state["h"])
+                    on_done(True)
+                    return
+                try:
+                    state["p"] = subprocess.Popen(
+                        cmds[state["i"]], stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL, creationflags=0x08000000)
+                except Exception as e:
+                    unreal.unregister_slate_post_tick_callback(state["h"])
+                    self.status_var.set("ffmpeg 起動失敗: %s" % e)
+                    on_done(False)
+                    return
+                state["i"] += 1
+                self.status_var.set("MP4 エンコード中… (%d/%d)" % (state["i"], len(cmds)))
+                return
+            rc = p.poll()
+            if rc is None:
+                return
+            state["p"] = None
+            if rc != 0:
+                unreal.unregister_slate_post_tick_callback(state["h"])
+                self.status_var.set("ffmpeg 失敗 (exit %d)" % rc)
+                on_done(False)
+
+        state["h"] = unreal.register_slate_post_tick_callback(_tick)
 
     def _make_picker(self, frm, row, label):
         """対象アクターのリストを作る。リストの中身＝対象。
@@ -1136,14 +1268,12 @@ class CaptureWindow(object):
                 "seq_range_mode": self.seq_range_mode.get(),
                 "seq_start": self.seq_start_var.get(),
                 "seq_end": self.seq_end_var.get(),
-                "seq_png": self.seq_png_var.get(),
-                "seq_mp4": self.seq_mp4_var.get(),
                 "seq_rate": self.seq_rate_var.get(),
-                "seq_depth": self.seq_depth_var.get(),
-                "seq_matte": self.seq_matte_var.get(),
                 "seq_matte_hide": self.seq_matte_hide_var.get(),
-                "seq_behind": self.seq_behind_var.get(),
                 "seq_subdir": self.seq_subdir_var.get(),
+                "seq_outputs": {k: [pv.get(), mv.get()]
+                                for k, (pv, mv) in self.seq_out_vars.items()},
+                "ffmpeg_path": getattr(self, "_ffmpeg_hint", "") or "",
                 "seq_w": self.seq_w_var.get(), "seq_h": self.seq_h_var.get(),
                 "seq_warm": self.seq_warm_var.get(), "seq_ts": self.seq_ts_var.get(),
                 "seq_fog": self.seq_fog_var.get(),
@@ -1225,14 +1355,19 @@ class CaptureWindow(object):
             self.seq_range_mode.set(st["seq_range_mode"])
         _setvar(self.seq_start_var, "seq_start")
         _setvar(self.seq_end_var, "seq_end")
-        _setvar(self.seq_png_var, "seq_png")
-        _setvar(self.seq_mp4_var, "seq_mp4")
         _setvar(self.seq_rate_var, "seq_rate")   # プリセット名 or CRF 数値そのまま
-        _setvar(self.seq_depth_var, "seq_depth")
-        _setvar(self.seq_matte_var, "seq_matte")
         _setvar(self.seq_matte_hide_var, "seq_matte_hide")
-        _setvar(self.seq_behind_var, "seq_behind")
         _setvar(self.seq_subdir_var, "seq_subdir")
+        outs = st.get("seq_outputs")
+        if isinstance(outs, dict):
+            for k, (pv, mv) in self.seq_out_vars.items():
+                v = outs.get(k)
+                if isinstance(v, (list, tuple)) and len(v) == 2:
+                    pv.set(bool(v[0]))
+                    mv.set(bool(v[1]))
+        fp = st.get("ffmpeg_path")
+        if fp:
+            self._ffmpeg_hint = fp
         _setvar(self.seq_w_var, "seq_w"); _setvar(self.seq_h_var, "seq_h")
         _setvar(self.seq_warm_var, "seq_warm"); _setvar(self.seq_ts_var, "seq_ts")
         _setvar(self.seq_fog_var, "seq_fog")

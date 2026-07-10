@@ -24,7 +24,7 @@ PNG / EXR で書き出す。映像タブは Sequencer で開いている LevelSe
 - **クリーンプレート**: Matte ON のとき Beauty と Z-Depth からマット対象を自動除外（隠せば影/AO も自動で消える）。
 - **解像度**: Use Camera Setting（アスペクト表示）/ Override（アスペクト維持トグルで幅⇄高さ自動）。出力名は `[任意名]_[カメラ名]_素材名_NNN`。
 - **anti-aliasing**: Spatial Supersample (1x / 2x / 4x)。Beauty は MRQ の TSR/Temporal。
-- **シーケンスレンダ（映像タブ）**: Sequencer で開いている LevelSequence をカメラカットに従って MRQ レンダ。PNG 連番と **H.264 MP4**（UE 内蔵エンコーダ・CRF プリセット 17/20/24/28・音声なし）を同時出力可。Z-Depth AOV（Near/Far 正規化・表示用エンコード）もパス毎の連番 / MP4 で出力できる。フレーム範囲はシーケンス設定または指定、fps はシーケンスの Display Rate。テイク毎サブフォルダ出力のトグルあり。「画像キャプチャの設定を転送」ボタンで画像タブの解像度 / 出力先 / 品質 / Depth 設定を一括コピー。
+- **シーケンスレンダ（映像タブ）**: Sequencer で開いている LevelSequence をカメラカットに従って MRQ レンダ。**5素材（Beauty / Z-Depth / Beauty+Matte(Matteの前) / Matteの奥 / ObjectID）それぞれに PNG 連番と H.264 MP4 を個別指定**できる。MRQ は PNG 連番（マスター）を出力し、MP4 は **ffmpeg でシーケンスの Display Rate どおりに**エンコード（CRF プリセット 17/20/24/28 + 数値直接入力・音声なし・余剰フレームは自動トリム）。Matte 系の対象は画像タブの Matte targets、ObjectID は Object ID targets を共用（色↔名前の JSON マニフェスト付き。レンダ中のみ r.CustomDepth=3 に切替えて復元）。フレーム範囲はシーケンス設定または指定。テイク毎サブフォルダ出力のトグルあり。「画像キャプチャの設定を転送」ボタンで画像タブの解像度 / 出力先 / 品質 / Depth 設定を一括コピー。
 - **設定の保持**: 両タブの入力は `Saved/UE5Capture_ui_settings.json` に保存され、次回起動時に復元される。
 - GUI (tkinter) は UE の Slate tick に非ブロッキング統合。tkinter が無い環境は CONFIG ベースの CUI に自動フォールバック。
 
@@ -51,6 +51,7 @@ PNG / EXR で書き出す。映像タブは Sequencer で開いている LevelSe
 | **Pillow (PIL)** | PNG / 16bit PNG の入出力、合成 | **必須** |
 | imageio または (OpenEXR + Imath) または opencv-python | Z-Depth を **EXR (float)** で出力する場合のみ | 任意 |
 | tkinter (tcl/tk) | GUI を使う場合。無ければ CUI へ自動フォールバック | 任意 |
+| **ffmpeg** | 映像タブの MP4 エンコード | MP4 を使う場合（imageio_ffmpeg 同梱バイナリ / PATH を自動検出。設定 JSON の `ffmpeg_path` で明示可） |
 
 UE 同梱 Python へのインストール例:
 
