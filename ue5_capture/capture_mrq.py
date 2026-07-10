@@ -257,24 +257,62 @@ def _start_render(sub, camera_actor, output_dir, width, height,
 # ----------------------------------------------------------------------------
 # シーケンスレンダ（PNG連番 / MP4。ユーザーの LevelSequence を直接レンダ）
 # ----------------------------------------------------------------------------
+def _set_matte_render_mode(actors):
+    """マット対象を「ビューティに写らず CustomDepth にだけ写る」状態にする。
+    影も落とさない（クリーンプレートと Matte パスを1ジョブで両立するため）。
+    返り値は復元用の (component, main_pass, custom_depth, cast_shadow) リスト。"""
+    saved = []
+    for a in actors or []:
+        if a is None:
+            continue
+        for comp in a.get_components_by_class(unreal.PrimitiveComponent):
+            try:
+                saved.append((comp,
+                              comp.get_editor_property("render_in_main_pass"),
+                              comp.get_editor_property("render_custom_depth"),
+                              comp.get_editor_property("cast_shadow")))
+                comp.set_editor_property("render_in_main_pass", False)
+                comp.set_editor_property("render_custom_depth", True)
+                comp.set_editor_property("cast_shadow", False)
+            except Exception as e:
+                _warn("Matte レンダモード設定に失敗: %s" % e)
+    return saved
+
+
+def _restore_matte_render_mode(saved):
+    for comp, mp, cd, cs in saved or []:
+        try:
+            comp.set_editor_property("render_in_main_pass", mp)
+            comp.set_editor_property("render_custom_depth", cd)
+            comp.set_editor_property("cast_shadow", cs)
+        except Exception as e:
+            _warn("Matte レンダモード復元に失敗: %s" % e)
+
+
 def render_sequence(level_sequence, output_dir, width, height, name_body, take_str,
                     do_png=True, do_mp4=False, mp4_crf=20,
                     temporal_samples=8, warmup=32,
                     custom_start=None, custom_end=None,
-                    depth_material=None, fog_off=False, on_done=None):
+                    depth_material=None, matte_material=None, matte_actors=None,
+                    hidden_actors=None, fog_off=False, on_done=None):
     """開いている/指定の LevelSequence を MRQ でレンダリング（非同期）。
     一時シーケンスは作らず job.sequence に直接指定し、カメラはシーケンスの
     カメラカットトラックに従う。fps はシーケンスの Display Rate。
+    静止画と違いモーションブラーは殺さない（切ると動きがストロボ状になる）。
     do_png=PNG連番 / do_mp4=内蔵 H.264 MP4（CRF 指定・音声なし）。両方同時可。
-    depth_material を渡すと additional_post_process_materials で Depth パスが増え、
-    パス毎に別ファイルで出力される（動画はフレーム番号が自動で外れて1本になる）。
-    出力名: name_body_{render_pass}_take.{frame_number} 。レンダパス名 FinalImage は
-    完了時に Beauty へリネームする。custom_start/custom_end は上書き範囲（end 排他）。"""
+    depth_material / matte_material を渡すと additional_post_process_materials で
+    パスが増え、パス毎に別ファイルで出力される。matte_material には matte_actors も
+    必須（対象を main pass 非表示 + CustomDepth 書き込みに切替え、完了時に復元）。
+    hidden_actors は単純な非表示（クリーンプレートのみ。matte とは排他で使う）。
+    出力名: name_body_{render_pass}_take.{frame_number} 。レンダパス名は完了時に
+    FinalImage→Beauty / FinalImageDepth→Depth / FinalImageMatte→Matte にリネーム。"""
     output_dir = os.path.normpath(output_dir)
     if not os.path.isdir(output_dir):
         os.makedirs(output_dir)
     if not (do_png or do_mp4):
         raise RuntimeError("PNG連番 / MP4 のどちらも選ばれていません。")
+    if matte_material is not None and not matte_actors:
+        raise RuntimeError("Matte 出力には対象アクターが必要です。")
 
     sub = unreal.get_editor_subsystem(unreal.MoviePipelineQueueSubsystem)
     if sub.is_rendering() or _KEEP.get("executor") is not None:
@@ -290,12 +328,36 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
         raise RuntimeError("シーケンスにカメラカットトラックがありません。"
                            "Sequencer でカメラカットを追加してください。")
 
+    # シーン状態の変更（レンダ後・起動失敗時に必ず復元）
+    saved_matte = None
+    hidden = []
+    if matte_material is not None:
+        saved_matte = _set_matte_render_mode(matte_actors)
+    elif hidden_actors:
+        for a in hidden_actors:
+            try:
+                a.set_actor_hidden_in_game(True)
+                hidden.append(a)
+            except Exception:
+                pass
+
+    def _restore_scene():
+        if saved_matte:
+            _restore_matte_render_mode(saved_matte)
+        for a in hidden:
+            try:
+                a.set_actor_hidden_in_game(False)
+            except Exception:
+                pass
+
     try:
         return _start_sequence_render(sub, level_sequence, output_dir, width, height,
                                       name_body, take_str, do_png, do_mp4, mp4_crf,
                                       temporal_samples, warmup, custom_start, custom_end,
-                                      depth_material, fog_off, on_done)
+                                      depth_material, matte_material, fog_off,
+                                      _restore_scene, on_done)
     except Exception:
+        _restore_scene()
         _KEEP.clear()      # 起動失敗時に次回レンダを塞がない
         raise
 
@@ -303,7 +365,8 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
 def _start_sequence_render(sub, level_sequence, output_dir, width, height,
                            name_body, take_str, do_png, do_mp4, mp4_crf,
                            temporal_samples, warmup, custom_start, custom_end,
-                           depth_material, fog_off, on_done):
+                           depth_material, matte_material, fog_off,
+                           restore_scene, on_done):
     queue = sub.get_queue()
     for j in list(queue.get_jobs()):
         queue.delete_job(j)
@@ -314,12 +377,17 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
 
     cfg = job.get_configuration()
     deferred = cfg.find_or_add_setting_by_class(unreal.MoviePipelineDeferredPassBase)
-    if depth_material is not None:
+    extra_passes = []
+    for pass_name, pass_mat in (("Depth", depth_material), ("Matte", matte_material)):
+        if pass_mat is None:
+            continue
         ppp = unreal.MoviePipelinePostProcessPass()
         ppp.set_editor_property("enabled", True)
-        ppp.set_editor_property("name", "Depth")
-        ppp.set_editor_property("material", depth_material)
-        deferred.set_editor_property("additional_post_process_materials", [ppp])
+        ppp.set_editor_property("name", pass_name)
+        ppp.set_editor_property("material", pass_mat)
+        extra_passes.append(ppp)
+    if extra_passes:
+        deferred.set_editor_property("additional_post_process_materials", extra_passes)
 
     if do_png:
         png = cfg.find_or_add_setting_by_class(unreal.MoviePipelineImageSequenceOutput_PNG)
@@ -371,7 +439,10 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
     except Exception:
         pass
 
-    cmds = list(_HQ_CONSOLE)
+    # 静止画用 _HQ_CONSOLE の r.MotionBlurQuality 0 はシーケンスでは使わない。
+    # モーションブラーを切ると 24fps でストロボ状のぎこちない動きになる上、
+    # MRQ のテンポラルサンプル蓄積ブラーも効かなくなる。
+    cmds = [c for c in _HQ_CONSOLE if "MotionBlur" not in c]
     if fog_off:
         cmds += ["r.Fog 0", "r.VolumetricFog 0"]
         _log("fog off")
@@ -382,6 +453,7 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
 
     def _on_finished(exec_obj, success):
         _log("MRQ シーケンスレンダ完了 success=%s -> %s" % (success, output_dir))
+        restore_scene()                     # matte/hidden の状態を元に戻す
         if fog_off:
             try:
                 w = _editor_world()
@@ -389,7 +461,7 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
                 unreal.SystemLibrary.execute_console_command(w, "r.VolumetricFog 1")
             except Exception:
                 pass
-        _rename_final_image(output_dir)     # FinalImage -> Beauty
+        _rename_final_image(output_dir)     # FinalImage -> Beauty ほか
         _KEEP.clear()
         if on_done:
             try:
@@ -416,7 +488,10 @@ def _rename_final_image(output_dir):
         for f in os.listdir(output_dir):
             if "_FinalImage" not in f:
                 continue
-            nf = f.replace("_FinalImageDepth", "_Depth").replace("_FinalImage", "_Beauty")
+            nf = f
+            for pass_name in ("Depth", "Matte"):
+                nf = nf.replace("_FinalImage" + pass_name, "_" + pass_name)
+            nf = nf.replace("_FinalImage", "_Beauty")
             try:
                 os.replace(os.path.join(output_dir, f), os.path.join(output_dir, nf))
             except Exception as e:
