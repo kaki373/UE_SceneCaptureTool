@@ -101,8 +101,8 @@ def render_beauty(camera_actor, output_dir, width, height,
         os.makedirs(output_dir)
 
     # 多重起動防止: 既に MRQ レンダ中なら弾く（PIE 衝突で破損 PNG が出るのを防ぐ）
-    _sub = unreal.get_editor_subsystem(unreal.MoviePipelineQueueSubsystem)
-    if _sub.is_rendering() or _KEEP.get("executor") is not None:
+    sub = unreal.get_editor_subsystem(unreal.MoviePipelineQueueSubsystem)
+    if sub.is_rendering() or _KEEP.get("executor") is not None:
         raise RuntimeError("MRQ は既にレンダリング中です。完了までお待ちください（多重起動防止）。")
 
     # 対象を非表示（レンダ後に復元）
@@ -115,9 +115,32 @@ def render_beauty(camera_actor, output_dir, width, height,
             except Exception:
                 pass
 
+    def _restore_hidden():
+        for a in restore:
+            try:
+                a.set_actor_hidden_in_game(False)
+            except Exception:
+                pass
+
+    try:
+        return _start_render(sub, camera_actor, output_dir, width, height,
+                             use_exr, spatial_samples, temporal_samples, warmup,
+                             file_basename, on_done, near_clip_cm, overscan,
+                             fog_off, _restore_hidden)
+    except Exception:
+        # 起動に失敗したら状態を巻き戻す（非表示を残さない・次回レンダを塞がない）
+        _restore_hidden()
+        _delete_temp_sequence()
+        _KEEP.clear()
+        raise
+
+
+def _start_render(sub, camera_actor, output_dir, width, height,
+                  use_exr, spatial_samples, temporal_samples, warmup,
+                  file_basename, on_done, near_clip_cm, overscan,
+                  fog_off, restore_hidden):
     seq, seq_path = _create_temp_sequence(camera_actor)
 
-    sub = unreal.get_editor_subsystem(unreal.MoviePipelineQueueSubsystem)
     queue = sub.get_queue()
     for j in list(queue.get_jobs()):
         queue.delete_job(j)
@@ -198,11 +221,7 @@ def render_beauty(camera_actor, output_dir, width, height,
     def _on_finished(exec_obj, success):
         _log("MRQ レンダ完了 success=%s -> %s" % (success, output_dir))
         _delete_temp_sequence()
-        for a in restore:                       # 非表示にしたアクターを元に戻す
-            try:
-                a.set_actor_hidden_in_game(False)
-            except Exception:
-                pass
+        restore_hidden()                        # 非表示にしたアクターを元に戻す
         if near_clip_cm is not None:
             # near clip はグローバルに残るので必ず既定(10cm)へ戻す（ビューポート破壊防止）
             try:
