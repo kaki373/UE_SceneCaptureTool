@@ -882,6 +882,37 @@ def composite_behind_in_matte(world, cam, matte_actors, beauty_path, behind_path
     return out_path
 
 
+def composite_behind_sequence(output_dir, name_body, take_str):
+    """シーケンスレンダの behind 合成。各フレームで Matte（選択=黒）をマスクに、
+    黒い部分は BehindPlate、白い部分は Beauty を合成した Behind 連番を書く。
+    出力したフレーム数を返す。"""
+    if not (_HAS_NUMPY and _HAS_PIL):
+        return 0
+    pat = re.compile(re.escape("%s_Beauty_%s." % (name_body, take_str)) + r"(\d+)\.png$")
+    n = 0
+    for f in sorted(os.listdir(output_dir)):
+        m = pat.match(f)
+        if not m:
+            continue
+        fr = m.group(1)
+        plate_p = os.path.join(output_dir, "%s_BehindPlate_%s.%s.png" % (name_body, take_str, fr))
+        matte_p = os.path.join(output_dir, "%s_Matte_%s.%s.png" % (name_body, take_str, fr))
+        if not (os.path.isfile(plate_p) and os.path.isfile(matte_p)):
+            _warn("behind 合成: フレーム %s の素材が不足（plate/matte）" % fr)
+            continue
+        beauty = _np.asarray(_PILImage.open(os.path.join(output_dir, f)).convert("RGB"),
+                             dtype=_np.float32)
+        plate = _np.asarray(_PILImage.open(plate_p).convert("RGB"), dtype=_np.float32)
+        matte = _np.asarray(_PILImage.open(matte_p).convert("L"), dtype=_np.float32) / 255.0
+        w_plate = (1.0 - matte)[:, :, None]     # Matte は 選択=黒（黒い所ほどプレート）
+        comp = plate * w_plate + beauty * (1.0 - w_plate)
+        out = os.path.join(output_dir, "%s_Behind_%s.%s.png" % (name_body, take_str, fr))
+        _write_png_u8(out, _np.clip(comp, 0, 255))
+        n += 1
+    _log("behind 合成: %d フレーム出力" % n)
+    return n
+
+
 def matte_near_clip_cm(actors, cam):
     """カメラからマット代表点までの『視線方向』距離(cm)を返す。MRQ の r.SetNearClipPlane 用
     （fronto-parallel 近似の behind-matte）。マット面がほぼ正対している前提。"""

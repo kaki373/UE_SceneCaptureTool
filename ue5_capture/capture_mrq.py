@@ -294,7 +294,8 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
                     temporal_samples=8, warmup=32,
                     custom_start=None, custom_end=None,
                     depth_material=None, matte_material=None, matte_actors=None,
-                    hidden_actors=None, fog_off=False, on_done=None):
+                    hidden_actors=None, near_clip_cm=None, beauty_label="Beauty",
+                    fog_off=False, on_done=None):
     """開いている/指定の LevelSequence を MRQ でレンダリング（非同期）。
     一時シーケンスは作らず job.sequence に直接指定し、カメラはシーケンスの
     カメラカットトラックに従う。fps はシーケンスの Display Rate。
@@ -304,8 +305,12 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
     パスが増え、パス毎に別ファイルで出力される。matte_material には matte_actors も
     必須（対象を main pass 非表示 + CustomDepth 書き込みに切替え、完了時に復元）。
     hidden_actors は単純な非表示（クリーンプレートのみ。matte とは排他で使う）。
+    near_clip_cm でその距離より手前を描画時クリップ（behind-matte のプレート用。
+    グローバル cvar なので完了時に既定 10cm へ戻す）。
     出力名: name_body_{render_pass}_take.{frame_number} 。レンダパス名は完了時に
-    FinalImage→Beauty / FinalImageDepth→Depth / FinalImageMatte→Matte にリネーム。"""
+    FinalImage→beauty_label（既定 Beauty）/ FinalImageDepth→Depth /
+    FinalImageMatte→Matte にリネーム。beauty_label は behind プレートの2本目ジョブが
+    メインの Beauty と衝突しないための上書き用（例 "BehindPlate"）。"""
     output_dir = os.path.normpath(output_dir)
     if not os.path.isdir(output_dir):
         os.makedirs(output_dir)
@@ -354,8 +359,8 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
         return _start_sequence_render(sub, level_sequence, output_dir, width, height,
                                       name_body, take_str, do_png, do_mp4, mp4_crf,
                                       temporal_samples, warmup, custom_start, custom_end,
-                                      depth_material, matte_material, fog_off,
-                                      _restore_scene, on_done)
+                                      depth_material, matte_material, near_clip_cm,
+                                      beauty_label, fog_off, _restore_scene, on_done)
     except Exception:
         _restore_scene()
         _KEEP.clear()      # 起動失敗時に次回レンダを塞がない
@@ -365,8 +370,8 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
 def _start_sequence_render(sub, level_sequence, output_dir, width, height,
                            name_body, take_str, do_png, do_mp4, mp4_crf,
                            temporal_samples, warmup, custom_start, custom_end,
-                           depth_material, matte_material, fog_off,
-                           restore_scene, on_done):
+                           depth_material, matte_material, near_clip_cm,
+                           beauty_label, fog_off, restore_scene, on_done):
     queue = sub.get_queue()
     for j in list(queue.get_jobs()):
         queue.delete_job(j)
@@ -443,6 +448,9 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
     # モーションブラーを切ると 24fps でストロボ状のぎこちない動きになる上、
     # MRQ のテンポラルサンプル蓄積ブラーも効かなくなる。
     cmds = [c for c in _HQ_CONSOLE if "MotionBlur" not in c]
+    if near_clip_cm is not None:
+        cmds.append("r.SetNearClipPlane %f" % float(near_clip_cm))
+        _log("near clip = %.1f cm" % float(near_clip_cm))
     if fog_off:
         cmds += ["r.Fog 0", "r.VolumetricFog 0"]
         _log("fog off")
@@ -454,14 +462,17 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
     def _on_finished(exec_obj, success):
         _log("MRQ シーケンスレンダ完了 success=%s -> %s" % (success, output_dir))
         restore_scene()                     # matte/hidden の状態を元に戻す
-        if fog_off:
-            try:
-                w = _editor_world()
+        try:
+            w = _editor_world()
+            if near_clip_cm is not None:
+                # near clip はグローバルに残るので必ず既定(10cm)へ戻す
+                unreal.SystemLibrary.execute_console_command(w, "r.SetNearClipPlane 10")
+            if fog_off:
                 unreal.SystemLibrary.execute_console_command(w, "r.Fog 1")
                 unreal.SystemLibrary.execute_console_command(w, "r.VolumetricFog 1")
-            except Exception:
-                pass
-        _rename_final_image(output_dir)     # FinalImage -> Beauty ほか
+        except Exception:
+            pass
+        _rename_final_image(output_dir, beauty_label)   # FinalImage -> Beauty ほか
         _KEEP.clear()
         if on_done:
             try:
@@ -480,10 +491,10 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
     return executor
 
 
-def _rename_final_image(output_dir):
+def _rename_final_image(output_dir, beauty_label="Beauty"):
     """MRQ のレンダパス名をツールの素材名に揃える。
     追加 PP パスの識別子は "FinalImage"+Name（例 FinalImageDepth）なので、
-    長い方を先に置換してから素の FinalImage を Beauty にする。"""
+    長い方を先に置換してから素の FinalImage を beauty_label にする。"""
     try:
         for f in os.listdir(output_dir):
             if "_FinalImage" not in f:
@@ -491,7 +502,7 @@ def _rename_final_image(output_dir):
             nf = f
             for pass_name in ("Depth", "Matte"):
                 nf = nf.replace("_FinalImage" + pass_name, "_" + pass_name)
-            nf = nf.replace("_FinalImage", "_Beauty")
+            nf = nf.replace("_FinalImage", "_" + beauty_label)
             try:
                 os.replace(os.path.join(output_dir, f), os.path.join(output_dir, nf))
             except Exception as e:
