@@ -5,6 +5,13 @@
 ステータス: **実装済み (as-built)**。ライブレンダ (2 フレーム、PNG 連番 + MP4 + Depth AOV、
 テイクサブフォルダ) で動作検証済み。本書は実装後の最終設計に同期している。
 
+> **注記 (2026-07-11)**: 本書の同期後にさらに以下が変更された。最新の仕様は README と実装を参照。
+> 出力は5素材（Beauty / Z-Depth / Matteの前(Beauty+Matte) / Matteの奥 / ObjectID）×
+> PNG連番/MP4 のマトリクス選択に変更。MP4 は内蔵エンコーダでなく **ffmpeg で
+> シーケンスの Display Rate どおりにエンコード**（範囲外フレームは自動トリム）。
+> ObjectID 映像パス（ステンシル色分け + JSON マニフェスト）を追加。
+> Z-Depth の Invert は廃止（手前=白 固定）。
+
 本仕様書中の `unreal.*` クラス名 / プロパティ名は、特記なき限り UE 5.7 のエンジンソース
 (`D:/Unreal/UE_5.7/Engine/Plugins/MovieScene/MovieRenderPipeline/` ほか) で実在を確認済み。
 未確認の項目は【要検証】と明記する。

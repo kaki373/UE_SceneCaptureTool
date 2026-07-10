@@ -15,11 +15,11 @@ PNG / EXR で書き出す。映像タブは Sequencer で開いている LevelSe
 
 ## 主な機能
 
-- **Beauty (MRQ)**: Movie Render Queue で対象カメラを通して高品質レンダ（ビューポート露出 + シーケンサ相当の影 / GI / TSR / ウォームアップ）。
-- **Z-Depth**: `SCS_SceneDepth`(cm) を Near/Far で正規化して 8bit / 16bit PNG、または EXR(float) で出力。`手前=白/奥=黒` 反転可。
-- **Matte (B/W)**: 指定オブジェクトのオクルージョン考慮シルエット。`+ Beauty + Matte alpha` で Beauty に α 合成した RGBA(MatteBeauty) も出力。
-- **Behind matte**: マットオブジェクトの**手前を除去して奥だけを描画**（MRQ Beauty 品質）。near-clip で手前を実除去し、マットのシルエット形状でマスク合成して出力。
-- **Object ID**: アクターを色分けした 1 枚 + 色 -> 名前の対応 JSON。`+ Beauty with alpha`(ObjectIDBeauty) で α 合成 RGBA、`+ Hide-render`(ObjectIDClean) でクリーンプレートも。
+- **Beauty (MRQ)**: Movie Render Queue で対象カメラを通して高品質レンダ（ビューポート露出 + シーケンサ相当の影 / GI / TSR / ウォームアップ）。出力形式は **PNG 8bit / JPG 8bit / EXR 16bit (float)**。
+- **Z-Depth**: `SCS_SceneDepth`(cm) を Near/Far で正規化して 8bit / 16bit PNG、または EXR(float) で出力。**手前=白 / 奥=黒 固定**。
+- **Matteの前（Beauty+Matte）**: クリーンな Beauty にオクルージョン考慮のマットをアルファとして焼いた RGBA(MatteBeauty)。生の白黒マットは内部素材（自動削除）。
+- **Matteの奥**: マットオブジェクトの**手前を除去して奥だけを描画**（MRQ Beauty 品質）。near-clip で手前を実除去し、マットのシルエット形状でマスク合成して出力。
+- **ObjectID**: 対象アクターを色分け（他は黒）した 1 枚 + 色 -> 名前の対応 JSON。
 - **Overscan**: 元フレームを中央に保ったまま周囲に余白を追加。`%`（一律）/ `px`（X,Y 別）。カメラ filmback を一時拡大して実現。
 - **クリーンプレート**: Matte ON のとき Beauty と Z-Depth からマット対象を自動除外（隠せば影/AO も自動で消える）。
 - **解像度**: Use Camera Setting（アスペクト表示）/ Override（アスペクト維持トグルで幅⇄高さ自動）。出力名は `[任意名]_[カメラ名]_素材名_NNN`。
