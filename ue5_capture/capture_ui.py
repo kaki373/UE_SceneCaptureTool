@@ -40,7 +40,7 @@ except Exception:
 _SEQ_OUTPUTS = [
     ("beauty", "Beauty", "Beauty"),
     ("depth", "Z-Depth", "Depth"),
-    ("mfront", "Beauty+Matte（Matteの前）", "MatteBeauty"),
+    ("mfront", "Matteの前（Beauty+Matte）", "MatteBeauty"),
     ("behind", "Matteの奥", "Behind"),
     ("objid", "ObjectID", "ObjectID"),
 ]
@@ -210,12 +210,7 @@ class CaptureWindow(object):
             row=row, column=0, columnspan=3, sticky="w", **pad)
         row += 1
 
-        # Beauty（MRQ = ビューポート露出＋シーケンサ品質）
-        self.beauty_var = tk.BooleanVar(master=self.root, value=True)
-        ttk.Checkbutton(frm, text="Beauty（MRQ = ビューポート露出＋シーケンサ品質）",
-                        variable=self.beauty_var).grid(
-            row=row, column=0, columnspan=3, sticky="w", padx=8)
-        row += 1
+        # 品質と出力形式（Beauty より上に置く）
         mrqf = ttk.Frame(frm)
         ttk.Label(mrqf, text="ウォームアップ:").pack(side="left")
         self.mrq_warmup_var = tk.StringVar(master=self.root, value="32")
@@ -223,14 +218,31 @@ class CaptureWindow(object):
         ttk.Label(mrqf, text="サンプリングフレーム:").pack(side="left", padx=(8, 0))
         self.mrq_ts_var = tk.StringVar(master=self.root, value="8")
         tk.Entry(mrqf, textvariable=self.mrq_ts_var, width=5).pack(side="left", padx=2)
-        mrqf.grid(row=row, column=0, columnspan=3, sticky="w", padx=24)
+        mrqf.grid(row=row, column=0, columnspan=3, sticky="w", padx=8)
+        row += 1
+        fmtf = ttk.Frame(frm)
+        ttk.Label(fmtf, text="出力形式:").pack(side="left")
+        self.beauty_fmt_var = tk.StringVar(master=self.root, value="PNG 8bit")
+        ttk.Combobox(fmtf, textvariable=self.beauty_fmt_var, state="readonly", width=11,
+                     values=["PNG 8bit", "PNG 16bit", "JPG", "EXR (float)"]).pack(
+            side="left", padx=4)
+        ttk.Label(fmtf, text="（Beauty の形式。Matte系合成/ObjectID は PNG）",
+                  foreground="#888").pack(side="left")
+        fmtf.grid(row=row, column=0, columnspan=3, sticky="w", padx=8)
+        row += 1
+        ttk.Frame(frm, height=8).grid(row=row, column=0)   # 余白
+        row += 1
+
+        # Beauty（MRQ = ビューポート露出＋シーケンサ品質）
+        self.beauty_var = tk.BooleanVar(master=self.root, value=True)
+        ttk.Checkbutton(frm, text="Beauty（MRQ = ビューポート露出＋シーケンサ品質）",
+                        variable=self.beauty_var).grid(
+            row=row, column=0, columnspan=3, sticky="w", padx=8)
         row += 1
         mrqf2 = ttk.Frame(frm)
-        self.mrq_exr_var = tk.BooleanVar(master=self.root, value=False)
-        ttk.Checkbutton(mrqf2, text="EXR", variable=self.mrq_exr_var).pack(side="left")
         self.mrq_camasp_var = tk.BooleanVar(master=self.root, value=True)
         ttk.Checkbutton(mrqf2, text="カメラのアスペクト",
-                        variable=self.mrq_camasp_var).pack(side="left", padx=(8, 0))
+                        variable=self.mrq_camasp_var).pack(side="left")
         self.fog_off_var = tk.BooleanVar(master=self.root, value=False)
         ttk.Checkbutton(mrqf2, text="Fogなし", variable=self.fog_off_var).pack(
             side="left", padx=(8, 0))
@@ -255,13 +267,13 @@ class CaptureWindow(object):
         ttk.Label(depth_frm, text="Far:").pack(side="left", padx=(6, 0))
         self.far_var = tk.StringVar(master=self.root, value="10000")
         tk.Entry(depth_frm, textvariable=self.far_var, width=7).pack(side="left", padx=2)
-        ttk.Label(depth_frm, text="cm（=Unreal世界単位。1m=100cm）").pack(side="left")
+        ttk.Label(depth_frm, text="cm（1m=100cm）").pack(side="left")
         depth_frm.grid(row=row, column=0, columnspan=3, sticky="w", padx=24)
         row += 1
 
         # Matte 系（Beauty+Matte / Matteの奥。対象は Matte targets）
         self.mfront_var = tk.BooleanVar(master=self.root, value=False)
-        ttk.Checkbutton(frm, text="Beauty+Matte（Matteの前）",
+        ttk.Checkbutton(frm, text="Matteの前（Beauty+Matte）",
                         variable=self.mfront_var).grid(
             row=row, column=0, columnspan=3, sticky="w", padx=8)
         row += 1
@@ -353,55 +365,7 @@ class CaptureWindow(object):
             row=row, column=0, columnspan=3, sticky="we", pady=8)
         row += 1
 
-        ttk.Label(frm, text="出力（素材ごとに PNG連番 / MP4 を選択。MP4 はシーケンスの fps で ffmpeg エンコード）:").grid(
-            row=row, column=0, columnspan=3, sticky="w", **pad)
-        row += 1
-        mtx = ttk.Frame(frm)
-        ttk.Label(mtx, text="PNG連番").grid(row=0, column=1, padx=8)
-        ttk.Label(mtx, text="MP4").grid(row=0, column=2, padx=8)
-        self.seq_out_vars = {}
-        for i, (key, label, _pass) in enumerate(_SEQ_OUTPUTS):
-            ttk.Label(mtx, text=label).grid(row=i + 1, column=0, sticky="w", pady=1)
-            pv = tk.BooleanVar(master=self.root, value=(key == "beauty"))
-            mv = tk.BooleanVar(master=self.root, value=(key == "beauty"))
-            ttk.Checkbutton(mtx, variable=pv).grid(row=i + 1, column=1)
-            ttk.Checkbutton(mtx, variable=mv).grid(row=i + 1, column=2)
-            self.seq_out_vars[key] = (pv, mv)
-        mtx.grid(row=row, column=0, columnspan=3, sticky="w", padx=24)
-        row += 1
-        rate = ttk.Frame(frm)
-        ttk.Label(rate, text="レート:").pack(side="left")
-        self.seq_rate_var = tk.StringVar(master=self.root, value="高 (CRF 20)")
-        ttk.Combobox(rate, textvariable=self.seq_rate_var, state="normal", width=12,
-                     values=list(_MP4_RATE_PRESETS.keys())).pack(side="left", padx=2)
-        ttk.Label(rate, text="(CRF 16-51 直接入力可)", foreground="#888").pack(
-            side="left", padx=(2, 0))
-        rate.grid(row=row, column=0, columnspan=3, sticky="w", padx=24)
-        row += 1
-        dep = ttk.Frame(frm)
-        ttk.Label(dep, text="Z-Depth 設定:  Near:").pack(side="left")
-        self.seq_near_var = tk.StringVar(master=self.root, value="0")
-        tk.Entry(dep, textvariable=self.seq_near_var, width=6).pack(side="left", padx=2)
-        ttk.Label(dep, text="Far:").pack(side="left", padx=(6, 0))
-        self.seq_far_var = tk.StringVar(master=self.root, value="10000")
-        tk.Entry(dep, textvariable=self.seq_far_var, width=7).pack(side="left", padx=2)
-        ttk.Label(dep, text="cm（手前=白 / 奥=黒）").pack(side="left")
-        dep.grid(row=row, column=0, columnspan=3, sticky="w", padx=24)
-        row += 1
-        self.seq_matte_hide_var = tk.BooleanVar(master=self.root, value=False)
-        ttk.Checkbutton(frm, text="Matte 対象を隠す（クリーンプレートのみ。Matte系出力時は自動で隠れる）",
-                        variable=self.seq_matte_hide_var).grid(
-            row=row, column=0, columnspan=3, sticky="w", padx=24)
-        row += 1
-        ttk.Label(frm, text="（Matte系の対象=画像タブの Matte targets / ObjectID の対象=画像タブの Object ID targets。"
-                            "空ならエディタ選択。Matteの奥は2本目レンダ＋合成、ObjectID は色↔名前の JSON 付き）",
-                  foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", padx=24)
-        row += 1
-
-        ttk.Separator(frm, orient="horizontal").grid(
-            row=row, column=0, columnspan=3, sticky="we", pady=8)
-        row += 1
-
+        # 出力先まわり（画像タブと同じ並びで「出力」の上に置く）
         ttk.Label(frm, text="Output Dir:").grid(row=row, column=0, sticky="w", **pad)
         default_dir = os.path.normpath(
             os.path.join(unreal.Paths.project_saved_dir(), "Captures"))
@@ -426,6 +390,53 @@ class CaptureWindow(object):
         row += 1
         ttk.Label(frm, text="  ファイル名: [任意名]_[シーケンス名]_素材名_NNN.フレーム番号",
                   foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", padx=8)
+        row += 1
+
+        ttk.Separator(frm, orient="horizontal").grid(
+            row=row, column=0, columnspan=3, sticky="we", pady=8)
+        row += 1
+
+        ttk.Label(frm, text="出力（素材ごとに PNG連番 / MP4。MP4 はシーケンスの fps で ffmpeg エンコード）:").grid(
+            row=row, column=0, columnspan=3, sticky="w", **pad)
+        row += 1
+        mtx = ttk.Frame(frm)
+        ttk.Label(mtx, text="PNG連番").grid(row=0, column=1, padx=8)
+        ttk.Label(mtx, text="MP4").grid(row=0, column=2, padx=8)
+        rate = ttk.Frame(mtx)
+        ttk.Label(rate, text="レート:").pack(side="left")
+        self.seq_rate_var = tk.StringVar(master=self.root, value="高 (CRF 20)")
+        ttk.Combobox(rate, textvariable=self.seq_rate_var, state="normal", width=11,
+                     values=list(_MP4_RATE_PRESETS.keys())).pack(side="left", padx=2)
+        ttk.Label(rate, text="(数値可)", foreground="#888").pack(side="left")
+        rate.grid(row=0, column=3, sticky="w", padx=(12, 0))
+        self.seq_out_vars = {}
+        for i, (key, label, _pass) in enumerate(_SEQ_OUTPUTS):
+            ttk.Label(mtx, text=label).grid(row=i + 1, column=0, sticky="w", pady=1)
+            pv = tk.BooleanVar(master=self.root, value=(key == "beauty"))
+            mv = tk.BooleanVar(master=self.root, value=(key == "beauty"))
+            ttk.Checkbutton(mtx, variable=pv).grid(row=i + 1, column=1)
+            ttk.Checkbutton(mtx, variable=mv).grid(row=i + 1, column=2)
+            self.seq_out_vars[key] = (pv, mv)
+            if key == "depth":
+                depf = ttk.Frame(mtx)
+                ttk.Label(depf, text="Near:").pack(side="left")
+                self.seq_near_var = tk.StringVar(master=self.root, value="0")
+                tk.Entry(depf, textvariable=self.seq_near_var, width=6).pack(side="left", padx=2)
+                ttk.Label(depf, text="Far:").pack(side="left", padx=(6, 0))
+                self.seq_far_var = tk.StringVar(master=self.root, value="10000")
+                tk.Entry(depf, textvariable=self.seq_far_var, width=7).pack(side="left", padx=2)
+                ttk.Label(depf, text="cm（手前=白/奥=黒）").pack(side="left")
+                depf.grid(row=i + 1, column=3, sticky="w", padx=(12, 0))
+        mtx.grid(row=row, column=0, columnspan=3, sticky="w", padx=24)
+        row += 1
+        self.seq_matte_hide_var = tk.BooleanVar(master=self.root, value=False)
+        ttk.Checkbutton(frm, text="Matte 対象を隠す（クリーンプレートのみ。Matte系出力時は自動で隠れる）",
+                        variable=self.seq_matte_hide_var).grid(
+            row=row, column=0, columnspan=3, sticky="w", padx=24)
+        row += 1
+        ttk.Label(frm, text="（Matte系の対象=画像タブの Matte targets / ObjectID の対象=画像タブの Object ID targets。"
+                            "空ならエディタ選択。Matteの奥は2本目レンダ＋合成、ObjectID は色↔名前の JSON 付き）",
+                  foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", padx=24)
         row += 1
 
         self.seq_btn = ttk.Button(frm, text="Sequence Render", style="Big.TButton",
@@ -568,8 +579,20 @@ class CaptureWindow(object):
         except Exception as e:
             self.status_var.set("データパス出力でエラー: %s" % e)
 
-        beauty_path = os.path.join(out, _name("Beauty") + ".png")
-        exr = self.mrq_exr_var.get()
+        # Beauty の出力形式（PNG 16bit は MRQ 非対応のため 8bit にフォールバック）
+        fmt_label = self.beauty_fmt_var.get()
+        if fmt_label == "PNG 16bit":
+            self.status_var.set("PNG 16bit は Beauty 未対応のため PNG 8bit で出力します"
+                                "（Z-Depth は Format で 16bit 可）")
+            fmt_label = "PNG 8bit"
+        img_fmt = {"PNG 8bit": "png", "JPG": "jpg", "EXR (float)": "exr"}.get(fmt_label, "png")
+        beauty_path = os.path.join(out, _name("Beauty") +
+                                   {"png": ".png", "jpg": ".jpg", "exr": ".exr"}[img_fmt])
+        # Matte 系合成は PIL で読める画像が必要。EXR のときは PNG も内部出力して使う。
+        need_comp = want_mfront or want_behind
+        aux_png = (img_fmt == "exr") and need_comp
+        comp_beauty = (os.path.join(out, _name("Beauty") + ".png")
+                       if img_fmt == "exr" else beauty_path)
 
         # Beauty（MRQ）は Beauty 指定時か Matte 系合成が要るときだけレンダする
         beauty_needed = self.beauty_var.get() or want_mfront or want_behind
@@ -601,9 +624,11 @@ class CaptureWindow(object):
                 self.status_var.set("Matteの奥: Matte 対象が見つかりません")
 
         def _finalize():
-            # 内部素材の後始末: 生 Matte マスクは製品ではないので削除。
+            # 内部素材の後始末: 生 Matte マスクと EXR 用の内部 PNG は削除。
             # Beauty のチェックが無い場合（合成のためだけにレンダした場合）も削除。
+            aux = comp_beauty if comp_beauty != beauty_path else None
             for p, keep in ((matte_path, False),
+                            (aux, False),
                             (beauty_path, self.beauty_var.get())):
                 if p and not keep and os.path.isfile(p):
                     try:
@@ -627,7 +652,7 @@ class CaptureWindow(object):
                         inter = os.path.join(out, _j["base"] + ".png")
                         core.composite_behind_in_matte(
                             core._get_editor_world(), core.get_camera_settings(c),
-                            _j["matte"], beauty_path, inter,
+                            _j["matte"], comp_beauty, inter,
                             os.path.join(out, _name("Behind") + ".png"),
                             W, H)
                         # 中間の全画面 near-clip は残さない（最終 behindmatte.png のみ）
@@ -642,7 +667,7 @@ class CaptureWindow(object):
             self.status_var.set("追加 MRQ レンダ中… (%s)" % j["base"])
             self.root.update()
             try:
-                capture_mrq.render_beauty(cam, out, W, H, use_exr=exr,
+                capture_mrq.render_beauty(cam, out, W, H, image_format="png",
                                           temporal_samples=ts, warmup=warm,
                                           file_basename=j["base"],
                                           hidden_actors=j["hidden"],
@@ -656,7 +681,7 @@ class CaptureWindow(object):
                 try:
                     if want_mfront and matte_path:
                         core.blend_with_beauty(
-                            beauty_path, matte_path, None,
+                            comp_beauty, matte_path, None,
                             matte_out=os.path.join(out, _name("MatteBeauty") + ".png"))
                 except Exception as e:
                     _restore_fb()
@@ -670,7 +695,8 @@ class CaptureWindow(object):
         self.status_var.set("MRQ Beauty レンダ中… (PIEに入ります / 完了まで待機)")
         self.root.update()
         try:
-            capture_mrq.render_beauty(cam, out, W, H, use_exr=exr,
+            capture_mrq.render_beauty(cam, out, W, H, image_format=img_fmt,
+                                      also_png=aux_png,
                                       temporal_samples=ts, warmup=warm,
                                       file_basename=_name("Beauty"),
                                       hidden_actors=beauty_hidden,
@@ -1231,7 +1257,7 @@ class CaptureWindow(object):
                 "near": self.near_var.get(), "far": self.far_var.get(),
                 "mrq_warmup": self.mrq_warmup_var.get(),
                 "mrq_ts": self.mrq_ts_var.get(),
-                "mrq_exr": self.mrq_exr_var.get(),
+                "beauty_fmt": self.beauty_fmt_var.get(),
                 "mrq_camasp": self.mrq_camasp_var.get(),
                 "fog_off": self.fog_off_var.get(),
                 "seq_range_mode": self.seq_range_mode.get(),
@@ -1313,7 +1339,8 @@ class CaptureWindow(object):
         _setvar(self.near_var, "near"); _setvar(self.far_var, "far")
         _setvar(self.mrq_warmup_var, "mrq_warmup")
         _setvar(self.mrq_ts_var, "mrq_ts")
-        _setvar(self.mrq_exr_var, "mrq_exr")
+        if st.get("beauty_fmt") in ("PNG 8bit", "PNG 16bit", "JPG", "EXR (float)"):
+            self.beauty_fmt_var.set(st["beauty_fmt"])
         _setvar(self.mrq_camasp_var, "mrq_camasp")
         _setvar(self.fog_off_var, "fog_off")
         if st.get("seq_range_mode") in ("auto", "custom"):

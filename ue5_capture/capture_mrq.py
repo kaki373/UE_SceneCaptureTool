@@ -89,7 +89,8 @@ _HQ_CONSOLE = [
 
 
 def render_beauty(camera_actor, output_dir, width, height,
-                  use_exr=False, spatial_samples=1, temporal_samples=8,
+                  use_exr=False, image_format=None, also_png=False,
+                  spatial_samples=1, temporal_samples=8,
                   warmup=32, file_basename="beauty", hidden_actors=None, on_done=None,
                   near_clip_cm=None, overscan=0.0, fog_off=False):
     """対象カメラを MRQ で Beauty レンダリング（非同期）。executor を返す。
@@ -151,8 +152,22 @@ def _start_render(sub, camera_actor, output_dir, width, height,
 
     cfg = job.get_configuration()
     cfg.find_or_add_setting_by_class(unreal.MoviePipelineDeferredPassBase)
-    if use_exr:
-        out_fmt = cfg.find_or_add_setting_by_class(unreal.MoviePipelineImageSequenceOutput_EXR)
+    # image_format: "png"（既定）/ "jpg" / "exr"。exr のとき also_png=True で
+    # PNG も同時出力する（Matte 系合成が PIL で読める画像を必要とするため）。
+    fmt = (image_format or ("exr" if use_exr else "png")).lower()
+    if fmt == "exr":
+        cfg.find_or_add_setting_by_class(unreal.MoviePipelineImageSequenceOutput_EXR)
+        if also_png:
+            png_fmt = cfg.find_or_add_setting_by_class(unreal.MoviePipelineImageSequenceOutput_PNG)
+            try:
+                png_fmt.set_editor_property("write_alpha", False)
+            except Exception:
+                pass
+    elif fmt == "jpg":
+        jpg_cls = getattr(unreal, "MoviePipelineImageSequenceOutput_JPG", None)
+        if jpg_cls is None:
+            raise RuntimeError("この UE には JPG 出力 (MoviePipelineImageSequenceOutput_JPG) がありません。")
+        cfg.find_or_add_setting_by_class(jpg_cls)
     else:
         out_fmt = cfg.find_or_add_setting_by_class(unreal.MoviePipelineImageSequenceOutput_PNG)
         try:
