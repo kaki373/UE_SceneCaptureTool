@@ -397,10 +397,13 @@ class CaptureWindow(object):
         self.seq_matte_var = tk.BooleanVar(master=self.root, value=False)
         ttk.Checkbutton(mt, text="+ Matte も出力（白黒）",
                         variable=self.seq_matte_var).pack(side="left", padx=(8, 0))
+        self.seq_behind_var = tk.BooleanVar(master=self.root, value=False)
+        ttk.Checkbutton(mt, text="+ Behind（奥を描画）",
+                        variable=self.seq_behind_var).pack(side="left", padx=(8, 0))
         mt.grid(row=row, column=0, columnspan=3, sticky="w", **pad)
         row += 1
-        ttk.Label(frm, text="（対象は画像タブの Matte targets、空ならエディタ選択。"
-                            "Matte 出力時は対象を自動で隠す＝選択=黒/周囲=白）",
+        ttk.Label(frm, text="（対象は画像タブの Matte targets、空ならエディタ選択。Matte/Behind は対象を自動で隠す。"
+                            "Behind は2本目のレンダ＋合成連番。near-clip は開始フレームのカメラ位置基準）",
                   foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", padx=24)
         row += 1
 
@@ -586,7 +589,7 @@ class CaptureWindow(object):
         want_matte_fill = self.matte_fill_var.get()
         want_objid_fill = self.objid_fill_var.get()
         want_hidden = self.objid_hide_var.get()
-        objid_names = self._pick_targets(self.objid_pick)
+        objid_names = self._pick_targets_resolved(self.objid_pick)
         try:
             if s.do_matte or s.do_object_id or s.do_depth:
                 self.status_var.set("同フレームの Matte/ObjectID/Depth を出力中…")
@@ -606,7 +609,7 @@ class CaptureWindow(object):
         # Matte ON のときは Beauty から対象を常に隠す（クリーンプレート）。
         beauty_hidden = None
         if self.matte_var.get():
-            matte_names = self._pick_targets(self.matte_pick)
+            matte_names = self._pick_targets_resolved(self.matte_pick)
             beauty_hidden = core._resolve_target_actors(None, matte_names or None)
             if beauty_hidden:
                 self.status_var.set("Beauty: Matte 対象 %d 個を隠して撮影（クリーンプレート）" % len(beauty_hidden))
@@ -621,7 +624,7 @@ class CaptureWindow(object):
                              base=_name("ObjectIDClean")))
         # Behind matte: マット面までの距離で near-clip して手前を除去（MRQ Beauty 品質）
         if self.behind_var.get():
-            mt = core._resolve_target_actors(None, self._pick_targets(self.matte_pick) or None)
+            mt = core._resolve_target_actors(None, self._pick_targets_resolved(self.matte_pick) or None)
             if mt:
                 nc = core.matte_near_clip_cm(mt, core.get_camera_settings(cam))
                 jobs.append(dict(hidden=mt, base=_name("BehindPlate"),
@@ -706,6 +709,29 @@ class CaptureWindow(object):
         except Exception:
             return None
 
+    def _sequence_camera_at(self, seq, frame):
+        """プレイヘッドを frame に合わせ、カメラカットに束縛されたカメラアクターを返す。
+        バインディング解決に失敗した場合はレベル内の先頭カメラにフォールバック。"""
+        try:
+            unreal.LevelSequenceEditorBlueprintLibrary.set_current_time(int(frame))
+        except Exception:
+            pass
+        ext = unreal.MovieSceneSequenceExtensions
+        try:
+            world = core._get_editor_world()
+            sec = ext.find_tracks_by_exact_type(
+                seq, unreal.MovieSceneCameraCutTrack)[0].get_sections()[0]
+            guid = sec.get_camera_binding_id().get_editor_property("guid")
+            for b in ext.get_bindings(seq):
+                if b.get_id() == guid:
+                    for o in ext.locate_bound_objects(seq, b, world):
+                        if isinstance(o, unreal.Actor):
+                            return o
+        except Exception:
+            pass
+        cams = core.list_cameras()
+        return cams[0] if cams else None
+
     def _refresh_sequence(self):
         seq = self._current_sequence()
         if seq is None:
@@ -764,10 +790,11 @@ class CaptureWindow(object):
         crf = self._resolve_crf()
         self._save_ui_state()
         # Matte 対象（画像タブの Matte targets を共用。空ならエディタ選択）
+        want_behind = self.seq_behind_var.get()
         matte_actors = None
-        if self.seq_matte_var.get() or self.seq_matte_hide_var.get():
+        if self.seq_matte_var.get() or self.seq_matte_hide_var.get() or want_behind:
             matte_actors = core._resolve_target_actors(
-                None, self._pick_targets(self.matte_pick) or None)
+                None, self._pick_targets_resolved(self.matte_pick) or None)
             if not matte_actors:
                 self.status_var.set("シーケンスレンダ: Matte 対象が見つかりません"
                                     "（画像タブの Matte targets か選択を確認）")
@@ -780,8 +807,8 @@ class CaptureWindow(object):
                     self._float_var(self.seq_near_var, 0.0),
                     self._float_var(self.seq_far_var, 10000.0),
                     invert=self.seq_inv_var.get())
-            if self.seq_matte_var.get():
-                matte_mat = core.create_temp_matte_material()
+            if self.seq_matte_var.get() or want_behind:
+                matte_mat = core.create_temp_matte_material()   # Behind は合成にマットが必要
             elif self.seq_matte_hide_var.get():
                 hide_actors = matte_actors
         except Exception as e:
@@ -794,31 +821,77 @@ class CaptureWindow(object):
             if matte_mat is not None:
                 core.delete_temp_matte_material()
 
-        def _done(ok, od):
+        def _final(ok, od):
             _cleanup_materials()
             self.status_var.set(("シーケンスレンダ完了: %s" % od) if ok
                                 else "シーケンスレンダ失敗 (Output Log 参照)")
+
+        def _after_main(ok, od):
+            if not (ok and want_behind):
+                _final(ok, od)
+                return
+            # ② Behind プレート: 開始フレームのカメラ→マット距離で near-clip して手前を除去
+            try:
+                start_f = cs if cs is not None else \
+                    unreal.MovieSceneSequenceExtensions.get_playback_start(seq)
+                cam_actor = self._sequence_camera_at(seq, start_f)
+                if cam_actor is None:
+                    raise RuntimeError("シーケンスカメラを特定できません")
+                nc = core.matte_near_clip_cm(
+                    matte_actors, {"transform": cam_actor.get_actor_transform()})
+            except Exception as e:
+                self.status_var.set("Behind: near-clip 計算失敗: %s" % e)
+                _final(False, od)
+                return
+
+            def _after_plate(ok2, od2):
+                if ok2:
+                    try:
+                        n = core.composite_behind_sequence(out, name_body, take_str)
+                        if n == 0:
+                            self.status_var.set("Behind 合成: 素材不足で 0 フレーム")
+                    except Exception as e:
+                        self.status_var.set("Behind 合成エラー: %s" % e)
+                _final(ok2, od2)
+
+            self.status_var.set("Behind プレートをレンダ中… (near-clip %.0fcm)" % nc)
+            self.root.update()
+            try:
+                capture_mrq.render_sequence(
+                    seq, out, W, H, name_body, take_str,
+                    do_png=True, do_mp4=self.seq_mp4_var.get(), mp4_crf=crf,
+                    temporal_samples=ts, warmup=warm,
+                    custom_start=cs, custom_end=ce,
+                    hidden_actors=matte_actors, near_clip_cm=nc,
+                    beauty_label="BehindPlate",
+                    fog_off=self.seq_fog_var.get(), on_done=_after_plate)
+            except Exception as e:
+                self.status_var.set("Behind プレート起動失敗: %s" % e)
+                _final(False, od)
 
         self.status_var.set("シーケンスレンダ中… (PIE に入ります / MP4 CRF %d)" % crf)
         self.root.update()
         try:
             capture_mrq.render_sequence(
                 seq, out, W, H, name_body, take_str,
-                do_png=self.seq_png_var.get(), do_mp4=self.seq_mp4_var.get(),
+                do_png=self.seq_png_var.get() or want_behind,   # Behind 合成は PNG が必要
+                do_mp4=self.seq_mp4_var.get(),
                 mp4_crf=crf, temporal_samples=ts, warmup=warm,
                 custom_start=cs, custom_end=ce,
                 depth_material=depth_mat,
                 matte_material=matte_mat, matte_actors=matte_actors,
                 hidden_actors=hide_actors, fog_off=self.seq_fog_var.get(),
-                on_done=_done)
+                on_done=_after_main)
         except Exception as e:
             _cleanup_materials()
             self.status_var.set("シーケンスレンダ起動失敗: %s" % e)
 
     def _make_picker(self, frm, row, label):
         """対象アクターのリストを作る。リストの中身＝対象。
-        Add Sel: アウトライナ/ビューポートの選択を追加 / Clear: リストで選択した項目を削除。"""
-        p = {"all": []}
+        Add Sel: アウトライナ/ビューポートの選択を追加 / Clear: リストで選択した項目を削除。
+        キーはフルパス名だが、追加時のラベルも保持し、パスが解決できなくなった場合
+        （再インポート等でアクターが作り直された場合）はラベルで再解決する。"""
+        p = {"all": [], "labels": {}}
         bar = ttk.Frame(frm)
         ttk.Label(bar, text=label).pack(side="left")
         ttk.Button(bar, text="Add Sel", width=8,
@@ -843,6 +916,19 @@ class CaptureWindow(object):
         一意かつ、レベル側でラベルをリネームしても不変。"""
         return list(p["all"])
 
+    def _pick_targets_resolved(self, p):
+        """解決用の名前リスト。パスが現在のレベルに存在すればパス、無ければ
+        追加時に保存したラベルへフォールバックする（再インポート等でアクターが
+        作り直されるとパスが変わるため。ラベルが同じなら自動で追従できる）。"""
+        p2l = self._path2label()
+        out = []
+        for path in p["all"]:
+            if path in p2l:
+                out.append(path)
+            else:
+                out.append(p.get("labels", {}).get(path) or path)
+        return out
+
     def _path2label(self):
         """現在レベルの フルパス名→ラベル の対応を作る（表示用に毎回ライブ取得）。"""
         m = {}
@@ -855,20 +941,28 @@ class CaptureWindow(object):
 
     def _pick_refresh(self, p):
         # p["all"] はフルパス名のリスト。表示は現在のラベルをライブ取得する（リネーム追従）。
+        # レベルに無いパスは保存済みラベルでの再解決を試みる旨を表示する。
         p2l = self._path2label()
         p["list"].delete(0, "end")
         for path in p["all"]:
             lab = p2l.get(path)
             short = path.rsplit(".", 1)[-1]    # 末尾の内部名だけ補助表示
-            p["list"].insert("end", "%s  [%s]" % (lab, short) if lab else "%s  (レベルに無し)" % short)
+            if lab:
+                p["list"].insert("end", "%s  [%s]" % (lab, short))
+            else:
+                saved = p.get("labels", {}).get(path)
+                p["list"].insert("end", "%s  (パス無し→ラベル'%s'で解決)" % (short, saved)
+                                 if saved else "%s  (レベルに無し)" % short)
 
     def _pick_add_selection(self, p):
-        """選択中アクターをリストへ追加。キーはフルパス名（get_path_name()）で重複無視。"""
+        """選択中アクターをリストへ追加。キーはフルパス名（get_path_name()）で重複無視。
+        追加時のラベルも保持する（パスが失効した場合のフォールバック解決用）。"""
         sel = core.get_selected_actors()
         added = 0
         for a in sel:
             try:
                 path = a.get_path_name()
+                p.setdefault("labels", {})[path] = a.get_actor_label()
             except Exception:
                 continue
             if path not in p["all"]:
@@ -1027,6 +1121,8 @@ class CaptureWindow(object):
                 "objid_hide": self.objid_hide_var.get(),
                 "matte_names": self._pick_targets(self.matte_pick),
                 "objid_names": self._pick_targets(self.objid_pick),
+                "matte_labels": self.matte_pick.get("labels", {}),
+                "objid_labels": self.objid_pick.get("labels", {}),
                 "depth_bit": self.depth_bit_var.get(),
                 "depth_invert": self.depth_invert_var.get(),
                 "near": self.near_var.get(), "far": self.far_var.get(),
@@ -1044,6 +1140,7 @@ class CaptureWindow(object):
                 "seq_depth": self.seq_depth_var.get(),
                 "seq_matte": self.seq_matte_var.get(),
                 "seq_matte_hide": self.seq_matte_hide_var.get(),
+                "seq_behind": self.seq_behind_var.get(),
                 "seq_subdir": self.seq_subdir_var.get(),
                 "seq_w": self.seq_w_var.get(), "seq_h": self.seq_h_var.get(),
                 "seq_warm": self.seq_warm_var.get(), "seq_ts": self.seq_ts_var.get(),
@@ -1099,17 +1196,20 @@ class CaptureWindow(object):
         _setvar(self.objid_fill_var, "objid_fill")
         _setvar(self.objid_hide_var, "objid_hide")
 
-        def _restore_picker(p, names_key):
+        def _restore_picker(p, names_key, labels_key):
             names = st.get(names_key)
             if isinstance(names, str):   # 旧形式互換
                 names = [x.strip() for x in names.split(",") if x.strip()]
+            labels = st.get(labels_key)
+            if isinstance(labels, dict):
+                p["labels"] = dict(labels)
             if names:
                 # 旧設定はラベル/内部名を保存していた。ラベル一致するものはフルパス名へ移行する。
                 label2path = {v: k for k, v in self._path2label().items()}
                 p["all"] = [label2path.get(n, n) for n in names]
                 self._pick_refresh(p)
-        _restore_picker(self.matte_pick, "matte_names")
-        _restore_picker(self.objid_pick, "objid_names")
+        _restore_picker(self.matte_pick, "matte_names", "matte_labels")
+        _restore_picker(self.objid_pick, "objid_names", "objid_labels")
         if st.get("depth_bit") in ("8bit PNG", "16bit PNG", "EXR float"):
             self.depth_bit_var.set(st["depth_bit"])
         _setvar(self.depth_invert_var, "depth_invert")
@@ -1129,6 +1229,7 @@ class CaptureWindow(object):
         _setvar(self.seq_depth_var, "seq_depth")
         _setvar(self.seq_matte_var, "seq_matte")
         _setvar(self.seq_matte_hide_var, "seq_matte_hide")
+        _setvar(self.seq_behind_var, "seq_behind")
         _setvar(self.seq_subdir_var, "seq_subdir")
         _setvar(self.seq_w_var, "seq_w"); _setvar(self.seq_h_var, "seq_h")
         _setvar(self.seq_warm_var, "seq_warm"); _setvar(self.seq_ts_var, "seq_ts")
@@ -1161,9 +1262,10 @@ class CaptureWindow(object):
         s.do_object_id = self.objid_var.get()
         s.objid_fill_alpha = self.objid_fill_var.get()
         s.objid_hide_render = self.objid_hide_var.get()
-        # 対象リスト（リストの中身＝対象。空ならエディタ選択にフォールバック）
-        s.matte_actor_names = self._pick_targets(self.matte_pick) or None
-        s.objid_actor_names = self._pick_targets(self.objid_pick) or None
+        # 対象リスト（リストの中身＝対象。空ならエディタ選択にフォールバック。
+        # パス失効時はラベルで再解決）
+        s.matte_actor_names = self._pick_targets_resolved(self.matte_pick) or None
+        s.objid_actor_names = self._pick_targets_resolved(self.objid_pick) or None
         dsel = self.depth_bit_var.get()
         if dsel.startswith("8"):
             s.depth_bit = "8bit"
