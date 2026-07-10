@@ -190,7 +190,7 @@ class CaptureWindow(object):
         ttk.Checkbutton(frm, text="カメラ名を付ける", variable=self.name_usecam_var).grid(
             row=row, column=0, columnspan=2, sticky="w", **pad)
         row += 1
-        ttk.Label(frm, text="  ファイル名: [任意名]_[カメラ名]_素材名_001",
+        ttk.Label(frm, text="  ファイル名: [任意名]_[カメラ名]_素材名_NNN",
                   foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", padx=8)
         row += 1
 
@@ -234,7 +234,7 @@ class CaptureWindow(object):
 
         # Matte（独立した対象ピッカー）
         self.matte_var = tk.BooleanVar(master=self.root, value=False)
-        ttk.Checkbutton(frm, text="Matte B/W png image",
+        ttk.Checkbutton(frm, text="Matte（白黒）を出力",
                         variable=self.matte_var).grid(
             row=row, column=0, columnspan=3, sticky="w", padx=8)
         row += 1
@@ -248,7 +248,7 @@ class CaptureWindow(object):
                   foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", padx=24)
         row += 1
         self.behind_var = tk.BooleanVar(master=self.root, value=False)
-        ttk.Checkbutton(frm, text="  + Behind matte   マットオブジェクトの奥を描画",
+        ttk.Checkbutton(frm, text="  + Matteの奥を描画",
                         variable=self.behind_var).grid(
             row=row, column=0, columnspan=3, sticky="w", padx=24)
         row += 1
@@ -352,7 +352,7 @@ class CaptureWindow(object):
         row += 1
 
         res = ttk.Frame(frm)
-        ttk.Label(res, text="解像度:").pack(side="left")
+        ttk.Label(res, text="Resolution:").pack(side="left")
         self.seq_w_var = tk.StringVar(master=self.root, value="1920")
         tk.Entry(res, textvariable=self.seq_w_var, width=6).pack(side="left", padx=2)
         ttk.Label(res, text="x").pack(side="left")
@@ -361,7 +361,7 @@ class CaptureWindow(object):
         ttk.Label(res, text="ウォームアップ:").pack(side="left", padx=(12, 0))
         self.seq_warm_var = tk.StringVar(master=self.root, value="32")
         tk.Entry(res, textvariable=self.seq_warm_var, width=5).pack(side="left", padx=2)
-        ttk.Label(res, text="サンプリング:").pack(side="left", padx=(8, 0))
+        ttk.Label(res, text="サンプリングフレーム:").pack(side="left", padx=(8, 0))
         self.seq_ts_var = tk.StringVar(master=self.root, value="8")
         tk.Entry(res, textvariable=self.seq_ts_var, width=5).pack(side="left", padx=2)
         res.grid(row=row, column=0, columnspan=3, sticky="w", **pad)
@@ -395,21 +395,23 @@ class CaptureWindow(object):
         ttk.Checkbutton(mt, text="Matte 対象を隠す（クリーンプレート）",
                         variable=self.seq_matte_hide_var).pack(side="left")
         self.seq_matte_var = tk.BooleanVar(master=self.root, value=False)
-        ttk.Checkbutton(mt, text="+ Matte も出力（白黒）",
+        ttk.Checkbutton(mt, text="+ Matte（白黒）を出力",
                         variable=self.seq_matte_var).pack(side="left", padx=(8, 0))
-        self.seq_behind_var = tk.BooleanVar(master=self.root, value=False)
-        ttk.Checkbutton(mt, text="+ Behind（奥を描画）",
-                        variable=self.seq_behind_var).pack(side="left", padx=(8, 0))
         mt.grid(row=row, column=0, columnspan=3, sticky="w", **pad)
         row += 1
-        ttk.Label(frm, text="（対象は画像タブの Matte targets、空ならエディタ選択。Matte/Behind は対象を自動で隠す。"
-                            "Behind は2本目のレンダ＋合成連番。near-clip は開始フレームのカメラ位置基準）",
+        self.seq_behind_var = tk.BooleanVar(master=self.root, value=False)
+        ttk.Checkbutton(frm, text="+ Matteの奥を描画",
+                        variable=self.seq_behind_var).grid(
+            row=row, column=0, columnspan=3, sticky="w", padx=24)
+        row += 1
+        ttk.Label(frm, text="（対象は画像タブの Matte targets、空ならエディタ選択。Matte/奥描画は対象を自動で隠す。"
+                            "奥描画は2本目のレンダ＋合成連番。near-clip は開始フレームのカメラ位置基準）",
                   foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", padx=24)
         row += 1
 
         dep = ttk.Frame(frm)
         self.seq_depth_var = tk.BooleanVar(master=self.root, value=False)
-        ttk.Checkbutton(dep, text="Z-Depth も出力", variable=self.seq_depth_var).pack(side="left")
+        ttk.Checkbutton(dep, text="Z-Depth", variable=self.seq_depth_var).pack(side="left")
         ttk.Label(dep, text="Near:").pack(side="left", padx=(8, 0))
         self.seq_near_var = tk.StringVar(master=self.root, value="0")
         tk.Entry(dep, textvariable=self.seq_near_var, width=6).pack(side="left", padx=2)
@@ -418,8 +420,8 @@ class CaptureWindow(object):
         tk.Entry(dep, textvariable=self.seq_far_var, width=7).pack(side="left", padx=2)
         ttk.Label(dep, text="cm").pack(side="left")
         self.seq_inv_var = tk.BooleanVar(master=self.root, value=True)
-        ttk.Checkbutton(dep, text="Invert (近=白)", variable=self.seq_inv_var).pack(
-            side="left", padx=(8, 0))
+        ttk.Checkbutton(dep, text="Invert (near=white / far=black)",
+                        variable=self.seq_inv_var).pack(side="left", padx=(8, 0))
         dep.grid(row=row, column=0, columnspan=3, sticky="w", **pad)
         row += 1
         ttk.Label(frm, text="（Z-Depth 連番/MP4 は表示用エンコード。厳密なリニア深度は画像タブの Z-Depth を使用）",
