@@ -17,15 +17,15 @@ _OWNER = "UE5CaptureLauncher"
 _SECTION = "UE5Capture"
 _ENTRY = "UE5CaptureLaunch"
 
+# Slate コールバック内で直接 tk.Tk() を作ると Tcl panic でエディタが落ちるため、
+# capture_menu.on_open_panel()（次の Slate tick に遅延して開く）を経由する。
 _LAUNCH_CMD = (
-    "import sys, importlib\n"
+    "import sys\n"
     "p = r'%s'\n"
     "if p not in sys.path:\n"
     "    sys.path.insert(0, p)\n"
-    "import capture_core, capture_ui\n"
-    "importlib.reload(capture_core)\n"
-    "importlib.reload(capture_ui)\n"
-    "capture_ui.show()\n"
+    "import capture_menu\n"
+    "capture_menu.on_open_panel()\n"
 ) % _TOOL_DIR
 
 

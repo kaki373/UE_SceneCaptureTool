@@ -33,13 +33,35 @@ _SUBMENU_PATH = _PARENT + "." + _MENU_NAME
 
 # ------------------------------------------------------------------- handlers
 def on_open_panel():
-    """ツールを開く。モジュールを reload するのでコード修正も反映される。"""
-    import importlib
-    import capture_core
-    import capture_ui
-    importlib.reload(capture_core)
-    importlib.reload(capture_ui)
-    capture_ui.show()
+    """ツールを開く（次の Slate tick に遅延して開く）。
+
+    メニュー/ツールバークリックの Slate コールスタック内で tk.Tk() を生成すると、
+    別ツール（max2ue 等）の Tk ルートが既に存在するセッションで Tcl panic →
+    エディタごと abort する（2026-07-10 クラッシュダンプ2件で実測。
+    MCP 経由など Slate スタック外からの同じ処理は落ちない）。
+    コールスタックが巻き戻った後の tick で開けば安全。"""
+    state = {}
+
+    def _open_once(dt):
+        h = state.pop("h", None)
+        if h is not None:
+            try:
+                unreal.unregister_slate_post_tick_callback(h)
+            except Exception:
+                pass
+        try:
+            import importlib
+            import capture_core
+            import capture_ui
+            importlib.reload(capture_core)
+            importlib.reload(capture_ui)
+            capture_ui.show()
+        except Exception as ex:
+            import traceback
+            traceback.print_exc()
+            unreal.log_error("[SceneCapture] パネルを開けませんでした: %s" % ex)
+
+    state["h"] = unreal.register_slate_post_tick_callback(_open_once)
 
 
 def _settings_json_path():
