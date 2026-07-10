@@ -135,12 +135,6 @@ class CaptureWindow(object):
                      state="readonly", width=8).grid(row=row, column=1, sticky="w", **pad)
         row += 1
 
-        # 露出は MRQ(実カメラの物理露出+PostProcessVolume) が担当するため UI からは廃止。
-        # 互換のため変数だけ保持（SceneCapture 旧Color は使わない）。
-        self.exp_mode_var = tk.StringVar(value="Auto")
-        self.exp_ev_var = tk.StringVar(value="-8")
-        self.exp_target_var = tk.StringVar(value="45")
-
         # Output dir
         ttk.Label(frm, text="Output Dir:").grid(row=row, column=0, sticky="w", **pad)
         default_dir = os.path.normpath(
@@ -174,9 +168,6 @@ class CaptureWindow(object):
         ttk.Label(frm, text="Passes（Color/Beauty は下の MRQ ボタンで出力）").grid(
             row=row, column=0, columnspan=3, sticky="w", **pad)
         row += 1
-
-        # 旧 Color(SceneCapture) は廃止。互換のため変数だけ False で保持。
-        self.color_var = tk.BooleanVar(value=False)
 
         # Depth
         self.depth_var = tk.BooleanVar(value=False)
@@ -303,18 +294,19 @@ class CaptureWindow(object):
         self._update_cam_res()
 
     # ------------------------------------------------------------- handlers
-    def _basename(self, pass_type, suf, cam):
-        """MRQ 出力名を 任意名_カメラ名_素材名_NNN で組む（SceneCapture 側と同じ規則）。"""
-        parts = []
-        if self.name_usecustom_var.get():
-            c = self.name_custom_var.get().strip()
-            if c:
-                parts.append(core._safe_name(c))
-        if self.name_usecam_var.get() and cam is not None:
-            parts.append(core._safe_name(cam.get_actor_label()))
-        parts.append(pass_type)
-        parts.append(suf)
-        return "_".join(parts)
+    @staticmethod
+    def _int_var(var, default):
+        try:
+            return int(var.get())
+        except ValueError:
+            return default
+
+    @staticmethod
+    def _float_var(var, default):
+        try:
+            return float(var.get())
+        except ValueError:
+            return default
 
     def _browse(self):
         d = filedialog.askdirectory(initialdir=self.out_var.get() or "/")
@@ -324,7 +316,6 @@ class CaptureWindow(object):
     def _on_mrq(self):
         """Movie Render Queue で Beauty を高品質レンダ（非同期・PIE）。"""
         import capture_mrq
-        importlib = __import__("importlib")
         importlib.reload(capture_mrq)
         cam = self._current_camera()
         if cam is None:
@@ -339,50 +330,26 @@ class CaptureWindow(object):
                 os.makedirs(out)
             except Exception:
                 pass
-        try:
-            W = int(self.w_var.get())
-        except ValueError:
-            W = 1920
+        W = self._int_var(self.w_var, 1920)
         if self.mrq_camasp_var.get():
             asp = core.get_camera_settings(cam).get("aspect_ratio", 0.0)
             H = int(round(W / asp)) if asp > 0.1 else 1080
         else:
-            try:
-                H = int(self.h_var.get())
-            except ValueError:
-                H = 1080
+            H = self._int_var(self.h_var, 1080)
         # Overscan: ON のとき fx(横)/fy(縦) を決める。% は一律、px は X/Y 別。
         # カメラの filmback を一時拡大して FOV を縦横独立に広げ、解像度も ×(1+f) に拡大。
         fx = fy = 0.0
         if self.overscan_on_var.get():
             if self.overscan_mode_var.get() == "pixels":
-                try:
-                    pxx = max(0.0, float(self.overscan_x_var.get()))
-                except ValueError:
-                    pxx = 0.0
-                try:
-                    pxy = max(0.0, float(self.overscan_y_var.get()))
-                except ValueError:
-                    pxy = 0.0
-                fx = pxx / W if W > 0 else 0.0
-                fy = pxy / H if H > 0 else 0.0
+                fx = (max(0.0, self._float_var(self.overscan_x_var, 0.0)) / W) if W > 0 else 0.0
+                fy = (max(0.0, self._float_var(self.overscan_y_var, 0.0)) / H) if H > 0 else 0.0
             else:
-                try:
-                    p = max(0.0, float(self.overscan_var.get()) / 100.0)
-                except ValueError:
-                    p = 0.0
-                fx = fy = p
+                fx = fy = max(0.0, self._float_var(self.overscan_var, 0.0) / 100.0)
         if fx > 0.0 or fy > 0.0:
             W = int(round(W * (1.0 + fx)))
             H = int(round(H * (1.0 + fy)))
-        try:
-            warm = int(self.mrq_warmup_var.get())
-        except ValueError:
-            warm = 32
-        try:
-            ts = int(self.mrq_ts_var.get())
-        except ValueError:
-            ts = 8
+        warm = self._int_var(self.mrq_warmup_var, 32)
+        ts = self._int_var(self.mrq_ts_var, 8)
         self._save_ui_state()
         # Overscan: filmback を一時拡大（全パスのレンダ前。MRQ完了後/失敗時に復元）。
         _osc_fb = None
@@ -403,22 +370,26 @@ class CaptureWindow(object):
         # ① マスク系データ(Matte白黒 / ObjectID色 / Depth)を同フレーム・同解像度で先に出す。
         #    旧Color(SceneCapture Fill)は一切出さない。matte_fill/objid_fill/objid_hidden は
         #    全て MRQ Beauty を使うので、ここでは作らない。
+        s = self._collect_settings()
+        s.camera_actor = cam
+        s.use_camera_resolution = False
+        s.override_width, s.override_height = W, H
+        s.matte_fill_alpha = False          # Beauty と後段で合成
+        s.objid_fill_alpha = False
+        s.objid_hide_render = False         # 非表示レンダも Beauty(2回目MRQ)で行う
+        s.do_behind_matte = False           # behind は下の MRQ near-clip ジョブで高品質に行う
+        s.take_suffix = suf                 # SceneCapture 系の出力にも同じ通し番号
+
+        def _name(pass_type):
+            """MRQ 出力名（SceneCapture 側と同じ 任意名_カメラ名_素材名_NNN 規則）。"""
+            return core.out_basename(s, pass_type, suf)
+
         matte_path = objid_path = None
         want_matte_fill = self.matte_fill_var.get()
         want_objid_fill = self.objid_fill_var.get()
         want_hidden = self.objid_hide_var.get()
         objid_names = self._pick_targets(self.objid_pick)
         try:
-            s = self._collect_settings()
-            s.camera_actor = cam
-            s.do_color = False
-            s.use_camera_resolution = False
-            s.override_width, s.override_height = W, H
-            s.matte_fill_alpha = False         # Beauty と後段で合成
-            s.objid_fill_alpha = False
-            s.objid_hide_render = False         # 非表示レンダも Beauty(2回目MRQ)で行う
-            s.do_behind_matte = False           # behind は下の MRQ near-clip ジョブで高品質に行う
-            s.take_suffix = suf                 # SceneCapture 系の出力にも同じ通し番号
             if s.do_matte or s.do_object_id or s.do_depth:
                 self.status_var.set("同フレームの Matte/ObjectID/Depth を出力中…")
                 self.root.update()
@@ -431,7 +402,7 @@ class CaptureWindow(object):
         except Exception as e:
             self.status_var.set("データパス出力でエラー: %s" % e)
 
-        beauty_path = os.path.join(out, self._basename("Beauty", suf, cam) + ".png")
+        beauty_path = os.path.join(out, _name("Beauty") + ".png")
         exr = self.mrq_exr_var.get()
 
         # Matte ON のときは Beauty から対象を常に隠す（クリーンプレート）。
@@ -449,13 +420,13 @@ class CaptureWindow(object):
         jobs = []
         if want_hidden and objid_names and objid_path:
             jobs.append(dict(hidden=core._resolve_target_actors(None, objid_names),
-                             base=self._basename("ObjectIDClean", suf, cam)))
+                             base=_name("ObjectIDClean")))
         # Behind matte: マット面までの距離で near-clip して手前を除去（MRQ Beauty 品質）
         if self.behind_var.get():
             mt = core._resolve_target_actors(None, self._pick_targets(self.matte_pick) or None)
             if mt:
                 nc = core.matte_near_clip_cm(mt, core.get_camera_settings(cam))
-                jobs.append(dict(hidden=mt, base=self._basename("BehindPlate", suf, cam),
+                jobs.append(dict(hidden=mt, base=_name("BehindPlate"),
                                  near_clip=nc, composite=True, matte=mt))
             else:
                 self.status_var.set("Behind matte: Matte 対象が見つかりません")
@@ -476,7 +447,7 @@ class CaptureWindow(object):
                         core.composite_behind_in_matte(
                             core._get_editor_world(), core.get_camera_settings(c),
                             _j["matte"], beauty_path, inter,
-                            os.path.join(out, self._basename("Behind", suf, cam) + ".png"),
+                            os.path.join(out, _name("Behind") + ".png"),
                             W, H)
                         # 中間の全画面 near-clip は残さない（最終 behindmatte.png のみ）
                         try:
@@ -506,8 +477,8 @@ class CaptureWindow(object):
                         beauty_path,
                         matte_path if want_matte_fill else None,
                         objid_path if want_objid_fill else None,
-                        matte_out=os.path.join(out, self._basename("MatteBeauty", suf, cam) + ".png"),
-                        objid_out=os.path.join(out, self._basename("ObjectIDBeauty", suf, cam) + ".png"))
+                        matte_out=os.path.join(out, _name("MatteBeauty") + ".png"),
+                        objid_out=os.path.join(out, _name("ObjectIDBeauty") + ".png"))
                 except Exception as e:
                     _restore_fb()
                     self.status_var.set("Beautyブレンドでエラー: %s" % e)
@@ -522,7 +493,7 @@ class CaptureWindow(object):
         try:
             capture_mrq.render_beauty(cam, out, W, H, use_exr=exr,
                                       temporal_samples=ts, warmup=warm,
-                                      file_basename=self._basename("Beauty", suf, cam),
+                                      file_basename=_name("Beauty"),
                                       hidden_actors=beauty_hidden,
                                       fog_off=self.fog_off_var.get(), on_done=_after_beauty)
         except Exception as e:
@@ -732,7 +703,6 @@ class CaptureWindow(object):
                 "name_usecustom": self.name_usecustom_var.get(),
                 "name_custom": self.name_custom_var.get(),
                 "name_usecam": self.name_usecam_var.get(),
-                "color": self.color_var.get(),
                 "depth": self.depth_var.get(),
                 "matte": self.matte_var.get(),
                 "matte_fill": self.matte_fill_var.get(),
@@ -745,9 +715,6 @@ class CaptureWindow(object):
                 "depth_bit": self.depth_bit_var.get(),
                 "depth_invert": self.depth_invert_var.get(),
                 "near": self.near_var.get(), "far": self.far_var.get(),
-                "exp_mode": self.exp_mode_var.get(),
-                "exp_ev": self.exp_ev_var.get(),
-                "exp_target": self.exp_target_var.get(),
                 "mrq_warmup": self.mrq_warmup_var.get(),
                 "mrq_ts": self.mrq_ts_var.get(),
                 "mrq_exr": self.mrq_exr_var.get(),
@@ -790,7 +757,7 @@ class CaptureWindow(object):
         _setvar(self.name_usecustom_var, "name_usecustom")
         _setvar(self.name_custom_var, "name_custom")
         _setvar(self.name_usecam_var, "name_usecam")
-        _setvar(self.color_var, "color"); _setvar(self.depth_var, "depth")
+        _setvar(self.depth_var, "depth")
         _setvar(self.matte_var, "matte")
         _setvar(self.matte_fill_var, "matte_fill")
         _setvar(self.behind_var, "behind")
@@ -813,10 +780,6 @@ class CaptureWindow(object):
             self.depth_bit_var.set(st["depth_bit"])
         _setvar(self.depth_invert_var, "depth_invert")
         _setvar(self.near_var, "near"); _setvar(self.far_var, "far")
-        if st.get("exp_mode") in ("Auto", "Scene (viewport)", "Manual EV"):
-            self.exp_mode_var.set(st["exp_mode"])
-        _setvar(self.exp_ev_var, "exp_ev")
-        _setvar(self.exp_target_var, "exp_target")
         _setvar(self.mrq_warmup_var, "mrq_warmup")
         _setvar(self.mrq_ts_var, "mrq_ts")
         _setvar(self.mrq_exr_var, "mrq_exr")
@@ -827,17 +790,14 @@ class CaptureWindow(object):
         s = core.CaptureSettings()
         s.camera_actor = self._current_camera()
         s.use_camera_resolution = (self.res_mode.get() == "camera")
-        try:
-            s.override_width = int(self.w_var.get())
-            s.override_height = int(self.h_var.get())
-        except ValueError:
-            pass
+        s.override_width = self._int_var(self.w_var, s.override_width)
+        s.override_height = self._int_var(self.h_var, s.override_height)
         s.aa_factor = {"1x": 1, "2x": 2, "4x": 4}.get(self.aa_var.get(), 2)
         s.output_dir = self.out_var.get().strip()
         s.name_prefix = self.name_custom_var.get().strip() if self.name_usecustom_var.get() else ""
         s.name_include_camera = self.name_usecam_var.get()
         s.fog_off = self.fog_off_var.get()
-        s.do_color = self.color_var.get()
+        s.do_color = False                 # 旧 Color(SceneCapture) は廃止。Beauty は MRQ で出す。
         s.do_depth = self.depth_var.get()
         s.do_matte = self.matte_var.get()
         s.matte_invert = True              # 選択=黒/周囲=白 で固定
@@ -847,11 +807,8 @@ class CaptureWindow(object):
         s.do_object_id = self.objid_var.get()
         s.objid_fill_alpha = self.objid_fill_var.get()
         s.objid_hide_render = self.objid_hide_var.get()
-        # Matte 対象（リストの中身＝対象。空ならエディタ選択にフォールバック）
-        s.matte_actors = None
+        # 対象リスト（リストの中身＝対象。空ならエディタ選択にフォールバック）
         s.matte_actor_names = self._pick_targets(self.matte_pick) or None
-        # Object ID 対象（Matte とは別リスト）
-        s.objid_actors = None
         s.objid_actor_names = self._pick_targets(self.objid_pick) or None
         dsel = self.depth_bit_var.get()
         if dsel.startswith("8"):
@@ -861,46 +818,9 @@ class CaptureWindow(object):
         else:
             s.depth_bit = "exr"
         s.depth_invert = self.depth_invert_var.get()
-        try:
-            s.depth_near = float(self.near_var.get())
-            s.depth_far = float(self.far_var.get())
-        except ValueError:
-            pass
-        # 露出
-        em = self.exp_mode_var.get()
-        if em.startswith("Scene"):
-            s.exposure_mode = "scene"
-        elif em.startswith("Manual"):
-            s.exposure_mode = "manual"
-        else:
-            s.exposure_mode = "auto"
-        try:
-            s.exposure_bias = float(self.exp_ev_var.get())
-        except ValueError:
-            pass
-        try:
-            s.exposure_target = float(self.exp_target_var.get())
-        except ValueError:
-            pass
-        s.matte_actors = None  # 実行時に選択アクター取得
+        s.depth_near = self._float_var(self.near_var, s.depth_near)
+        s.depth_far = self._float_var(self.far_var, s.depth_far)
         return s
-
-    def _on_capture(self):
-        s = self._collect_settings()
-        problems = s.validate()
-        if problems:
-            self.status_var.set("NG: " + " / ".join(problems))
-            return
-        if s.output_dir and not os.path.isdir(s.output_dir):
-            try:
-                os.makedirs(s.output_dir)
-            except Exception:
-                pass
-        self.status_var.set("Capturing...")
-        self.root.update()
-        self._save_ui_state()      # 入力内容を保持（次回復元用）
-        outs = core.run_capture(s)
-        self.status_var.set("Done: %d file(s)" % len(outs) if outs else "Failed (see Output Log)")
 
     # ------------------------------------------------------------ UE tick
     def _register_tick(self):
