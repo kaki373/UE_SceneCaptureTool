@@ -252,3 +252,174 @@ def _start_render(sub, camera_actor, output_dir, width, height,
          % (camera_actor.get_actor_label(), width, height, temporal_samples, warmup, output_dir))
     sub.render_queue_with_executor_instance(executor)
     return executor
+
+
+# ----------------------------------------------------------------------------
+# シーケンスレンダ（PNG連番 / MP4。ユーザーの LevelSequence を直接レンダ）
+# ----------------------------------------------------------------------------
+def render_sequence(level_sequence, output_dir, width, height, name_body, take_str,
+                    do_png=True, do_mp4=False, mp4_crf=20,
+                    temporal_samples=8, warmup=32,
+                    custom_start=None, custom_end=None,
+                    depth_material=None, fog_off=False, on_done=None):
+    """開いている/指定の LevelSequence を MRQ でレンダリング（非同期）。
+    一時シーケンスは作らず job.sequence に直接指定し、カメラはシーケンスの
+    カメラカットトラックに従う。fps はシーケンスの Display Rate。
+    do_png=PNG連番 / do_mp4=内蔵 H.264 MP4（CRF 指定・音声なし）。両方同時可。
+    depth_material を渡すと additional_post_process_materials で Depth パスが増え、
+    パス毎に別ファイルで出力される（動画はフレーム番号が自動で外れて1本になる）。
+    出力名: name_body_{render_pass}_take.{frame_number} 。レンダパス名 FinalImage は
+    完了時に Beauty へリネームする。custom_start/custom_end は上書き範囲（end 排他）。"""
+    output_dir = os.path.normpath(output_dir)
+    if not os.path.isdir(output_dir):
+        os.makedirs(output_dir)
+    if not (do_png or do_mp4):
+        raise RuntimeError("PNG連番 / MP4 のどちらも選ばれていません。")
+
+    sub = unreal.get_editor_subsystem(unreal.MoviePipelineQueueSubsystem)
+    if sub.is_rendering() or _KEEP.get("executor") is not None:
+        raise RuntimeError("MRQ は既にレンダリング中です。完了までお待ちください（多重起動防止）。")
+
+    # カメラカットトラックが無いと何も映らないので先に弾く
+    try:
+        cuts = unreal.MovieSceneSequenceExtensions.find_tracks_by_exact_type(
+            level_sequence, unreal.MovieSceneCameraCutTrack)
+    except Exception:
+        cuts = None
+    if cuts is not None and not list(cuts):
+        raise RuntimeError("シーケンスにカメラカットトラックがありません。"
+                           "Sequencer でカメラカットを追加してください。")
+
+    try:
+        return _start_sequence_render(sub, level_sequence, output_dir, width, height,
+                                      name_body, take_str, do_png, do_mp4, mp4_crf,
+                                      temporal_samples, warmup, custom_start, custom_end,
+                                      depth_material, fog_off, on_done)
+    except Exception:
+        _KEEP.clear()      # 起動失敗時に次回レンダを塞がない
+        raise
+
+
+def _start_sequence_render(sub, level_sequence, output_dir, width, height,
+                           name_body, take_str, do_png, do_mp4, mp4_crf,
+                           temporal_samples, warmup, custom_start, custom_end,
+                           depth_material, fog_off, on_done):
+    queue = sub.get_queue()
+    for j in list(queue.get_jobs()):
+        queue.delete_job(j)
+    job = queue.allocate_new_job(unreal.MoviePipelineExecutorJob)
+    job.job_name = "UE5Capture_Sequence"
+    job.map = unreal.SoftObjectPath(_current_map_softpath())
+    job.sequence = unreal.SoftObjectPath(level_sequence.get_path_name())
+
+    cfg = job.get_configuration()
+    deferred = cfg.find_or_add_setting_by_class(unreal.MoviePipelineDeferredPassBase)
+    if depth_material is not None:
+        ppp = unreal.MoviePipelinePostProcessPass()
+        ppp.set_editor_property("enabled", True)
+        ppp.set_editor_property("name", "Depth")
+        ppp.set_editor_property("material", depth_material)
+        deferred.set_editor_property("additional_post_process_materials", [ppp])
+
+    if do_png:
+        png = cfg.find_or_add_setting_by_class(unreal.MoviePipelineImageSequenceOutput_PNG)
+        try:
+            png.set_editor_property("write_alpha", False)
+        except Exception:
+            pass
+    if do_mp4:
+        mp4 = cfg.find_or_add_setting_by_class(unreal.MoviePipelineMP4EncoderOutput)
+        mp4.set_editor_property("constant_rate_factor", int(mp4_crf))
+        mp4.set_editor_property("include_audio", False)
+
+    out = cfg.find_or_add_setting_by_class(unreal.MoviePipelineOutputSetting)
+    out.set_editor_property("output_directory", unreal.DirectoryPath(output_dir))
+    out.set_editor_property("output_resolution", unreal.IntPoint(int(width), int(height)))
+    # 動画出力側は {frame_number} を自動で外して1ファイルにする（エンジン仕様）
+    out.set_editor_property("file_name_format",
+                            "%s_{render_pass}_%s.{frame_number}" % (name_body, take_str))
+    out.set_editor_property("override_existing_output", True)
+    out.set_editor_property("zero_pad_frame_numbers", 4)
+    try:
+        out.set_editor_property("flush_disk_writes_per_shot", True)
+    except Exception:
+        pass
+    if custom_start is not None and custom_end is not None:
+        out.set_editor_property("use_custom_playback_range", True)
+        out.set_editor_property("custom_start_frame", int(custom_start))
+        out.set_editor_property("custom_end_frame", int(custom_end))
+
+    aa = cfg.find_or_add_setting_by_class(unreal.MoviePipelineAntiAliasingSetting)
+    aa.set_editor_property("override_anti_aliasing", True)
+    aa.set_editor_property("spatial_sample_count", 1)
+    aa.set_editor_property("temporal_sample_count", int(temporal_samples))
+    aa.set_editor_property("engine_warm_up_count", int(warmup))
+    aa.set_editor_property("render_warm_up_count", int(warmup))
+    try:
+        aa.set_editor_property("anti_aliasing_method", unreal.AntiAliasingMethod.AAM_TSR)
+    except Exception:
+        pass
+
+    go = cfg.find_or_add_setting_by_class(unreal.MoviePipelineGameOverrideSetting)
+    go.set_editor_property("use_high_quality_shadows", True)
+    go.set_editor_property("use_lod_zero", True)
+    go.set_editor_property("flush_grass_streaming", True)
+    go.set_editor_property("flush_streaming_managers", True)
+    try:
+        go.set_editor_property("texture_streaming",
+                               unreal.MoviePipelineTextureStreamingMethod.FULLY_LOAD)
+    except Exception:
+        pass
+
+    cmds = list(_HQ_CONSOLE)
+    if fog_off:
+        cmds += ["r.Fog 0", "r.VolumetricFog 0"]
+        _log("fog off")
+    cv = cfg.find_or_add_setting_by_class(unreal.MoviePipelineConsoleVariableSetting)
+    cv.set_editor_property("start_console_commands", cmds)
+
+    executor = unreal.MoviePipelinePIEExecutor()
+
+    def _on_finished(exec_obj, success):
+        _log("MRQ シーケンスレンダ完了 success=%s -> %s" % (success, output_dir))
+        if fog_off:
+            try:
+                w = _editor_world()
+                unreal.SystemLibrary.execute_console_command(w, "r.Fog 1")
+                unreal.SystemLibrary.execute_console_command(w, "r.VolumetricFog 1")
+            except Exception:
+                pass
+        _rename_final_image(output_dir)     # FinalImage -> Beauty
+        _KEEP.clear()
+        if on_done:
+            try:
+                on_done(bool(success), output_dir)
+            except Exception as e:
+                _warn("on_done でエラー: %s" % e)
+
+    executor.on_executor_finished_delegate.add_callable(_on_finished)
+    _KEEP["executor"] = executor
+    _KEEP["queue"] = queue
+
+    _log("MRQ シーケンスレンダ開始: %s  %dx%d  TS=%d warmup=%d  PNG=%s MP4=%s(CRF%d)  out=%s"
+         % (level_sequence.get_name(), width, height, temporal_samples, warmup,
+            do_png, do_mp4, mp4_crf, output_dir))
+    sub.render_queue_with_executor_instance(executor)
+    return executor
+
+
+def _rename_final_image(output_dir):
+    """MRQ のレンダパス名をツールの素材名に揃える。
+    追加 PP パスの識別子は "FinalImage"+Name（例 FinalImageDepth）なので、
+    長い方を先に置換してから素の FinalImage を Beauty にする。"""
+    try:
+        for f in os.listdir(output_dir):
+            if "_FinalImage" not in f:
+                continue
+            nf = f.replace("_FinalImageDepth", "_Depth").replace("_FinalImage", "_Beauty")
+            try:
+                os.replace(os.path.join(output_dir, f), os.path.join(output_dir, nf))
+            except Exception as e:
+                _warn("リネーム失敗 %s: %s" % (f, e))
+    except Exception as e:
+        _warn("FinalImage リネームに失敗: %s" % e)
