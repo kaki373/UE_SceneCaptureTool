@@ -36,6 +36,15 @@ except Exception:
     _HAS_TK = False
 
 
+# MP4 レートプリセット（内蔵 H.264 エンコーダの CRF。小さいほど高品質・大容量）
+_MP4_RATE_PRESETS = {
+    "最高 (CRF 17)": 17,
+    "高 (CRF 20)": 20,
+    "標準 (CRF 24)": 24,
+    "軽量 (CRF 28)": 28,
+}
+
+
 class CaptureWindow(object):
     def __init__(self):
         if not _HAS_TK:
@@ -47,7 +56,7 @@ class CaptureWindow(object):
         for child in self.root.winfo_children():
             child.destroy()      # 子ウィジェットの破棄は安全（ルートだけは破棄禁止）
         self.root.title("Scene Capture Tool (UE5.7) ★Beauty版★")
-        self.root.geometry("480x980")
+        self.root.geometry("500x1040")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._build()
@@ -57,9 +66,32 @@ class CaptureWindow(object):
     # ------------------------------------------------------------------ UI
     def _build(self):
         pad = {"padx": 8, "pady": 4}
+        outer = ttk.Frame(self.root, padding=(6, 6, 6, 4))
+        outer.pack(fill="both", expand=True)
+        nb = ttk.Notebook(outer)
+        nb.pack(fill="both", expand=True)
+        tab_img = ttk.Frame(nb, padding=6)
+        tab_seq = ttk.Frame(nb, padding=6)
+        nb.add(tab_img, text="画像キャプチャ")
+        nb.add(tab_seq, text="映像キャプチャ")
+        # ステータスはタブ共通で最下部に表示
+        self.status_var = tk.StringVar(value="")
+        ttk.Label(outer, textvariable=self.status_var, foreground="#0a7").pack(
+            anchor="w", padx=8, pady=(2, 0))
+        try:
+            ttk.Style().configure("Big.TButton", font=("", 14, "bold"), padding=12)
+        except Exception:
+            pass
+        self._build_image_tab(tab_img, pad)
+        self._build_seq_tab(tab_seq, pad)
+        # 前回の入力を復元
+        self._load_ui_state()
+        self._update_cam_res()
+        self._refresh_sequence()
+
+    def _build_image_tab(self, frm, pad):
+        """従来の単発キャプチャ UI（レイアウトは従来のまま）。"""
         row = 0
-        frm = ttk.Frame(self.root, padding=10)
-        frm.pack(fill="both", expand=True)
 
         # Camera（Refresh で現在のレベルのカメラに更新）
         ttk.Label(frm, text="Camera:").grid(row=row, column=0, sticky="w", **pad)
@@ -273,15 +305,6 @@ class CaptureWindow(object):
                   foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", padx=8)
         row += 1
 
-        self.status_var = tk.StringVar(value="")
-        ttk.Label(frm, textvariable=self.status_var, foreground="#0a7").grid(
-            row=row, column=0, columnspan=3, sticky="w", padx=8)
-        row += 1
-
-        try:
-            ttk.Style().configure("Big.TButton", font=("", 14, "bold"), padding=12)
-        except Exception:
-            pass
         self.capture_btn = ttk.Button(
             frm, text="Capture", style="Big.TButton", command=self._on_mrq)
         self.capture_btn.grid(row=row, column=0, columnspan=3,
@@ -289,9 +312,158 @@ class CaptureWindow(object):
 
         frm.columnconfigure(1, weight=1)
 
-        # 前回の入力を復元
-        self._load_ui_state()
-        self._update_cam_res()
+    def _build_seq_tab(self, frm, pad):
+        """映像キャプチャ（シーケンスレンダ）タブ。設定は画像タブから独立していて、
+        「設定を転送」ボタンで画像タブの値を一括コピーできる。"""
+        row = 0
+        ttk.Button(frm, text="← 画像キャプチャの設定を転送 (解像度/出力先/任意名/品質/Depth/Fog)",
+                   command=self._transfer_from_image_tab).grid(
+            row=row, column=0, columnspan=3, sticky="we", padx=8, pady=(6, 10))
+        row += 1
+
+        seqrow = ttk.Frame(frm)
+        ttk.Label(seqrow, text="Sequence:").pack(side="left")
+        self.seq_name_var = tk.StringVar(value="(未取得)")
+        ttk.Label(seqrow, textvariable=self.seq_name_var, foreground="#0a7").pack(
+            side="left", padx=(4, 0))
+        ttk.Button(seqrow, text="⟳", width=3, command=self._refresh_sequence).pack(
+            side="left", padx=(6, 0))
+        seqrow.grid(row=row, column=0, columnspan=3, sticky="w", **pad)
+        row += 1
+        ttk.Label(frm, text="（Sequencer で開いているシーケンスをカメラカットでレンダ。"
+                            "fps はシーケンスの Display Rate）",
+                  foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", padx=8)
+        row += 1
+
+        rng = ttk.Frame(frm)
+        ttk.Label(rng, text="Range:").pack(side="left")
+        self.seq_range_mode = tk.StringVar(value="auto")
+        ttk.Radiobutton(rng, text="シーケンス範囲", variable=self.seq_range_mode,
+                        value="auto").pack(side="left", padx=(4, 0))
+        ttk.Radiobutton(rng, text="指定:", variable=self.seq_range_mode,
+                        value="custom").pack(side="left", padx=(8, 0))
+        self.seq_start_var = tk.StringVar(value="0")
+        tk.Entry(rng, textvariable=self.seq_start_var, width=6).pack(side="left", padx=2)
+        ttk.Label(rng, text="〜").pack(side="left")
+        self.seq_end_var = tk.StringVar(value="0")
+        tk.Entry(rng, textvariable=self.seq_end_var, width=6).pack(side="left", padx=2)
+        ttk.Label(rng, text="(End含む)").pack(side="left")
+        rng.grid(row=row, column=0, columnspan=3, sticky="w", **pad)
+        row += 1
+
+        res = ttk.Frame(frm)
+        ttk.Label(res, text="解像度:").pack(side="left")
+        self.seq_w_var = tk.StringVar(value="1920")
+        tk.Entry(res, textvariable=self.seq_w_var, width=6).pack(side="left", padx=2)
+        ttk.Label(res, text="x").pack(side="left")
+        self.seq_h_var = tk.StringVar(value="1080")
+        tk.Entry(res, textvariable=self.seq_h_var, width=6).pack(side="left", padx=2)
+        ttk.Label(res, text="ウォームアップ:").pack(side="left", padx=(12, 0))
+        self.seq_warm_var = tk.StringVar(value="32")
+        tk.Entry(res, textvariable=self.seq_warm_var, width=5).pack(side="left", padx=2)
+        ttk.Label(res, text="サンプリング:").pack(side="left", padx=(8, 0))
+        self.seq_ts_var = tk.StringVar(value="8")
+        tk.Entry(res, textvariable=self.seq_ts_var, width=5).pack(side="left", padx=2)
+        res.grid(row=row, column=0, columnspan=3, sticky="w", **pad)
+        row += 1
+        self.seq_fog_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frm, text="Fogなし", variable=self.seq_fog_var).grid(
+            row=row, column=0, columnspan=3, sticky="w", padx=8)
+        row += 1
+
+        ttk.Separator(frm, orient="horizontal").grid(
+            row=row, column=0, columnspan=3, sticky="we", pady=8)
+        row += 1
+
+        fmt = ttk.Frame(frm)
+        ttk.Label(fmt, text="Format:").pack(side="left")
+        self.seq_png_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(fmt, text="PNG連番", variable=self.seq_png_var).pack(
+            side="left", padx=(4, 0))
+        self.seq_mp4_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(fmt, text="MP4", variable=self.seq_mp4_var).pack(side="left", padx=(8, 0))
+        ttk.Label(fmt, text="レート:").pack(side="left", padx=(8, 0))
+        self.seq_rate_var = tk.StringVar(value="高 (CRF 20)")
+        ttk.Combobox(fmt, textvariable=self.seq_rate_var, state="readonly", width=12,
+                     values=list(_MP4_RATE_PRESETS.keys())).pack(side="left", padx=2)
+        fmt.grid(row=row, column=0, columnspan=3, sticky="w", **pad)
+        row += 1
+
+        dep = ttk.Frame(frm)
+        self.seq_depth_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(dep, text="Z-Depth も出力", variable=self.seq_depth_var).pack(side="left")
+        ttk.Label(dep, text="Near:").pack(side="left", padx=(8, 0))
+        self.seq_near_var = tk.StringVar(value="0")
+        tk.Entry(dep, textvariable=self.seq_near_var, width=6).pack(side="left", padx=2)
+        ttk.Label(dep, text="Far:").pack(side="left", padx=(6, 0))
+        self.seq_far_var = tk.StringVar(value="10000")
+        tk.Entry(dep, textvariable=self.seq_far_var, width=7).pack(side="left", padx=2)
+        ttk.Label(dep, text="cm").pack(side="left")
+        self.seq_inv_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(dep, text="Invert (近=白)", variable=self.seq_inv_var).pack(
+            side="left", padx=(8, 0))
+        dep.grid(row=row, column=0, columnspan=3, sticky="w", **pad)
+        row += 1
+        ttk.Label(frm, text="（Z-Depth 連番/MP4 は表示用エンコード。厳密なリニア深度は画像タブの Z-Depth を使用）",
+                  foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", padx=24)
+        row += 1
+
+        ttk.Separator(frm, orient="horizontal").grid(
+            row=row, column=0, columnspan=3, sticky="we", pady=8)
+        row += 1
+
+        ttk.Label(frm, text="Output Dir:").grid(row=row, column=0, sticky="w", **pad)
+        default_dir = os.path.normpath(
+            os.path.join(unreal.Paths.project_saved_dir(), "Captures"))
+        self.seq_out_var = tk.StringVar(value=default_dir)
+        tk.Entry(frm, textvariable=self.seq_out_var, width=28).grid(
+            row=row, column=1, sticky="we", **pad)
+        ttk.Button(frm, text="...", width=3,
+                   command=lambda: self._browse(self.seq_out_var)).grid(
+            row=row, column=2, sticky="w")
+        row += 1
+        self.seq_usecustom_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frm, text="任意名を付ける:", variable=self.seq_usecustom_var).grid(
+            row=row, column=0, sticky="w", **pad)
+        self.seq_custom_var = tk.StringVar(value="")
+        tk.Entry(frm, textvariable=self.seq_custom_var, width=28).grid(
+            row=row, column=1, sticky="we", **pad)
+        row += 1
+        self.seq_subdir_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(frm, text="テイク毎サブフォルダに出力 (OFF で指定フォルダへ直接)",
+                        variable=self.seq_subdir_var).grid(
+            row=row, column=0, columnspan=3, sticky="w", **pad)
+        row += 1
+        ttk.Label(frm, text="  ファイル名: [任意名]_[シーケンス名]_素材名_NNN.フレーム番号",
+                  foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", padx=8)
+        row += 1
+
+        self.seq_btn = ttk.Button(frm, text="Sequence Render", style="Big.TButton",
+                                  command=self._on_seq_render)
+        self.seq_btn.grid(row=row, column=0, columnspan=3,
+                          pady=14, padx=24, ipady=6, sticky="we")
+        frm.columnconfigure(1, weight=1)
+
+    def _transfer_from_image_tab(self):
+        """画像キャプチャタブの設定（解像度/出力先/任意名/品質/Depth/Fog）を映像タブへコピー。"""
+        W = self._int_var(self.w_var, 1920)
+        if self.mrq_camasp_var.get():
+            asp = self._aspect_ratio()
+            H = int(round(W / asp)) if asp > 0.1 else self._int_var(self.h_var, 1080)
+        else:
+            H = self._int_var(self.h_var, 1080)
+        self.seq_w_var.set(str(W))
+        self.seq_h_var.set(str(H))
+        self.seq_out_var.set(self.out_var.get())
+        self.seq_usecustom_var.set(self.name_usecustom_var.get())
+        self.seq_custom_var.set(self.name_custom_var.get())
+        self.seq_warm_var.set(self.mrq_warmup_var.get())
+        self.seq_ts_var.set(self.mrq_ts_var.get())
+        self.seq_near_var.set(self.near_var.get())
+        self.seq_far_var.set(self.far_var.get())
+        self.seq_inv_var.set(self.depth_invert_var.get())
+        self.seq_fog_var.set(self.fog_off_var.get())
+        self.status_var.set("画像キャプチャの設定を映像タブへ転送しました")
 
     # ------------------------------------------------------------- handlers
     @staticmethod
@@ -308,10 +480,11 @@ class CaptureWindow(object):
         except ValueError:
             return default
 
-    def _browse(self):
-        d = filedialog.askdirectory(initialdir=self.out_var.get() or "/")
+    def _browse(self, var=None):
+        var = var if var is not None else self.out_var
+        d = filedialog.askdirectory(initialdir=var.get() or "/")
         if d:
-            self.out_var.set(os.path.normpath(d))
+            var.set(os.path.normpath(d))
 
     def _on_mrq(self):
         """Movie Render Queue で Beauty を高品質レンダ（非同期・PIE）。"""
@@ -499,6 +672,104 @@ class CaptureWindow(object):
         except Exception as e:
             _restore_fb()
             self.status_var.set("MRQ 起動失敗: %s" % e)
+
+    # ------------------------------------------------------ sequence render
+    def _current_sequence(self):
+        """Sequencer で現在開いている LevelSequence（無ければ None）。"""
+        try:
+            return unreal.LevelSequenceEditorBlueprintLibrary.get_current_level_sequence()
+        except Exception:
+            return None
+
+    def _refresh_sequence(self):
+        seq = self._current_sequence()
+        if seq is None:
+            self.seq_name_var.set("(Sequencer で開いていません)")
+            return
+        try:
+            ext = unreal.MovieSceneSequenceExtensions
+            s = ext.get_playback_start(seq)
+            e = ext.get_playback_end(seq)          # end は排他的
+            fr = ext.get_display_rate(seq)
+            fps = float(fr.numerator) / max(float(fr.denominator), 1.0)
+            self.seq_name_var.set("%s  [%d〜%d @%gfps]" % (seq.get_name(), s, e - 1, fps))
+        except Exception:
+            self.seq_name_var.set(seq.get_name())
+
+    def _on_seq_render(self):
+        """Sequencer で開いている LevelSequence を PNG連番 / MP4 でレンダ（非同期・PIE）。"""
+        import capture_mrq
+        importlib.reload(capture_mrq)
+        seq = self._current_sequence()
+        if seq is None:
+            self.status_var.set("シーケンスレンダ: Sequencer でシーケンスを開いてください")
+            return
+        self._refresh_sequence()
+        base_out = self.seq_out_var.get().strip()
+        if not base_out:
+            self.status_var.set("シーケンスレンダ: 出力先を指定してください")
+            return
+        if not os.path.isdir(base_out):
+            try:
+                os.makedirs(base_out)
+            except Exception:
+                pass
+        W = self._int_var(self.seq_w_var, 1920)
+        H = self._int_var(self.seq_h_var, 1080)
+        warm = self._int_var(self.seq_warm_var, 32)
+        ts = self._int_var(self.seq_ts_var, 8)
+        cs = ce = None
+        if self.seq_range_mode.get() == "custom":
+            cs = self._int_var(self.seq_start_var, 0)
+            ce = self._int_var(self.seq_end_var, cs) + 1   # UI は End含む → 排他へ
+            if ce <= cs:
+                self.status_var.set("シーケンスレンダ: フレーム範囲が不正です (End は Start 以上)")
+                return
+        take_str = "%03d" % core.next_take_number(base_out)
+        parts = []
+        if self.seq_usecustom_var.get():
+            c = self.seq_custom_var.get().strip()
+            if c:
+                parts.append(core._safe_name(c))
+        parts.append(core._safe_name(seq.get_name()))
+        name_body = "_".join(parts)
+        out = base_out
+        if self.seq_subdir_var.get():
+            out = os.path.join(base_out, "%s_%s" % (name_body, take_str))
+        crf = _MP4_RATE_PRESETS.get(self.seq_rate_var.get(), 20)
+        self._save_ui_state()
+        depth_mat = None
+        if self.seq_depth_var.get():
+            try:
+                depth_mat = core.create_temp_depth_material(
+                    self._float_var(self.seq_near_var, 0.0),
+                    self._float_var(self.seq_far_var, 10000.0),
+                    invert=self.seq_inv_var.get())
+            except Exception as e:
+                self.status_var.set("深度マテリアル生成失敗: %s" % e)
+                return
+        made_depth = depth_mat is not None
+
+        def _done(ok, od):
+            if made_depth:
+                core.delete_temp_depth_material()
+            self.status_var.set(("シーケンスレンダ完了: %s" % od) if ok
+                                else "シーケンスレンダ失敗 (Output Log 参照)")
+
+        self.status_var.set("シーケンスレンダ中… (PIE に入ります / 完了まで待機)")
+        self.root.update()
+        try:
+            capture_mrq.render_sequence(
+                seq, out, W, H, name_body, take_str,
+                do_png=self.seq_png_var.get(), do_mp4=self.seq_mp4_var.get(),
+                mp4_crf=crf, temporal_samples=ts, warmup=warm,
+                custom_start=cs, custom_end=ce,
+                depth_material=depth_mat, fog_off=self.seq_fog_var.get(),
+                on_done=_done)
+        except Exception as e:
+            if made_depth:
+                core.delete_temp_depth_material()
+            self.status_var.set("シーケンスレンダ起動失敗: %s" % e)
 
     def _make_picker(self, frm, row, label):
         """対象アクターのリストを作る。リストの中身＝対象。
@@ -720,6 +991,23 @@ class CaptureWindow(object):
                 "mrq_exr": self.mrq_exr_var.get(),
                 "mrq_camasp": self.mrq_camasp_var.get(),
                 "fog_off": self.fog_off_var.get(),
+                "seq_range_mode": self.seq_range_mode.get(),
+                "seq_start": self.seq_start_var.get(),
+                "seq_end": self.seq_end_var.get(),
+                "seq_png": self.seq_png_var.get(),
+                "seq_mp4": self.seq_mp4_var.get(),
+                "seq_rate": self.seq_rate_var.get(),
+                "seq_depth": self.seq_depth_var.get(),
+                "seq_subdir": self.seq_subdir_var.get(),
+                "seq_w": self.seq_w_var.get(), "seq_h": self.seq_h_var.get(),
+                "seq_warm": self.seq_warm_var.get(), "seq_ts": self.seq_ts_var.get(),
+                "seq_fog": self.seq_fog_var.get(),
+                "seq_out": self.seq_out_var.get(),
+                "seq_usecustom": self.seq_usecustom_var.get(),
+                "seq_custom": self.seq_custom_var.get(),
+                "seq_near": self.seq_near_var.get(),
+                "seq_far": self.seq_far_var.get(),
+                "seq_inv": self.seq_inv_var.get(),
             }
             with open(self._settings_path(), "w", encoding="utf-8") as f:
                 json.dump(state, f, ensure_ascii=False, indent=2)
@@ -785,6 +1073,25 @@ class CaptureWindow(object):
         _setvar(self.mrq_exr_var, "mrq_exr")
         _setvar(self.mrq_camasp_var, "mrq_camasp")
         _setvar(self.fog_off_var, "fog_off")
+        if st.get("seq_range_mode") in ("auto", "custom"):
+            self.seq_range_mode.set(st["seq_range_mode"])
+        _setvar(self.seq_start_var, "seq_start")
+        _setvar(self.seq_end_var, "seq_end")
+        _setvar(self.seq_png_var, "seq_png")
+        _setvar(self.seq_mp4_var, "seq_mp4")
+        if st.get("seq_rate") in _MP4_RATE_PRESETS:
+            self.seq_rate_var.set(st["seq_rate"])
+        _setvar(self.seq_depth_var, "seq_depth")
+        _setvar(self.seq_subdir_var, "seq_subdir")
+        _setvar(self.seq_w_var, "seq_w"); _setvar(self.seq_h_var, "seq_h")
+        _setvar(self.seq_warm_var, "seq_warm"); _setvar(self.seq_ts_var, "seq_ts")
+        _setvar(self.seq_fog_var, "seq_fog")
+        _setvar(self.seq_out_var, "seq_out")
+        _setvar(self.seq_usecustom_var, "seq_usecustom")
+        _setvar(self.seq_custom_var, "seq_custom")
+        _setvar(self.seq_near_var, "seq_near")
+        _setvar(self.seq_far_var, "seq_far")
+        _setvar(self.seq_inv_var, "seq_inv")
 
     def _collect_settings(self):
         s = core.CaptureSettings()
