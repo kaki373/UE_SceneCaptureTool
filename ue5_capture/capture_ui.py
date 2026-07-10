@@ -6,6 +6,11 @@ Python 標準の tkinter でウィンドウを描画する。tkinter の mainloo
 メインスレッドをブロックするため使わず、register_slate_post_tick_callback で
 毎フレーム root.update() を呼ぶ「非ブロッキング統合」にする。
 
+Tk ルートはプロセスで1つだけ作り、絶対に destroy しない（UE 埋め込み Python では
+root.destroy() 後の tk.Tk() 再生成が Tcl panic となりエディタごと落ちる）。
+閉じる=withdraw / 再表示=deiconify＋UI 再構築。ルートと tick ハンドルは
+reload をまたいで残るよう unreal モジュール上に保持する。
+
 tkinter が利用できない環境（UE 同梱 Python に tcl/tk が無い等）では
 ImportError を送出するので、呼び出し側（capture_tool.py）が CONFIG/CUI に
 フォールバックする。
@@ -13,6 +18,7 @@ ImportError を送出するので、呼び出し側（capture_tool.py）が CONF
 
 import os
 import json
+import importlib
 
 import unreal
 
@@ -35,17 +41,18 @@ class CaptureWindow(object):
         if not _HAS_TK:
             raise ImportError("tkinter が利用できません。")
 
-        self._tick_handle = None
         self._cameras = core.list_cameras()
 
-        self.root = tk.Tk()
+        self.root = _persistent_root()
+        for child in self.root.winfo_children():
+            child.destroy()      # 子ウィジェットの破棄は安全（ルートだけは破棄禁止）
         self.root.title("Scene Capture Tool (UE5.7) ★Beauty版★")
         self.root.geometry("480x980")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._build()
+        self.root.deiconify()
         self._register_tick()
-        _window_registry().append(self)   # オーファン対策の登録
 
     # ------------------------------------------------------------------ UI
     def _build(self):
@@ -897,30 +904,21 @@ class CaptureWindow(object):
 
     # ------------------------------------------------------------ UE tick
     def _register_tick(self):
+        _unregister_global_tick()      # reload 後の二重登録を防ぐ
         def _tick(dt):
             try:
                 self.root.update()
             except Exception:
-                self._unregister_tick()
-        self._tick_handle = unreal.register_slate_post_tick_callback(_tick)
-
-    def _unregister_tick(self):
-        if self._tick_handle is not None:
-            try:
-                unreal.unregister_slate_post_tick_callback(self._tick_handle)
-            except Exception:
-                pass
-            self._tick_handle = None
+                _unregister_global_tick()
+        unreal._ue5capture_tick_handle = unreal.register_slate_post_tick_callback(_tick)
 
     def _on_close(self):
+        """閉じる=withdraw。ルートは destroy しない（再生成時に Tcl panic で
+        エディタごと落ちるため）。再表示は show() が deiconify する。"""
         self._save_ui_state()
-        self._unregister_tick()
+        _unregister_global_tick()
         try:
-            _window_registry().remove(self)
-        except Exception:
-            pass
-        try:
-            self.root.destroy()
+            self.root.withdraw()
         except Exception:
             pass
 
@@ -928,27 +926,65 @@ class CaptureWindow(object):
 _window_ref = None  # GC 防止
 
 
-def _window_registry():
-    """reload をまたいで残るウィンドウ登録簿（unreal モジュールに保持）。"""
-    if not hasattr(unreal, "_ue5capture_windows"):
-        unreal._ue5capture_windows = []
-    return unreal._ue5capture_windows
+def _persistent_root():
+    """reload をまたいで使い回す唯一の Tk ルート（unreal モジュールに保持）。"""
+    root = getattr(unreal, "_ue5capture_tk_root", None)
+    if root is not None:
+        try:
+            root.winfo_exists()
+        except Exception:
+            root = None
+    if root is None:
+        root = tk.Tk()
+        unreal._ue5capture_tk_root = root
+    return root
 
 
-def close_all_windows():
-    """これまでに開いた全ツールウィンドウを閉じる（オーファン対策）。"""
-    reg = _window_registry()
+def _unregister_global_tick():
+    h = getattr(unreal, "_ue5capture_tick_handle", None)
+    if h is not None:
+        try:
+            unreal.unregister_slate_post_tick_callback(h)
+        except Exception:
+            pass
+        unreal._ue5capture_tick_handle = None
+
+
+def _close_legacy_windows():
+    """旧実装（destroy 方式）が unreal._ue5capture_windows に残したウィンドウを
+    withdraw で畳む。destroy は絶対に呼ばない。"""
+    reg = getattr(unreal, "_ue5capture_windows", None)
+    if not reg:
+        return
     for w in list(reg):
         try:
-            w._on_close()
+            h = getattr(w, "_tick_handle", None)
+            if h is not None:
+                unreal.unregister_slate_post_tick_callback(h)
+        except Exception:
+            pass
+        try:
+            w.root.withdraw()
         except Exception:
             pass
     reg[:] = []
 
 
+def close_all_windows():
+    """ツールウィンドウを閉じる（withdraw のみ。ルートは保持）。"""
+    _close_legacy_windows()
+    _unregister_global_tick()
+    root = getattr(unreal, "_ue5capture_tk_root", None)
+    if root is not None:
+        try:
+            root.withdraw()
+        except Exception:
+            pass
+
+
 def show():
-    """GUI を表示。既存ウィンドウは全て閉じてから1枚だけ開く。"""
+    """GUI を表示。永続ルートを使い回し、UI だけ作り直す（reload 対応）。"""
     global _window_ref
-    close_all_windows()
+    _close_legacy_windows()
     _window_ref = CaptureWindow()
     return _window_ref
