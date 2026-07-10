@@ -65,7 +65,7 @@ class CaptureWindow(object):
         for child in self.root.winfo_children():
             child.destroy()      # 子ウィジェットの破棄は安全（ルートだけは破棄禁止）
         self.root.title("Scene Capture Tool (UE5.7) ★Beauty版★")
-        self.root.geometry("500x1040")
+        self.root.geometry("540x1040")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._build()
@@ -206,13 +206,37 @@ class CaptureWindow(object):
         ttk.Separator(frm, orient="horizontal").grid(
             row=row, column=0, columnspan=3, sticky="we", pady=8)
         row += 1
-        ttk.Label(frm, text="Passes（Color/Beauty は下の MRQ ボタンで出力）").grid(
+        ttk.Label(frm, text="出力:").grid(
             row=row, column=0, columnspan=3, sticky="w", **pad)
         row += 1
 
-        # Depth
+        # Beauty（MRQ = ビューポート露出＋シーケンサ品質）
+        self.beauty_var = tk.BooleanVar(master=self.root, value=True)
+        ttk.Checkbutton(frm, text="Beauty（MRQ = ビューポート露出＋シーケンサ品質）",
+                        variable=self.beauty_var).grid(
+            row=row, column=0, columnspan=3, sticky="w", padx=8)
+        row += 1
+        mrqf = ttk.Frame(frm)
+        ttk.Label(mrqf, text="ウォームアップ:").pack(side="left")
+        self.mrq_warmup_var = tk.StringVar(master=self.root, value="32")
+        tk.Entry(mrqf, textvariable=self.mrq_warmup_var, width=5).pack(side="left", padx=2)
+        ttk.Label(mrqf, text="サンプリングフレーム:").pack(side="left", padx=(8, 0))
+        self.mrq_ts_var = tk.StringVar(master=self.root, value="8")
+        tk.Entry(mrqf, textvariable=self.mrq_ts_var, width=5).pack(side="left", padx=2)
+        self.mrq_exr_var = tk.BooleanVar(master=self.root, value=False)
+        ttk.Checkbutton(mrqf, text="EXR", variable=self.mrq_exr_var).pack(side="left", padx=(8, 0))
+        self.mrq_camasp_var = tk.BooleanVar(master=self.root, value=True)
+        ttk.Checkbutton(mrqf, text="カメラのアスペクト",
+                        variable=self.mrq_camasp_var).pack(side="left", padx=(8, 0))
+        self.fog_off_var = tk.BooleanVar(master=self.root, value=False)
+        ttk.Checkbutton(mrqf, text="Fogなし", variable=self.fog_off_var).pack(
+            side="left", padx=(8, 0))
+        mrqf.grid(row=row, column=0, columnspan=3, sticky="w", padx=24)
+        row += 1
+
+        # Z-Depth（手前=白/奥=黒 固定）
         self.depth_var = tk.BooleanVar(master=self.root, value=False)
-        ttk.Checkbutton(frm, text="Z-Depth", variable=self.depth_var).grid(
+        ttk.Checkbutton(frm, text="Z-Depth（手前=白 / 奥=黒）", variable=self.depth_var).grid(
             row=row, column=0, columnspan=3, sticky="w", padx=8)
         row += 1
         depth_frm = ttk.Frame(frm)
@@ -228,91 +252,33 @@ class CaptureWindow(object):
         ttk.Label(depth_frm, text="Far:").pack(side="left", padx=(6, 0))
         self.far_var = tk.StringVar(master=self.root, value="10000")
         tk.Entry(depth_frm, textvariable=self.far_var, width=7).pack(side="left", padx=2)
-        ttk.Label(depth_frm, text="cm").pack(side="left")
+        ttk.Label(depth_frm, text="cm（=Unreal世界単位。1m=100cm）").pack(side="left")
         depth_frm.grid(row=row, column=0, columnspan=3, sticky="w", padx=24)
         row += 1
-        ttk.Label(frm, text="(Z-Depth 距離は cm 単位＝Unreal世界単位。1m = 100cm)",
-                  foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", padx=24)
-        row += 1
-        # Depth invert（手前=白/奥=黒）
-        self.depth_invert_var = tk.BooleanVar(master=self.root, value=True)
-        ttk.Checkbutton(frm, text="Invert (near=white / far=black)  ※PNGのみ",
-                        variable=self.depth_invert_var).grid(
-            row=row, column=0, columnspan=3, sticky="w", padx=24)
-        row += 1
 
-        # Matte（独立した対象ピッカー）
-        self.matte_var = tk.BooleanVar(master=self.root, value=False)
-        ttk.Checkbutton(frm, text="Matte（白黒）を出力",
-                        variable=self.matte_var).grid(
+        # Matte 系（Beauty+Matte / Matteの奥。対象は Matte targets）
+        self.mfront_var = tk.BooleanVar(master=self.root, value=False)
+        ttk.Checkbutton(frm, text="Beauty+Matte（Matteの前）",
+                        variable=self.mfront_var).grid(
             row=row, column=0, columnspan=3, sticky="w", padx=8)
         row += 1
-        # Matte は 選択=黒/周囲=白 で固定（Invert トグルは廃止）。
-        self.matte_fill_var = tk.BooleanVar(master=self.root, value=False)
-        ttk.Checkbutton(frm, text="  + Beauty + Matte alpha PNG",
-                        variable=self.matte_fill_var).grid(
-            row=row, column=0, columnspan=3, sticky="w", padx=24)
-        row += 1
-        ttk.Label(frm, text="  ※ Matte ON のとき Beauty から対象を自動で隠します（クリーンプレート）",
-                  foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", padx=24)
-        row += 1
         self.behind_var = tk.BooleanVar(master=self.root, value=False)
-        ttk.Checkbutton(frm, text="  + Matteの奥を描画",
+        ttk.Checkbutton(frm, text="Matteの奥",
                         variable=self.behind_var).grid(
-            row=row, column=0, columnspan=3, sticky="w", padx=24)
+            row=row, column=0, columnspan=3, sticky="w", padx=8)
+        row += 1
+        ttk.Label(frm, text="  （対象は下の Matte targets、空ならエディタ選択。出力時は Beauty から対象を自動で隠す）",
+                  foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", padx=8)
         row += 1
         self.matte_pick, row = self._make_picker(frm, row, "Matte targets")
 
-        # Object ID（Matte とは別の対象ピッカー）
+        # ObjectID（対象を色分け・他は黒）
         self.objid_var = tk.BooleanVar(master=self.root, value=False)
-        ttk.Checkbutton(frm, text="Object ID (color-coded + manifest .json)",
+        ttk.Checkbutton(frm, text="ObjectID（対象を色分け・他は黒 + 色↔名前 JSON）",
                         variable=self.objid_var).grid(
             row=row, column=0, columnspan=3, sticky="w", padx=8)
         row += 1
-        self.objid_fill_var = tk.BooleanVar(master=self.root, value=False)
-        ttk.Checkbutton(frm, text="  + Beauty + ObjectID mask",
-                        variable=self.objid_fill_var).grid(
-            row=row, column=0, columnspan=3, sticky="w", padx=24)
-        row += 1
-        self.objid_hide_var = tk.BooleanVar(master=self.root, value=False)
-        ttk.Checkbutton(frm, text="  + Hide-render (対象を非表示にして Beauty をレンダ＝クリーンプレート)",
-                        variable=self.objid_hide_var).grid(
-            row=row, column=0, columnspan=3, sticky="w", padx=24)
-        row += 1
         self.objid_pick, row = self._make_picker(frm, row, "Object ID targets")
-
-        ttk.Separator(frm, orient="horizontal").grid(
-            row=row, column=0, columnspan=3, sticky="we", pady=8)
-        row += 1
-
-        # ---- Beauty (MRQ / シーケンサ品質) ----
-        ttk.Separator(frm, orient="horizontal").grid(
-            row=row, column=0, columnspan=3, sticky="we", pady=6)
-        row += 1
-        ttk.Label(frm, text="Beauty (MRQ = ビューポート露出＋シーケンサ品質)").grid(
-            row=row, column=0, columnspan=3, sticky="w", padx=8)
-        row += 1
-        self.fog_off_var = tk.BooleanVar(master=self.root, value=False)
-        ttk.Checkbutton(frm, text="  Fogなし", variable=self.fog_off_var).grid(
-            row=row, column=0, columnspan=3, sticky="w", padx=24)
-        row += 1
-        mrqf = ttk.Frame(frm)
-        ttk.Label(mrqf, text="ウォームアップ:").pack(side="left")
-        self.mrq_warmup_var = tk.StringVar(master=self.root, value="32")
-        tk.Entry(mrqf, textvariable=self.mrq_warmup_var, width=5).pack(side="left", padx=2)
-        ttk.Label(mrqf, text="サンプリングフレーム:").pack(side="left", padx=(8, 0))
-        self.mrq_ts_var = tk.StringVar(master=self.root, value="8")
-        tk.Entry(mrqf, textvariable=self.mrq_ts_var, width=5).pack(side="left", padx=2)
-        self.mrq_exr_var = tk.BooleanVar(master=self.root, value=False)
-        ttk.Checkbutton(mrqf, text="EXR", variable=self.mrq_exr_var).pack(side="left", padx=(8, 0))
-        self.mrq_camasp_var = tk.BooleanVar(master=self.root, value=True)
-        ttk.Checkbutton(mrqf, text="カメラのアスペクト", variable=self.mrq_camasp_var).pack(side="left", padx=(8, 0))
-        mrqf.grid(row=row, column=0, columnspan=3, sticky="w", padx=24)
-        row += 1
-        ttk.Label(frm, text="（Matte/Object ID/Depth を一緒に出すには各チェック＋対象を Add Sel。"
-                            "matte_fill/objid_fill/objid_hidden は全て Beauty 合成）",
-                  foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", padx=8)
-        row += 1
 
         self.capture_btn = ttk.Button(
             frm, text="Capture", style="Big.TButton", command=self._on_mrq)
@@ -416,10 +382,7 @@ class CaptureWindow(object):
         ttk.Label(dep, text="Far:").pack(side="left", padx=(6, 0))
         self.seq_far_var = tk.StringVar(master=self.root, value="10000")
         tk.Entry(dep, textvariable=self.seq_far_var, width=7).pack(side="left", padx=2)
-        ttk.Label(dep, text="cm").pack(side="left")
-        self.seq_inv_var = tk.BooleanVar(master=self.root, value=True)
-        ttk.Checkbutton(dep, text="Invert (near=white / far=black)",
-                        variable=self.seq_inv_var).pack(side="left", padx=(8, 0))
+        ttk.Label(dep, text="cm（手前=白 / 奥=黒）").pack(side="left")
         dep.grid(row=row, column=0, columnspan=3, sticky="w", padx=24)
         row += 1
         self.seq_matte_hide_var = tk.BooleanVar(master=self.root, value=False)
@@ -485,7 +448,6 @@ class CaptureWindow(object):
         self.seq_ts_var.set(self.mrq_ts_var.get())
         self.seq_near_var.set(self.near_var.get())
         self.seq_far_var.set(self.far_var.get())
-        self.seq_inv_var.set(self.depth_invert_var.get())
         self.seq_fog_var.set(self.fog_off_var.get())
         self.status_var.set("画像キャプチャの設定を映像タブへ転送しました")
 
@@ -574,17 +536,13 @@ class CaptureWindow(object):
                     pass
         # この Capture の通し番号（全出力に _NNN を付与。設定違いを上書きしない）
         suf = "%03d" % core.next_take_number(out)
-        # ① マスク系データ(Matte白黒 / ObjectID色 / Depth)を同フレーム・同解像度で先に出す。
-        #    旧Color(SceneCapture Fill)は一切出さない。matte_fill/objid_fill/objid_hidden は
-        #    全て MRQ Beauty を使うので、ここでは作らない。
+        # ① データパス(内部 Matte マスク / ObjectID / Depth)を同フレーム・同解像度で先に出す。
+        #    Beauty+Matte の合成は MRQ Beauty 完了後に行う。
         s = self._collect_settings()
         s.camera_actor = cam
         s.use_camera_resolution = False
         s.override_width, s.override_height = W, H
-        s.matte_fill_alpha = False          # Beauty と後段で合成
-        s.objid_fill_alpha = False
-        s.objid_hide_render = False         # 非表示レンダも Beauty(2回目MRQ)で行う
-        s.do_behind_matte = False           # behind は下の MRQ near-clip ジョブで高品質に行う
+        s.do_behind_matte = False           # Matteの奥は下の MRQ near-clip ジョブで行う
         s.take_suffix = suf                 # SceneCapture 系の出力にも同じ通し番号
 
         def _name(pass_type):
@@ -592,10 +550,8 @@ class CaptureWindow(object):
             return core.out_basename(s, pass_type, suf)
 
         matte_path = objid_path = None
-        want_matte_fill = self.matte_fill_var.get()
-        want_objid_fill = self.objid_fill_var.get()
-        want_hidden = self.objid_hide_var.get()
-        objid_names = self._pick_targets_resolved(self.objid_pick)
+        want_mfront = self.mfront_var.get()
+        want_behind = self.behind_var.get()
         try:
             if s.do_matte or s.do_object_id or s.do_depth:
                 self.status_var.set("同フレームの Matte/ObjectID/Depth を出力中…")
@@ -612,36 +568,51 @@ class CaptureWindow(object):
         beauty_path = os.path.join(out, _name("Beauty") + ".png")
         exr = self.mrq_exr_var.get()
 
-        # Matte ON のときは Beauty から対象を常に隠す（クリーンプレート）。
+        # Beauty（MRQ）は Beauty 指定時か Matte 系合成が要るときだけレンダする
+        beauty_needed = self.beauty_var.get() or want_mfront or want_behind
+        if not beauty_needed:
+            _restore_fb()
+            self.status_var.set("完了（データパスのみ出力）" if (s.do_depth or s.do_object_id)
+                                else "出力が選ばれていません")
+            return
+
+        # Matte 系出力時は Beauty から対象を常に隠す（クリーンプレート）。
         beauty_hidden = None
-        if self.matte_var.get():
+        if want_mfront or want_behind:
             matte_names = self._pick_targets_resolved(self.matte_pick)
             beauty_hidden = core._resolve_target_actors(None, matte_names or None)
             if beauty_hidden:
                 self.status_var.set("Beauty: Matte 対象 %d 個を隠して撮影（クリーンプレート）" % len(beauty_hidden))
             else:
-                self.status_var.set("Matte ON ですが対象が見つかりません（Beauty は全表示で撮ります）")
+                self.status_var.set("Matte 対象が見つかりません（Beauty は全表示で撮ります）")
 
-
-        # 後続 MRQ ジョブのキュー
+        # 後続 MRQ ジョブのキュー（Matteの奥のプレート）
         jobs = []
-        if want_hidden and objid_names and objid_path:
-            jobs.append(dict(hidden=core._resolve_target_actors(None, objid_names),
-                             base=_name("ObjectIDClean")))
-        # Behind matte: マット面までの距離で near-clip して手前を除去（MRQ Beauty 品質）
-        if self.behind_var.get():
+        if want_behind:
             mt = core._resolve_target_actors(None, self._pick_targets_resolved(self.matte_pick) or None)
             if mt:
                 nc = core.matte_near_clip_cm(mt, core.get_camera_settings(cam))
                 jobs.append(dict(hidden=mt, base=_name("BehindPlate"),
                                  near_clip=nc, composite=True, matte=mt))
             else:
-                self.status_var.set("Behind matte: Matte 対象が見つかりません")
+                self.status_var.set("Matteの奥: Matte 対象が見つかりません")
+
+        def _finalize():
+            # 内部素材の後始末: 生 Matte マスクは製品ではないので削除。
+            # Beauty のチェックが無い場合（合成のためだけにレンダした場合）も削除。
+            for p, keep in ((matte_path, False),
+                            (beauty_path, self.beauty_var.get())):
+                if p and not keep and os.path.isfile(p):
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
+            _restore_fb()
+            self.status_var.set("完了")
 
         def _run_jobs():
             if not jobs:
-                _restore_fb()
-                self.status_var.set("完了（Beauty合成・クリーンプレート出力済）")
+                _finalize()
                 return
             j = jobs.pop(0)
 
@@ -680,12 +651,10 @@ class CaptureWindow(object):
         def _after_beauty(ok, od):
             if ok:
                 try:
-                    core.blend_with_beauty(
-                        beauty_path,
-                        matte_path if want_matte_fill else None,
-                        objid_path if want_objid_fill else None,
-                        matte_out=os.path.join(out, _name("MatteBeauty") + ".png"),
-                        objid_out=os.path.join(out, _name("ObjectIDBeauty") + ".png"))
+                    if want_mfront and matte_path:
+                        core.blend_with_beauty(
+                            beauty_path, matte_path, None,
+                            matte_out=os.path.join(out, _name("MatteBeauty") + ".png"))
                 except Exception as e:
                     _restore_fb()
                     self.status_var.set("Beautyブレンドでエラー: %s" % e)
@@ -853,7 +822,7 @@ class CaptureWindow(object):
                 depth_mat = core.create_temp_depth_material(
                     self._float_var(self.seq_near_var, 0.0),
                     self._float_var(self.seq_far_var, 10000.0),
-                    invert=self.seq_inv_var.get())
+                    invert=True)   # 手前=白 / 奥=黒 固定
             if matte_needed:
                 matte_mat = core.create_temp_matte_material()
             elif self.seq_matte_hide_var.get():
@@ -1247,18 +1216,15 @@ class CaptureWindow(object):
                 "name_custom": self.name_custom_var.get(),
                 "name_usecam": self.name_usecam_var.get(),
                 "depth": self.depth_var.get(),
-                "matte": self.matte_var.get(),
-                "matte_fill": self.matte_fill_var.get(),
+                "beauty": self.beauty_var.get(),
+                "mfront": self.mfront_var.get(),
                 "behind": self.behind_var.get(),
                 "objid": self.objid_var.get(),
-                "objid_fill": self.objid_fill_var.get(),
-                "objid_hide": self.objid_hide_var.get(),
                 "matte_names": self._pick_targets(self.matte_pick),
                 "objid_names": self._pick_targets(self.objid_pick),
                 "matte_labels": self.matte_pick.get("labels", {}),
                 "objid_labels": self.objid_pick.get("labels", {}),
                 "depth_bit": self.depth_bit_var.get(),
-                "depth_invert": self.depth_invert_var.get(),
                 "near": self.near_var.get(), "far": self.far_var.get(),
                 "mrq_warmup": self.mrq_warmup_var.get(),
                 "mrq_ts": self.mrq_ts_var.get(),
@@ -1282,7 +1248,6 @@ class CaptureWindow(object):
                 "seq_custom": self.seq_custom_var.get(),
                 "seq_near": self.seq_near_var.get(),
                 "seq_far": self.seq_far_var.get(),
-                "seq_inv": self.seq_inv_var.get(),
             }
             with open(self._settings_path(), "w", encoding="utf-8") as f:
                 json.dump(state, f, ensure_ascii=False, indent=2)
@@ -1321,12 +1286,10 @@ class CaptureWindow(object):
         _setvar(self.name_custom_var, "name_custom")
         _setvar(self.name_usecam_var, "name_usecam")
         _setvar(self.depth_var, "depth")
-        _setvar(self.matte_var, "matte")
-        _setvar(self.matte_fill_var, "matte_fill")
+        _setvar(self.beauty_var, "beauty")
+        _setvar(self.mfront_var, "mfront")
         _setvar(self.behind_var, "behind")
         _setvar(self.objid_var, "objid")
-        _setvar(self.objid_fill_var, "objid_fill")
-        _setvar(self.objid_hide_var, "objid_hide")
 
         def _restore_picker(p, names_key, labels_key):
             names = st.get(names_key)
@@ -1344,7 +1307,6 @@ class CaptureWindow(object):
         _restore_picker(self.objid_pick, "objid_names", "objid_labels")
         if st.get("depth_bit") in ("8bit PNG", "16bit PNG", "EXR float"):
             self.depth_bit_var.set(st["depth_bit"])
-        _setvar(self.depth_invert_var, "depth_invert")
         _setvar(self.near_var, "near"); _setvar(self.far_var, "far")
         _setvar(self.mrq_warmup_var, "mrq_warmup")
         _setvar(self.mrq_ts_var, "mrq_ts")
@@ -1376,7 +1338,6 @@ class CaptureWindow(object):
         _setvar(self.seq_custom_var, "seq_custom")
         _setvar(self.seq_near_var, "seq_near")
         _setvar(self.seq_far_var, "seq_far")
-        _setvar(self.seq_inv_var, "seq_inv")
 
     def _collect_settings(self):
         s = core.CaptureSettings()
@@ -1391,14 +1352,14 @@ class CaptureWindow(object):
         s.fog_off = self.fog_off_var.get()
         s.do_color = False                 # 旧 Color(SceneCapture) は廃止。Beauty は MRQ で出す。
         s.do_depth = self.depth_var.get()
-        s.do_matte = self.matte_var.get()
-        s.matte_invert = True              # 選択=黒/周囲=白 で固定
-        s.matte_fill_alpha = self.matte_fill_var.get()
-        s.depth_hide_matte = self.matte_var.get()   # Matte ON なら Z-Depth からも対象を除外
+        s.do_matte = self.mfront_var.get()   # MatteBeauty 合成用の内部マスク（製品ではない）
+        s.matte_invert = True                # 選択=黒/周囲=白 で固定
+        s.matte_fill_alpha = False           # 合成は MRQ Beauty 側で行う
+        s.depth_hide_matte = self.mfront_var.get() or self.behind_var.get()
         s.do_behind_matte = self.behind_var.get()
         s.do_object_id = self.objid_var.get()
-        s.objid_fill_alpha = self.objid_fill_var.get()
-        s.objid_hide_render = self.objid_hide_var.get()
+        s.objid_fill_alpha = False
+        s.objid_hide_render = False
         # 対象リスト（リストの中身＝対象。空ならエディタ選択にフォールバック。
         # パス失効時はラベルで再解決）
         s.matte_actor_names = self._pick_targets_resolved(self.matte_pick) or None
@@ -1410,7 +1371,7 @@ class CaptureWindow(object):
             s.depth_bit = "16bit"
         else:
             s.depth_bit = "exr"
-        s.depth_invert = self.depth_invert_var.get()
+        s.depth_invert = True                # 手前=白 / 奥=黒 固定
         s.depth_near = self._float_var(self.near_var, s.depth_near)
         s.depth_far = self._float_var(self.far_var, s.depth_far)
         return s
