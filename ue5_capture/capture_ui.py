@@ -384,9 +384,24 @@ class CaptureWindow(object):
         ttk.Checkbutton(fmt, text="MP4", variable=self.seq_mp4_var).pack(side="left", padx=(8, 0))
         ttk.Label(fmt, text="レート:").pack(side="left", padx=(8, 0))
         self.seq_rate_var = tk.StringVar(master=self.root, value="高 (CRF 20)")
-        ttk.Combobox(fmt, textvariable=self.seq_rate_var, state="readonly", width=12,
+        ttk.Combobox(fmt, textvariable=self.seq_rate_var, state="normal", width=12,
                      values=list(_MP4_RATE_PRESETS.keys())).pack(side="left", padx=2)
+        ttk.Label(fmt, text="(CRF 16-51 直接入力可)", foreground="#888").pack(side="left", padx=(2, 0))
         fmt.grid(row=row, column=0, columnspan=3, sticky="w", **pad)
+        row += 1
+
+        mt = ttk.Frame(frm)
+        self.seq_matte_hide_var = tk.BooleanVar(master=self.root, value=False)
+        ttk.Checkbutton(mt, text="Matte 対象を隠す（クリーンプレート）",
+                        variable=self.seq_matte_hide_var).pack(side="left")
+        self.seq_matte_var = tk.BooleanVar(master=self.root, value=False)
+        ttk.Checkbutton(mt, text="+ Matte も出力（白黒）",
+                        variable=self.seq_matte_var).pack(side="left", padx=(8, 0))
+        mt.grid(row=row, column=0, columnspan=3, sticky="w", **pad)
+        row += 1
+        ttk.Label(frm, text="（対象は画像タブの Matte targets、空ならエディタ選択。"
+                            "Matte 出力時は対象を自動で隠す＝選択=黒/周囲=白）",
+                  foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", padx=24)
         row += 1
 
         dep = ttk.Frame(frm)
@@ -479,6 +494,16 @@ class CaptureWindow(object):
             return float(var.get())
         except ValueError:
             return default
+
+    def _resolve_crf(self):
+        """レート欄からプリセット名 or 直接入力の CRF 数値を解決する（16-51 に clamp）。"""
+        txt = (self.seq_rate_var.get() or "").strip()
+        if txt in _MP4_RATE_PRESETS:
+            return _MP4_RATE_PRESETS[txt]
+        try:
+            return max(16, min(51, int(float(txt))))
+        except ValueError:
+            return 20
 
     def _browse(self, var=None):
         var = var if var is not None else self.out_var
@@ -736,27 +761,45 @@ class CaptureWindow(object):
         out = base_out
         if self.seq_subdir_var.get():
             out = os.path.join(base_out, "%s_%s" % (name_body, take_str))
-        crf = _MP4_RATE_PRESETS.get(self.seq_rate_var.get(), 20)
+        crf = self._resolve_crf()
         self._save_ui_state()
-        depth_mat = None
-        if self.seq_depth_var.get():
-            try:
+        # Matte 対象（画像タブの Matte targets を共用。空ならエディタ選択）
+        matte_actors = None
+        if self.seq_matte_var.get() or self.seq_matte_hide_var.get():
+            matte_actors = core._resolve_target_actors(
+                None, self._pick_targets(self.matte_pick) or None)
+            if not matte_actors:
+                self.status_var.set("シーケンスレンダ: Matte 対象が見つかりません"
+                                    "（画像タブの Matte targets か選択を確認）")
+                return
+        depth_mat = matte_mat = None
+        hide_actors = None
+        try:
+            if self.seq_depth_var.get():
                 depth_mat = core.create_temp_depth_material(
                     self._float_var(self.seq_near_var, 0.0),
                     self._float_var(self.seq_far_var, 10000.0),
                     invert=self.seq_inv_var.get())
-            except Exception as e:
-                self.status_var.set("深度マテリアル生成失敗: %s" % e)
-                return
-        made_depth = depth_mat is not None
+            if self.seq_matte_var.get():
+                matte_mat = core.create_temp_matte_material()
+            elif self.seq_matte_hide_var.get():
+                hide_actors = matte_actors
+        except Exception as e:
+            self.status_var.set("一時マテリアル生成失敗: %s" % e)
+            return
+
+        def _cleanup_materials():
+            if depth_mat is not None:
+                core.delete_temp_depth_material()
+            if matte_mat is not None:
+                core.delete_temp_matte_material()
 
         def _done(ok, od):
-            if made_depth:
-                core.delete_temp_depth_material()
+            _cleanup_materials()
             self.status_var.set(("シーケンスレンダ完了: %s" % od) if ok
                                 else "シーケンスレンダ失敗 (Output Log 参照)")
 
-        self.status_var.set("シーケンスレンダ中… (PIE に入ります / 完了まで待機)")
+        self.status_var.set("シーケンスレンダ中… (PIE に入ります / MP4 CRF %d)" % crf)
         self.root.update()
         try:
             capture_mrq.render_sequence(
@@ -764,11 +807,12 @@ class CaptureWindow(object):
                 do_png=self.seq_png_var.get(), do_mp4=self.seq_mp4_var.get(),
                 mp4_crf=crf, temporal_samples=ts, warmup=warm,
                 custom_start=cs, custom_end=ce,
-                depth_material=depth_mat, fog_off=self.seq_fog_var.get(),
+                depth_material=depth_mat,
+                matte_material=matte_mat, matte_actors=matte_actors,
+                hidden_actors=hide_actors, fog_off=self.seq_fog_var.get(),
                 on_done=_done)
         except Exception as e:
-            if made_depth:
-                core.delete_temp_depth_material()
+            _cleanup_materials()
             self.status_var.set("シーケンスレンダ起動失敗: %s" % e)
 
     def _make_picker(self, frm, row, label):
@@ -998,6 +1042,8 @@ class CaptureWindow(object):
                 "seq_mp4": self.seq_mp4_var.get(),
                 "seq_rate": self.seq_rate_var.get(),
                 "seq_depth": self.seq_depth_var.get(),
+                "seq_matte": self.seq_matte_var.get(),
+                "seq_matte_hide": self.seq_matte_hide_var.get(),
                 "seq_subdir": self.seq_subdir_var.get(),
                 "seq_w": self.seq_w_var.get(), "seq_h": self.seq_h_var.get(),
                 "seq_warm": self.seq_warm_var.get(), "seq_ts": self.seq_ts_var.get(),
@@ -1079,9 +1125,10 @@ class CaptureWindow(object):
         _setvar(self.seq_end_var, "seq_end")
         _setvar(self.seq_png_var, "seq_png")
         _setvar(self.seq_mp4_var, "seq_mp4")
-        if st.get("seq_rate") in _MP4_RATE_PRESETS:
-            self.seq_rate_var.set(st["seq_rate"])
+        _setvar(self.seq_rate_var, "seq_rate")   # プリセット名 or CRF 数値そのまま
         _setvar(self.seq_depth_var, "seq_depth")
+        _setvar(self.seq_matte_var, "seq_matte")
+        _setvar(self.seq_matte_hide_var, "seq_matte_hide")
         _setvar(self.seq_subdir_var, "seq_subdir")
         _setvar(self.seq_w_var, "seq_w"); _setvar(self.seq_h_var, "seq_h")
         _setvar(self.seq_warm_var, "seq_warm"); _setvar(self.seq_ts_var, "seq_ts")
