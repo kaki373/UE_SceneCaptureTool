@@ -851,6 +851,94 @@ def set_matte_shadow_occlusion(actors, enabled):
     return n
 
 
+_TMP_MATTEBOARD_NAME = "M_UE5Cap_MatteBoardUnlit"
+_MATTE_ORIGMAT_TAG = "ue5cap_origmat"
+
+
+def get_or_create_matteboard_material():
+    """マット板用のアンリット単色マテリアル（ライティング・影を一切受けない）。
+    板の見た目を撮影素材に使わない前提のニュートラル表示用。"""
+    full = _TMP_MAT_PKG + "/" + _TMP_MATTEBOARD_NAME
+    mat = None
+    if unreal.EditorAssetLibrary.does_asset_exist(full):
+        mat = unreal.EditorAssetLibrary.load_asset(full)
+    if mat is None:
+        at = unreal.AssetToolsHelpers.get_asset_tools()
+        mat = at.create_asset(_TMP_MATTEBOARD_NAME, _TMP_MAT_PKG,
+                              unreal.Material, unreal.MaterialFactoryNew())
+    if mat is None:
+        raise RuntimeError("MatteBoard マテリアルの生成に失敗しました。")
+    MEL = unreal.MaterialEditingLibrary
+    mat.set_editor_property("shading_model", unreal.MaterialShadingModel.MSM_UNLIT)
+    try:
+        MEL.delete_all_material_expressions(mat)
+    except Exception:
+        pass
+    e = _mx_const(mat, 0.18, -300, 0)   # 50%グレー相当（リニア）
+    MEL.connect_material_property(e, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+    MEL.recompile_material(mat)
+    try:
+        unreal.EditorAssetLibrary.save_loaded_asset(mat)
+    except Exception as ex:
+        _warn("MatteBoard マテリアルの保存に失敗（未保存のまま続行）: %s" % ex)
+    return mat
+
+
+def set_matte_unlit(actors):
+    """マット対象の全メッシュスロットをアンリット材へ差替える（受光・受影なし）。
+    元マテリアルのパスはアクタータグ ue5cap_origmat|comp|slot|path に退避
+    （restore_matte_materials で復元）。差替えたスロット数を返す。"""
+    mat = get_or_create_matteboard_material()
+    mat_path = mat.get_path_name()
+    n = 0
+    for a in actors or []:
+        if a is None:
+            continue
+        tags = [unreal.Name(str(t)) for t in a.tags]
+        for comp in a.get_components_by_class(unreal.MeshComponent):
+            cname = comp.get_name()
+            for i in range(comp.get_num_materials()):
+                cur = comp.get_material(i)
+                cur_path = cur.get_path_name() if cur else ""
+                if cur_path == mat_path:
+                    continue               # 既に差替え済み
+                tags.append(unreal.Name("%s|%s|%d|%s"
+                                        % (_MATTE_ORIGMAT_TAG, cname, i, cur_path)))
+                comp.set_material(i, mat)
+                n += 1
+        a.set_editor_property("tags", tags)
+    _log("マット板をアンリット化: %d slot" % n)
+    return n
+
+
+def restore_matte_materials(actors):
+    """set_matte_unlit の退避タグから元マテリアルを復元し、タグを除去する。"""
+    n = 0
+    for a in actors or []:
+        if a is None:
+            continue
+        keep = []
+        comps = {c.get_name(): c
+                 for c in a.get_components_by_class(unreal.MeshComponent)}
+        for t in a.tags:
+            s = str(t)
+            if not s.startswith(_MATTE_ORIGMAT_TAG + "|"):
+                keep.append(unreal.Name(s))
+                continue
+            try:
+                _p, cname, idx, path = s.split("|", 3)
+                comp = comps.get(cname)
+                if comp is not None:
+                    m = unreal.load_object(None, path) if path else None
+                    comp.set_material(int(idx), m)
+                    n += 1
+            except Exception as e:
+                _warn("マテリアル復元に失敗 (%s): %s" % (s, e))
+        a.set_editor_property("tags", keep)
+    _log("マット板のマテリアル復元: %d slot" % n)
+    return n
+
+
 def composite_behind_in_matte(world, cam, matte_actors, beauty_path, behind_path,
                               out_path, width, height):
     """マットのシルエット範囲だけ behind(near-clip Beauty)、それ以外は通常 Beauty を合成。
@@ -929,6 +1017,29 @@ def trim_sequence_frames(output_dir, name_body, take_str, pass_names, start, end
     return n
 
 
+def move_pass_frames_to_subdirs(output_dir, name_body, take_str, pass_names):
+    """PNG連番の各パスを <素材名>_<テイク> サブフォルダへ移動する
+    （連番の大量ファイルで出力フォルダが埋まるのを防ぐ。MP4 は直下のまま）。
+    合成・エンコード等の後処理がすべて終わった最後に呼ぶこと。移動数を返す。"""
+    n = 0
+    for pn in pass_names:
+        pat = re.compile(re.escape("%s_%s_%s." % (name_body, pn, take_str)) + r"\d+\.png$")
+        files = [f for f in os.listdir(output_dir) if pat.match(f)]
+        if not files:
+            continue
+        sub = os.path.join(output_dir, "%s_%s" % (pn, take_str))
+        os.makedirs(sub, exist_ok=True)
+        for f in files:
+            try:
+                os.replace(os.path.join(output_dir, f), os.path.join(sub, f))
+                n += 1
+            except Exception as e:
+                _warn("連番の移動に失敗 %s: %s" % (f, e))
+    if n:
+        _log("PNG連番をサブフォルダへ移動: %d ファイル" % n)
+    return n
+
+
 def delete_pass_frames(output_dir, name_body, take_str, pass_names):
     """指定パスのフレーム PNG を削除（中間素材や PNG 不要指定の後始末）。"""
     n = 0
@@ -986,8 +1097,10 @@ def objid_stencil_color(stencil):
 
 
 def composite_behind_sequence(output_dir, name_body, take_str):
-    """シーケンスレンダの behind 合成。各フレームで Matte（選択=黒）をマスクに、
-    黒い部分は BehindPlate、白い部分は Beauty を合成した Behind 連番を書く。
+    """シーケンスレンダの behind 合成。各フレームで MatteSil（マット対象の全投影
+    シルエット・選択=黒・遮蔽非依存）をマスクに、黒い部分は BehindPlate、白い部分は
+    Beauty を合成した Behind 連番を書く。可視性マスク（Matte）は使わない：マットより
+    手前のオブジェクト（キャラ等）の画素が白になり Beauty 側で写り込むため。
     出力したフレーム数を返す。"""
     if not (_HAS_NUMPY and _HAS_PIL):
         return 0
@@ -999,9 +1112,9 @@ def composite_behind_sequence(output_dir, name_body, take_str):
             continue
         fr = m.group(1)
         plate_p = os.path.join(output_dir, "%s_BehindPlate_%s.%s.png" % (name_body, take_str, fr))
-        matte_p = os.path.join(output_dir, "%s_Matte_%s.%s.png" % (name_body, take_str, fr))
+        matte_p = os.path.join(output_dir, "%s_MatteSil_%s.%s.png" % (name_body, take_str, fr))
         if not (os.path.isfile(plate_p) and os.path.isfile(matte_p)):
-            _warn("behind 合成: フレーム %s の素材が不足（plate/matte）" % fr)
+            _warn("behind 合成: フレーム %s の素材が不足（plate/mattesil）" % fr)
             continue
         beauty = _np.asarray(_PILImage.open(os.path.join(output_dir, f)).convert("RGB"),
                              dtype=_np.float32)
@@ -1152,9 +1265,14 @@ def blend_with_beauty(beauty_path, matte_path=None, objid_path=None,
 _TMP_MAT_PKG = "/Game/_UE5Capture_Tmp"
 _TMP_MAT_NAME = "M_UE5Cap_DepthNorm"
 
+# マット対象に付与する CustomDepth ステンシル値。ObjectID のステンシル(1..249)と
+# 帯域を分けることで、ObjectID 対象の CustomDepth が Matte/MatteSil マスクへ
+# 混入しない（マスクはステンシル一致で判定する）。
+MATTE_STENCIL = 250
 
-def delete_temp_depth_material():
-    full = _TMP_MAT_PKG + "/" + _TMP_MAT_NAME
+
+def _delete_temp_material(asset_name, label):
+    full = _TMP_MAT_PKG + "/" + asset_name
     try:
         if not unreal.EditorAssetLibrary.does_asset_exist(full):
             return
@@ -1162,9 +1280,13 @@ def delete_temp_depth_material():
         if not unreal.EditorAssetLibrary.delete_asset(full):
             unreal.SystemLibrary.collect_garbage()
             if not unreal.EditorAssetLibrary.delete_asset(full):
-                _warn("一時深度マテリアルを削除できませんでした: %s" % full)
+                _warn("一時 %s マテリアルを削除できませんでした: %s" % (label, full))
     except Exception as e:
-        _warn("一時深度マテリアル削除に失敗: %s" % e)
+        _warn("一時 %s マテリアル削除に失敗: %s" % (label, e))
+
+
+def delete_temp_depth_material():
+    _delete_temp_material(_TMP_MAT_NAME, "深度")
 
 
 def create_temp_depth_material(near, far, invert=True):
@@ -1277,23 +1399,35 @@ _TMP_MATTE_NAME = "M_UE5Cap_Matte"
 
 
 def delete_temp_matte_material():
-    full = _TMP_MAT_PKG + "/" + _TMP_MATTE_NAME
-    try:
-        if not unreal.EditorAssetLibrary.does_asset_exist(full):
-            return
-        if not unreal.EditorAssetLibrary.delete_asset(full):
-            unreal.SystemLibrary.collect_garbage()
-            if not unreal.EditorAssetLibrary.delete_asset(full):
-                _warn("一時 Matte マテリアルを削除できませんでした: %s" % full)
-    except Exception as e:
-        _warn("一時 Matte マテリアル削除に失敗: %s" % e)
+    _delete_temp_material(_TMP_MATTE_NAME, "Matte")
+
+
+def _mx_stencil_eq(mat, value, x, y):
+    """CustomStencil == value の画素で 1 になる式チェーンを組んで clamp ノードを返す。
+    eq = clamp(1 - abs(stencil - value))。ステンシル未書き込み画素は 0 なので
+    value>=1 なら自動的に除外される（CustomDepth の far-plane 検査は不要）。"""
+    MEL = unreal.MaterialEditingLibrary
+    st = _mx_scene_r(mat, unreal.SceneTextureId.PPI_CUSTOM_STENCIL, x, y)
+    diff = MEL.create_material_expression(mat, unreal.MaterialExpressionSubtract, x + 250, y)
+    _mx_conn(st, "", diff, "A")
+    _mx_conn(_mx_const(mat, float(value), x + 100, y + 100), "", diff, "B")
+    ab = MEL.create_material_expression(mat, unreal.MaterialExpressionAbs, x + 380, y)
+    _mx_conn(diff, "", ab, "")
+    inv = MEL.create_material_expression(mat, unreal.MaterialExpressionSubtract, x + 500, y)
+    _mx_conn(_mx_const(mat, 1.0, x + 380, y + 100), "", inv, "A")
+    _mx_conn(ab, "", inv, "B")
+    eq = MEL.create_material_expression(mat, unreal.MaterialExpressionClamp, x + 630, y)
+    _mx_conn(inv, "", eq, "")
+    return eq
 
 
 def create_temp_matte_material():
     """CustomDepth と SceneDepth の比較で「対象が最前面に見える画素」を出力する
     PostProcess マテリアルを用意して返す（選択=黒 / 周囲=白。画像タブの Matte と同じ）。
-    対象アクターは render_in_main_pass=False + render_custom_depth=True にしておく前提
-    （ビューティには写らず CustomDepth にだけ写る＝クリーンプレートと両立）。
+    対象アクターは render_in_main_pass=False + render_custom_depth=True +
+    ステンシル=MATTE_STENCIL にしておく前提（ビューティには写らず CustomDepth に
+    だけ写る＝クリーンプレートと両立）。対象の判定はステンシル一致で行うため、
+    ObjectID 対象など他の CustomDepth 書き込みは混入しない。
     既存の一時アセットがあれば再利用して式だけ作り直す。"""
     mat = _mx_get_or_create_pp_material(_TMP_MATTE_NAME)
     MEL = unreal.MaterialEditingLibrary
@@ -1301,11 +1435,9 @@ def create_temp_matte_material():
     _const = lambda v, x, y: _mx_const(mat, v, x, y)
     _scene_r = lambda tex_id, x, y: _mx_scene_r(mat, tex_id, x, y)
 
-    # black = in_front * valid,  out = 1 - black（選択=黒 / 周囲=白）
-    #   in_front = clamp((sd + tol - cd) * 1000)   対象がシーンより手前
-    #   valid    = clamp((1e7 - cd) * 0.001)       CustomDepth が実際に書かれた画素のみ
-    #     （未書き込み画素はファープレーン値になるため。空は sd もファープレーンで
-    #       cd ≈ sd となり in_front が立ってしまうので valid で除外する）
+    # black = in_front * stencil_eq,  out = 1 - black（選択=黒 / 周囲=白）
+    #   in_front   = clamp((sd + tol - cd) * 1000)   対象がシーンより手前
+    #   stencil_eq = CustomStencil == MATTE_STENCIL（未書き込み=0 は自動的に外れる）
     # If ノードを使わない算術のみの構成（ピン名依存を最小化）。
     cd = _scene_r(unreal.SceneTextureId.PPI_CUSTOM_DEPTH, -1250, 0)
     sd = _scene_r(unreal.SceneTextureId.PPI_SCENE_DEPTH, -1250, 250)
@@ -1327,19 +1459,12 @@ def create_temp_matte_material():
     _conn(_const(1000.0, -500, 300), "", scale, "B")
     in_front = MEL.create_material_expression(mat, unreal.MaterialExpressionClamp, -240, 120)
     _conn(scale, "", in_front, "")
-    # valid
-    vdiff = MEL.create_material_expression(mat, unreal.MaterialExpressionSubtract, -500, 420)
-    _conn(_const(1.0e7, -650, 420), "", vdiff, "A")
-    _conn(cd, "", vdiff, "B")
-    vscale = MEL.create_material_expression(mat, unreal.MaterialExpressionMultiply, -370, 420)
-    _conn(vdiff, "", vscale, "A")
-    _conn(_const(0.001, -500, 520), "", vscale, "B")
-    valid = MEL.create_material_expression(mat, unreal.MaterialExpressionClamp, -240, 420)
-    _conn(vscale, "", valid, "")
-    # black = in_front * valid → out = 1 - black
+    # stencil_eq
+    eq = _mx_stencil_eq(mat, MATTE_STENCIL, -1250, 480)
+    # black = in_front * stencil_eq → out = 1 - black
     black = MEL.create_material_expression(mat, unreal.MaterialExpressionMultiply, -120, 260)
     _conn(in_front, "", black, "A")
-    _conn(valid, "", black, "B")
+    _conn(eq, "", black, "B")
     inv = MEL.create_material_expression(mat, unreal.MaterialExpressionOneMinus, -10, 260)
     _conn(black, "", inv, "")
     MEL.connect_material_property(inv, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
@@ -1348,7 +1473,39 @@ def create_temp_matte_material():
         unreal.EditorAssetLibrary.save_loaded_asset(mat)
     except Exception as e:
         _warn("一時 Matte マテリアルの保存に失敗（未保存のまま続行）: %s" % e)
-    _log("一時 Matte マテリアル生成（選択=黒/周囲=白）")
+    _log("一時 Matte マテリアル生成（選択=黒/周囲=白・ステンシル判定）")
+    return mat
+
+
+_TMP_MATTE_SIL_NAME = "M_UE5Cap_MatteSil"
+
+
+def delete_temp_matte_sil_material():
+    _delete_temp_material(_TMP_MATTE_SIL_NAME, "MatteSil")
+
+
+def create_temp_matte_sil_material():
+    """マット対象の『全投影シルエット』を出力する PostProcess マテリアル
+    （選択=黒 / 周囲=白）。Matte と違い SceneDepth と比較しない＝手前の遮蔽物を
+    無視する（静止画側の show-only シルエットと同じ意味）。Behind 合成のマスク専用:
+    可視性マスク（M_UE5Cap_Matte）だとマットより手前のオブジェクトの画素が
+    「マットでない」になり、合成が Beauty 側（=手前オブジェクト入り）を選んでしまう。
+    対象アクターは render_custom_depth=True + ステンシル=MATTE_STENCIL の前提
+    （ステンシル一致判定なので ObjectID 対象の CustomDepth は混入しない）。"""
+    mat = _mx_get_or_create_pp_material(_TMP_MATTE_SIL_NAME)
+    MEL = unreal.MaterialEditingLibrary
+
+    # black = stencil_eq（対象の全投影シルエット）→ out = 1 - black
+    eq = _mx_stencil_eq(mat, MATTE_STENCIL, -1250, 120)
+    inv = MEL.create_material_expression(mat, unreal.MaterialExpressionOneMinus, -10, 120)
+    _mx_conn(eq, "", inv, "")
+    MEL.connect_material_property(inv, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+    MEL.recompile_material(mat)
+    try:
+        unreal.EditorAssetLibrary.save_loaded_asset(mat)
+    except Exception as e:
+        _warn("一時 MatteSil マテリアルの保存に失敗（未保存のまま続行）: %s" % e)
+    _log("一時 MatteSil マテリアル生成（選択=黒/周囲=白・遮蔽非依存・ステンシル判定）")
     return mat
 
 
@@ -1356,16 +1513,7 @@ _TMP_OBJID_NAME = "M_UE5Cap_ObjectID"
 
 
 def delete_temp_objid_material():
-    full = _TMP_MAT_PKG + "/" + _TMP_OBJID_NAME
-    try:
-        if not unreal.EditorAssetLibrary.does_asset_exist(full):
-            return
-        if not unreal.EditorAssetLibrary.delete_asset(full):
-            unreal.SystemLibrary.collect_garbage()
-            if not unreal.EditorAssetLibrary.delete_asset(full):
-                _warn("一時 ObjectID マテリアルを削除できませんでした: %s" % full)
-    except Exception as e:
-        _warn("一時 ObjectID マテリアル削除に失敗: %s" % e)
+    _delete_temp_material(_TMP_OBJID_NAME, "ObjectID")
 
 
 def create_temp_objid_material():
@@ -1441,9 +1589,16 @@ def create_temp_objid_material():
     gate = _mx_expr(mat, unreal.MaterialExpressionMultiply, -400, 200)
     _mx_conn(occ, "", gate, "A")
     _mx_conn(smask, "", gate, "B")
+    # マット予約ステンシル（MATTE_STENCIL）は ObjectID として着色しない
+    # （マットレンダモードの板が ObjectID 映像に色付きで写り込むため）
+    not_matte = _mx_expr(mat, unreal.MaterialExpressionOneMinus, -400, 620)
+    _mx_conn(_mx_stencil_eq(mat, MATTE_STENCIL, -1500, 660), "", not_matte, "")
+    gate2 = _mx_expr(mat, unreal.MaterialExpressionMultiply, -280, 200)
+    _mx_conn(gate, "", gate2, "A")
+    _mx_conn(not_matte, "", gate2, "B")
     outm = _mx_expr(mat, unreal.MaterialExpressionMultiply, -60, 40)
     _mx_conn(ap2, "", outm, "A")
-    _mx_conn(gate, "", outm, "B")
+    _mx_conn(gate2, "", outm, "B")
     unreal.MaterialEditingLibrary.connect_material_property(
         outm, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
     unreal.MaterialEditingLibrary.recompile_material(mat)

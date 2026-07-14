@@ -286,6 +286,12 @@ class CaptureWindow(object):
                   foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", padx=8)
         row += 1
         self.matte_pick, row = self._make_picker(frm, row, "Matte targets")
+        # マット対象はリストに入れた時点でライティングから分離、外したら復元する
+        self.matte_pick["on_added"] = self._matte_paths_neutralize
+        self.matte_pick["on_removed"] = self._matte_paths_restore
+        ttk.Label(frm, text="  （リストに入れた対象は自動で 影/AO/受光なし になり、外すと元に戻ります）",
+                  foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", padx=24)
+        row += 1
 
         # ObjectID（対象を色分け・他は黒）
         self.objid_var = tk.BooleanVar(master=self.root, value=False)
@@ -496,6 +502,25 @@ class CaptureWindow(object):
         if d:
             var.set(os.path.normpath(d))
 
+    def _matte_paths_neutralize(self, paths):
+        """マット対象をライティングから切り離す（影/AO/GIを落とさない・
+        アンリット材で受光/受影もしない）。元マテリアルはタグに退避。"""
+        actors = core._resolve_target_actors(None, list(paths) or None)
+        if not actors:
+            return
+        n = core.set_matte_shadow_occlusion(actors, False)
+        m = core.set_matte_unlit(actors)
+        self.status_var.set(
+            "マット対象を無効化: 影/AO OFF %d comp・アンリット %d slot（リストから外すと復元）" % (n, m))
+
+    def _matte_paths_restore(self, paths):
+        actors = core._resolve_target_actors(None, list(paths) or None)
+        if not actors:
+            return
+        n = core.set_matte_shadow_occlusion(actors, True)
+        m = core.restore_matte_materials(actors)
+        self.status_var.set("マット対象を復元: 影/AO ON %d comp・マテリアル復元 %d slot" % (n, m))
+
     def _on_mrq(self):
         """Movie Render Queue で Beauty を高品質レンダ（非同期・PIE）。"""
         import capture_mrq
@@ -550,6 +575,18 @@ class CaptureWindow(object):
                     pass
         # この Capture の通し番号（全出力に _NNN を付与。設定違いを上書きしない）
         suf = "%03d" % core.next_take_number(out)
+        # シーケンサーを開いていれば MRQ 側も「その現在フレーム」で固定する
+        # （PIE はエディタの評価ポーズを引き継がないため、SceneCapture 系=現在
+        #   フレーム / MRQ 系=フレーム0 とズレる。カメラはツール指定のまま）。
+        scene_seq = self._current_sequence()
+        scene_frame = None
+        if scene_seq is not None:
+            try:
+                scene_frame = int(
+                    unreal.LevelSequenceEditorBlueprintLibrary.get_current_time())
+            except Exception:
+                scene_seq = None
+                scene_frame = None
         # ① データパス(内部 Matte マスク / ObjectID / Depth)を同フレーム・同解像度で先に出す。
         #    Beauty+Matte の合成は MRQ Beauty 完了後に行う。
         s = self._collect_settings()
@@ -563,19 +600,39 @@ class CaptureWindow(object):
             """MRQ 出力名（SceneCapture 側と同じ 任意名_カメラ名_素材名_NNN 規則）。"""
             return core.out_basename(s, pass_type, suf)
 
-        matte_path = objid_path = None
+        matte_path = None
         want_mfront = self.mfront_var.get()
         want_behind = self.behind_var.get()
+        skip_notes = []
+        matte_mat_still = None
+        if want_mfront:
+            # Matteの前のマスクは Beauty と同一 MRQ ジョブの PP パスで撮る。
+            # SceneCapture 別撮りだと WPO（風）で揺れる前景（木の葉等）の
+            # シルエット位相が Beauty とズレる（2026-07-14 実測）。
+            s.do_matte = False
+            try:
+                matte_mat_still = core.create_temp_matte_material()
+            except Exception as e:
+                skip_notes.append("Matteの前: 一時マテリアル生成失敗でスキップ")
+                self.status_var.set("Matteの前: 一時マテリアル生成失敗: %s" % e)
+        depth_pp_mat = None
+        if self.depth_var.get() and self.depth_bit_var.get() == "8bit PNG":
+            # 8bit深度は Beauty と同一 MRQ ジョブの PP パスで撮る（WPO/風の位相一致）。
+            # 16bit PNG / EXR float は厳密リニアが必要なため従来の SceneCapture のまま
+            # （風で揺れる前景は Beauty と位相が合わない可能性がある）。
+            s.do_depth = False
+            try:
+                depth_pp_mat = core.create_temp_depth_material(
+                    self._float_var(self.near_var, 0.0),
+                    self._float_var(self.far_var, 10000.0), invert=True)
+            except Exception as e:
+                skip_notes.append("Z-Depth: 一時マテリアル生成失敗でスキップ")
+                self.status_var.set("Z-Depth: 一時マテリアル生成失敗: %s" % e)
         try:
             if s.do_matte or s.do_object_id or s.do_depth:
-                self.status_var.set("同フレームの Matte/ObjectID/Depth を出力中…")
+                self.status_var.set("同フレームの ObjectID/Depth を出力中…")
                 self.root.update()
-                outs = core.run_capture(s)
-                for o in outs:
-                    if o.endswith("_Matte_%s.png" % suf):
-                        matte_path = o
-                    elif o.endswith("_ObjectID_%s.png" % suf):
-                        objid_path = o
+                core.run_capture(s)
         except Exception as e:
             self.status_var.set("データパス出力でエラー: %s" % e)
 
@@ -584,14 +641,16 @@ class CaptureWindow(object):
                    "EXR 16bit (float)": "exr"}.get(self.beauty_fmt_var.get(), "png")
         beauty_path = os.path.join(out, _name("Beauty") +
                                    {"png": ".png", "jpg": ".jpg", "exr": ".exr"}[img_fmt])
-        # Matte 系合成は PIL で読める画像が必要。EXR のときは PNG も内部出力して使う。
+        # Matte 系合成は PIL で読める画像が必要。EXR のときは PNG も内部出力して使う
+        # （Depth PP パスの PNG 出力にも必要）。
         need_comp = want_mfront or want_behind
-        aux_png = (img_fmt == "exr") and need_comp
+        aux_png = (img_fmt == "exr") and (need_comp or depth_pp_mat is not None)
         comp_beauty = (os.path.join(out, _name("Beauty") + ".png")
                        if img_fmt == "exr" else beauty_path)
 
-        # Beauty（MRQ）は Beauty 指定時か Matte 系合成が要るときだけレンダする
-        beauty_needed = self.beauty_var.get() or want_mfront or want_behind
+        # Beauty（MRQ）は Beauty 指定時・Matte 系合成・同一ジョブ深度が要るときにレンダする
+        beauty_needed = (self.beauty_var.get() or want_mfront or want_behind
+                         or depth_pp_mat is not None)
         if not beauty_needed:
             _restore_fb()
             self.status_var.set("完了（データパスのみ出力）" if (s.do_depth or s.do_object_id)
@@ -607,6 +666,10 @@ class CaptureWindow(object):
                 self.status_var.set("Beauty: Matte 対象 %d 個を隠して撮影（クリーンプレート）" % len(beauty_hidden))
             else:
                 self.status_var.set("Matte 対象が見つかりません（Beauty は全表示で撮ります）")
+        if matte_mat_still is not None and not beauty_hidden:
+            core.delete_temp_matte_material()
+            matte_mat_still = None
+            skip_notes.append("Matteの前: Matte 対象が見つからずスキップ")
 
         # 後続 MRQ ジョブのキュー（Matteの奥のプレート）
         jobs = []
@@ -621,18 +684,25 @@ class CaptureWindow(object):
 
         def _finalize():
             # 内部素材の後始末: 生 Matte マスクと EXR 用の内部 PNG は削除。
-            # Beauty のチェックが無い場合（合成のためだけにレンダした場合）も削除。
+            # Beauty のチェックが無い場合（合成のためだけにレンダした場合）も削除するが、
+            # 合成がスキップされたときは唯一の成果物になるため残す。
             aux = comp_beauty if comp_beauty != beauty_path else None
+            keep_beauty = self.beauty_var.get() or bool(skip_notes)
+            matte_exr = os.path.join(out, _name("Beauty") + "_Matte.exr")
+            depth_exr = os.path.join(out, _name("Beauty") + "_Depth.exr")
             for p, keep in ((matte_path, False),
                             (aux, False),
-                            (beauty_path, self.beauty_var.get())):
+                            (matte_exr, False),
+                            (depth_exr, False),
+                            (beauty_path, keep_beauty)):
                 if p and not keep and os.path.isfile(p):
                     try:
                         os.remove(p)
                     except Exception:
                         pass
             _restore_fb()
-            self.status_var.set("完了")
+            self.status_var.set("完了" if not skip_notes
+                                else "完了（%s）" % " / ".join(skip_notes))
 
         def _run_jobs():
             if not jobs:
@@ -668,17 +738,36 @@ class CaptureWindow(object):
                                           file_basename=j["base"],
                                           hidden_actors=j["hidden"],
                                           near_clip_cm=j.get("near_clip"),
-                                          fog_off=self.fog_off_var.get(), on_done=_jdone)
+                                          fog_off=self.fog_off_var.get(),
+                                          scene_sequence=scene_seq,
+                                          scene_frame=scene_frame, on_done=_jdone)
             except Exception as e:
                 self.status_var.set("追加 MRQ 失敗: %s" % e)
 
         def _after_beauty(ok, od):
+            nonlocal matte_path
+            if matte_mat_still is not None:
+                core.delete_temp_matte_material()
+            if depth_pp_mat is not None:
+                core.delete_temp_depth_material()
             if ok:
                 try:
-                    if want_mfront and matte_path:
-                        core.blend_with_beauty(
-                            comp_beauty, matte_path, None,
-                            matte_out=os.path.join(out, _name("MatteBeauty") + ".png"))
+                    if want_mfront and matte_mat_still is not None:
+                        mp = os.path.join(out, _name("Beauty") + "_Matte.png")
+                        if os.path.isfile(mp):
+                            matte_path = mp
+                            core.blend_with_beauty(
+                                comp_beauty, matte_path, None,
+                                matte_out=os.path.join(out, _name("MatteBeauty") + ".png"))
+                        else:
+                            skip_notes.append(
+                                "Matteの前: マスクが得られずスキップ（Beauty は残置）")
+                    if depth_pp_mat is not None:
+                        dp = os.path.join(out, _name("Beauty") + "_Depth.png")
+                        if os.path.isfile(dp):
+                            os.replace(dp, os.path.join(out, _name("Depth") + ".png"))
+                        else:
+                            skip_notes.append("Z-Depth: PP パス出力が見つかりません")
                 except Exception as e:
                     _restore_fb()
                     self.status_var.set("Beautyブレンドでエラー: %s" % e)
@@ -695,9 +784,20 @@ class CaptureWindow(object):
                                       also_png=aux_png,
                                       temporal_samples=ts, warmup=warm,
                                       file_basename=_name("Beauty"),
-                                      hidden_actors=beauty_hidden,
-                                      fog_off=self.fog_off_var.get(), on_done=_after_beauty)
+                                      hidden_actors=(None if matte_mat_still is not None
+                                                     else beauty_hidden),
+                                      matte_material=matte_mat_still,
+                                      matte_actors=(beauty_hidden if matte_mat_still is not None
+                                                    else None),
+                                      depth_material=depth_pp_mat,
+                                      fog_off=self.fog_off_var.get(),
+                                      scene_sequence=scene_seq,
+                                      scene_frame=scene_frame, on_done=_after_beauty)
         except Exception as e:
+            if matte_mat_still is not None:
+                core.delete_temp_matte_material()
+            if depth_pp_mat is not None:
+                core.delete_temp_depth_material()
             _restore_fb()
             self.status_var.set("MRQ 起動失敗: %s" % e)
 
@@ -716,17 +816,11 @@ class CaptureWindow(object):
             unreal.LevelSequenceEditorBlueprintLibrary.set_current_time(int(frame))
         except Exception:
             pass
-        ext = unreal.MovieSceneSequenceExtensions
         try:
-            world = core._get_editor_world()
-            sec = ext.find_tracks_by_exact_type(
-                seq, unreal.MovieSceneCameraCutTrack)[0].get_sections()[0]
-            guid = sec.get_camera_binding_id().get_editor_property("guid")
-            for b in ext.get_bindings(seq):
-                if b.get_id() == guid:
-                    for o in ext.locate_bound_objects(seq, b, world):
-                        if isinstance(o, unreal.Actor):
-                            return o
+            import capture_mrq
+            cams = capture_mrq._camera_cut_camera_actors(seq, core._get_editor_world())
+            if cams:
+                return cams[0]
         except Exception:
             pass
         cams = core.list_cameras()
@@ -840,7 +934,7 @@ class CaptureWindow(object):
             out = os.path.join(base_out, "%s_%s" % (name_body, take_str))
         self._save_ui_state()
 
-        depth_mat = matte_mat = objid_mat = None
+        depth_mat = matte_mat = matte_sil_mat = objid_mat = None
         hide_actors = None
         try:
             if depth_needed:
@@ -848,9 +942,13 @@ class CaptureWindow(object):
                     self._float_var(self.seq_near_var, 0.0),
                     self._float_var(self.seq_far_var, 10000.0),
                     invert=True)   # 手前=白 / 奥=黒 固定
-            if matte_needed:
+            if _need("mfront"):
                 matte_mat = core.create_temp_matte_material()
-            elif self.seq_matte_hide_var.get():
+            if _need("behind"):
+                # Behind 合成は遮蔽非依存の全投影シルエットでマスクする
+                # （可視性マスクだと手前のオブジェクトが Beauty 側で写り込む）
+                matte_sil_mat = core.create_temp_matte_sil_material()
+            if not matte_needed and self.seq_matte_hide_var.get():
                 hide_actors = matte_actors
             if objid_needed:
                 objid_mat = core.create_temp_objid_material()
@@ -863,6 +961,8 @@ class CaptureWindow(object):
                 core.delete_temp_depth_material()
             if matte_mat is not None:
                 core.delete_temp_matte_material()
+            if matte_sil_mat is not None:
+                core.delete_temp_matte_sil_material()
             if objid_mat is not None:
                 core.delete_temp_objid_material()
 
@@ -876,6 +976,8 @@ class CaptureWindow(object):
             pass_files_main.append("Depth")
         if matte_mat is not None:
             pass_files_main.append("Matte")
+        if matte_sil_mat is not None:
+            pass_files_main.append("MatteSil")
         if objid_needed:
             pass_files_main.append("ObjectID")
 
@@ -896,7 +998,8 @@ class CaptureWindow(object):
                     core.composite_behind_sequence(out, name_body, take_str)
                 if objid_needed and objid_actors:
                     man = {}
-                    for i, a in enumerate(objid_actors[:255]):
+                    # ステンシルは 1..MATTE_STENCIL-1（MATTE_STENCIL はマット用予約）
+                    for i, a in enumerate(objid_actors[:core.MATTE_STENCIL - 1]):
                         r, g, b = core.objid_stencil_color(i + 1)
                         try:
                             man["#%02X%02X%02X" % (r, g, b)] = a.get_actor_label()
@@ -918,11 +1021,20 @@ class CaptureWindow(object):
                     cmds.append(cmd)
 
             def _after_encode(enc_ok):
-                drop = ["Matte", "BehindPlate"]      # 中間素材は常に削除
+                drop = ["BehindPlate"]               # 中間素材は削除
+                if matte_mat is not None:
+                    drop.append("Matte")
+                if matte_sil_mat is not None:
+                    drop.append("MatteSil")
                 for key, _label, pass_name in _SEQ_OUTPUTS:
                     if not wants[key][0]:
                         drop.append(pass_name)
                 core.delete_pass_frames(out, name_body, take_str, drop)
+                # PNG連番を選んだ素材は素材毎のサブフォルダへ自動移動（MP4は直下のまま）
+                png_passes = [pass_name for key, _label, pass_name in _SEQ_OUTPUTS
+                              if wants[key][0]]
+                if png_passes:
+                    core.move_pass_frames_to_subdirs(out, name_body, take_str, png_passes)
                 _final(enc_ok, od)
 
             if cmds:
@@ -971,6 +1083,7 @@ class CaptureWindow(object):
                 custom_start=cs, custom_end=ce,
                 depth_material=depth_mat,
                 matte_material=matte_mat, matte_actors=matte_actors,
+                matte_sil_material=matte_sil_mat,
                 objid_material=objid_mat, objid_actors=objid_actors,
                 hidden_actors=hide_actors, fog_off=self.seq_fog_var.get(),
                 on_done=_after_main)
@@ -1086,7 +1199,7 @@ class CaptureWindow(object):
         """選択中アクターをリストへ追加。キーはフルパス名（get_path_name()）で重複無視。
         追加時のラベルも保持する（パスが失効した場合のフォールバック解決用）。"""
         sel = core.get_selected_actors()
-        added = 0
+        added = []
         for a in sel:
             try:
                 path = a.get_path_name()
@@ -1095,9 +1208,12 @@ class CaptureWindow(object):
                 continue
             if path not in p["all"]:
                 p["all"].append(path)
-                added += 1
+                added.append(path)
         self._pick_refresh(p)
-        self.status_var.set("Added %d (list total %d)" % (added, len(p["all"])))
+        self.status_var.set("Added %d (list total %d)" % (len(added), len(p["all"])))
+        cb = p.get("on_added")
+        if cb and added:
+            cb(added)
 
     def _pick_clear(self, p):
         """リスト上で選択（ハイライト）した項目を行インデックスで削除する。"""
@@ -1105,10 +1221,15 @@ class CaptureWindow(object):
         if not idx:
             self.status_var.set("Clear: リスト内で消したい項目を選択してください")
             return
+        removed = []
         for i in idx:
+            removed.append(p["all"][i])
             del p["all"][i]
         self._pick_refresh(p)
         self.status_var.set("Removed %d (list total %d)" % (len(idx), len(p["all"])))
+        cb = p.get("on_removed")
+        if cb and removed:
+            cb(removed)
 
     def _current_camera(self):
         """選択中ラベルのカメラを毎回ライブで取得（キャッシュ参照は PIE 後に無効化するため）。"""
@@ -1329,6 +1450,13 @@ class CaptureWindow(object):
                 p["all"] = [label2path.get(n, n) for n in names]
                 self._pick_refresh(p)
         _restore_picker(self.matte_pick, "matte_names", "matte_labels")
+        # リスト内のマット対象は常にライティング分離、の不変条件を起動時にも適用
+        # （set_matte_unlit は差替え済みスロットをスキップするため冪等）
+        try:
+            if self.matte_pick["all"]:
+                self._matte_paths_neutralize(self._pick_targets_resolved(self.matte_pick))
+        except Exception:
+            pass
         _restore_picker(self.objid_pick, "objid_names", "objid_labels")
         if st.get("depth_bit") in ("8bit PNG", "16bit PNG", "EXR float"):
             self.depth_bit_var.set(st["depth_bit"])

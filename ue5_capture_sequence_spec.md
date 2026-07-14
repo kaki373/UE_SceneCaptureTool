@@ -12,6 +12,64 @@
 > ObjectID 映像パス（ステンシル色分け + JSON マニフェスト）を追加。
 > Z-Depth の Invert は廃止（手前=白 固定）。
 
+> **注記 (2026-07-13)**: Matteの奥の per-frame 合成マスクを Matte（可視性マスク）から
+> **MatteSil（遮蔽非依存の全投影シルエット・専用PPマテリアル `M_UE5Cap_MatteSil` =
+> CustomDepth の valid 項のみ、SceneDepth 比較なし）** に変更。可視性マスクだと
+> マットより手前のオブジェクト（キャラ等）の画素が「マットでない」扱いになり、
+> 合成が Beauty 側を選んで Behind 素材に写り込む（take 012 で実発生・修正済み）。
+> Matte（可視性）は Matteの前（MatteBeauty）専用になり、必要な素材だけ生成される。
+
+> **注記 (2026-07-13 その2)**: 出力解像度のアスペクトがカメラ filmback と異なる場合、
+> アスペクト拘束（`constrain_aspect_ratio=ON`。max2ue インポートカメラは常時ON）により
+> **FinalImage は中央寄せ黒帯・追加PPパスは左詰め書き込み**になり、パス間・ジョブ間で
+> 画がズレる（実測: 2048×858 出力 × filmback 1.778 → Depth が x=1526 から右黒帯、
+> Beauty は 261..1786 の中央寄せ）。対策: シーケンスレンダ中は**全ジョブ**でカメラカット
+> 束縛カメラの拘束を一時解除（`_set_cameras_fill_aspect`、完了時復元）。全素材が指定
+> 解像度へ全面レンダされ整合する。水平画角（focal/filmback 由来）は不変。
+> **Max と完全同一の構図が必要な場合は出力解像度を filmback アスペクトに合わせる**こと。
+
+> **注記 (2026-07-13 その3・コードレビュー起点の全面改善)**:
+> - **静止画キャプチャの意味論を確定**: シーケンサーを開いていれば「その現在フレーム」を
+>   一時シーケンスへの**サブシーケンス埋め込み**で固定評価してレンダ（PIE はエディタの
+>   評価ポーズを引き継がないため。内側 playback start を補正し、範囲外の指定はクランプ+警告）。
+>   埋め込みは **TimeWarp 固定レート 0 + start_frame_offset で時間を完全凍結**する
+>   （テンポラルサンプルはシャッター区間で時間を進めながら蓄積するため、凍結しないと
+>   動いているカメラの平均位置が焼かれ、SceneCapture 系マスクと画がズレる。
+>   実測: 2159 高で 28px。UE5.7 の `MovieSceneSectionParameters.time_scale` は
+>   `MovieSceneTimeWarpVariant` 構造体で、`set_fixed_play_rate(0.0)` を使う）。
+> - **静止画の Matteの前マスクも Beauty と同一 MRQ ジョブの PP パスで撮る**（2026-07-14）。
+>   SceneCapture 別撮りだと **WPO（風）で揺れる前景（木の葉等）のシルエット位相が
+>   Beauty とズレる**（板が前景の木と重なる配置で実測。剛体シフトではなく葉単位の不一致）。
+>   render_beauty(matte_material=, matte_actors=) → マットレンダモード + Matte PP パス +
+>   `file_basename_{render_pass}` 命名 + 完了時リネームで `<basename>_Matte.png` を出力。
+>   時間凍結によりマスク・Beauty とも同一時刻・同一蓄積＝画素整合を構造的に保証。
+> - **マット板のライティング分離**（2026-07-14）: マットレンダモードは cast_shadow に加え
+>   `affect_distance_field_lighting` / `affect_dynamic_indirect_lighting` も一時 OFF
+>   （main pass 非表示でも DF/Lumen には残り、クリーンプレートの AO/GI を板が暗くする）。
+>   さらに Matte targets リストと連動して自動でライティング分離（ボタン無し）：追加した
+>   瞬間に影/AO/GI 寄与 OFF ＋ アンリット材差替え、外すと自動復元（元材はアクタータグに
+>   退避）。パネル起動時もリスト内対象へ冪等に再適用。
+> - **Z-Depth 静止画も「8bit PNG」選択時は同一ジョブの PP パス**（`depth_material` →
+>   `<basename>_Depth.png` → `Depth_NNN.png` へリネーム）。枝・草の風によるたわみまで
+>   Beauty と画素一致（実測 dx=dy=0）。**「16bit PNG」「EXR float」選択時は厳密リニアが
+>   必要なため従来の SceneCapture のまま**（MRQ は 16bit PNG を出せない。風で揺れる
+>   前景は Beauty と位相が合わない可能性あり）。ObjectID 静止画も SceneCapture のまま
+>   （風対象を ObjectID にする場合は同種の位相ズレが原理上あり得る）。
+>   シーケンサー未使用時はエディタの現在配置のまま。**カメラは常にツール指定**（ルートの
+>   カメラカットが優先）。モーションブラー無し。auto-play プレイヤーは静止画・映像とも
+>   レンダ中は一時停止（復元付き）。
+> - **Matte/MatteSil マテリアルはステンシル一致判定に変更**（`MATTE_STENCIL=250` を
+>   マット用に予約、ObjectID のステンシルは 1..249）。CustomDepth の有無だけの判定だと
+>   ObjectID 対象の書き込みがマスクに混入し、Behind で ObjectID 対象が
+>   プレートに置換される。`r.CustomDepth 3` は Matte 系でも設定される。
+> - **cvar は MoviePipelineConsoleVariableSetting の `cvars` 配列で渡す**（エンジンが
+>   レンダ後に自動復元）。旧実装の `start_console_commands` 渡しは復元されず
+>   `r.TextureStreaming 0` / `r.MotionBlurQuality 0` 等がエディタへ恒久リークしていた。
+>   `r.SetNearClipPlane` のみコマンドのため手動復元を維持。
+> - アスペクト拘束の一時解除は**静止画にも適用**し、filmback と出力のミスマッチ時のみ
+>   実施。**既知の限界: スポーナブルカメラの拘束は解除できない**（本パイプラインの
+>   max2ue カメラは possessable のため影響なし）。
+
 本仕様書中の `unreal.*` クラス名 / プロパティ名は、特記なき限り UE 5.7 のエンジンソース
 (`D:/Unreal/UE_5.7/Engine/Plugins/MovieScene/MovieRenderPipeline/` ほか) で実在を確認済み。
 未確認の項目は【要検証】と明記する。
