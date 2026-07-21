@@ -43,7 +43,12 @@ _SEQ_OUTPUTS = [
     ("mfront", "Matteの前（Beauty+Matte）", "MatteBeauty"),
     ("behind", "Matteの奥", "Behind"),
     ("objid", "ObjectID", "ObjectID"),
+    ("rlfull", "Raw Lighting Full(Sun+GI+Sky)", "RawLightingFull"),
+    ("rldir", "Raw Lighting Direct", "RawLightingDirect"),
 ]
+
+# 画像タブの出力形式 → 拡張子（Beauty/Raw Lighting 系で共用）
+_FMT_EXT = {"png": ".png", "jpg": ".jpg", "exr": ".exr"}
 
 # MP4 レートプリセット（H.264 の CRF。小さいほど高品質・大容量）
 _MP4_RATE_PRESETS = {
@@ -247,6 +252,22 @@ class CaptureWindow(object):
         ttk.Checkbutton(mrqf2, text="Fogなし", variable=self.fog_off_var).pack(
             side="left", padx=(8, 0))
         mrqf2.grid(row=row, column=0, columnspan=3, sticky="w", padx=24)
+        row += 1
+
+        # Raw Lighting（MRQ LightingOnly パス = アルベド無視のライティングのみ素材）
+        self.rlfull_var = tk.BooleanVar(master=self.root, value=False)
+        ttk.Checkbutton(frm, text="Raw Lighting Full(Sun+GI+Sky)",
+                        variable=self.rlfull_var).grid(
+            row=row, column=0, columnspan=3, sticky="w", padx=8)
+        row += 1
+        self.rldir_var = tk.BooleanVar(master=self.root, value=False)
+        ttk.Checkbutton(frm, text="Raw Lighting Direct",
+                        variable=self.rldir_var).grid(
+            row=row, column=0, columnspan=3, sticky="w", padx=8)
+        row += 1
+        ttk.Label(frm, text="  （ライティングのみ素材＝落ち影+シェーディング。Direct は"
+                            " GI/スカイライト/AO なしの直射のみ＝追加レンダ1回）",
+                  foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", padx=8)
         row += 1
 
         # Z-Depth（手前=白/奥=黒 固定）
@@ -603,6 +624,8 @@ class CaptureWindow(object):
         matte_path = None
         want_mfront = self.mfront_var.get()
         want_behind = self.behind_var.get()
+        want_rlfull = self.rlfull_var.get()
+        want_rldir = self.rldir_var.get()
         skip_notes = []
         matte_mat_still = None
         if want_mfront:
@@ -639,8 +662,7 @@ class CaptureWindow(object):
         # Beauty の出力形式（実際に出せるものだけを提示している）
         img_fmt = {"PNG 8bit": "png", "JPG 8bit": "jpg",
                    "EXR 16bit (float)": "exr"}.get(self.beauty_fmt_var.get(), "png")
-        beauty_path = os.path.join(out, _name("Beauty") +
-                                   {"png": ".png", "jpg": ".jpg", "exr": ".exr"}[img_fmt])
+        beauty_path = os.path.join(out, _name("Beauty") + _FMT_EXT[img_fmt])
         # Matte 系合成は PIL で読める画像が必要。EXR のときは PNG も内部出力して使う
         # （Depth PP パスの PNG 出力にも必要）。
         need_comp = want_mfront or want_behind
@@ -648,10 +670,11 @@ class CaptureWindow(object):
         comp_beauty = (os.path.join(out, _name("Beauty") + ".png")
                        if img_fmt == "exr" else beauty_path)
 
-        # Beauty（MRQ）は Beauty 指定時・Matte 系合成・同一ジョブ深度が要るときにレンダする
+        # Beauty（MRQ）は Beauty 指定時・Matte 系合成・同一ジョブ深度・Raw Lighting Full
+        # が要るときにレンダする（Raw Lighting Direct はメイン無しでも専用ジョブで出せる）
         beauty_needed = (self.beauty_var.get() or want_mfront or want_behind
-                         or depth_pp_mat is not None)
-        if not beauty_needed:
+                         or depth_pp_mat is not None or want_rlfull)
+        if not beauty_needed and not want_rldir:
             _restore_fb()
             self.status_var.set("完了（データパスのみ出力）" if (s.do_depth or s.do_object_id)
                                 else "出力が選ばれていません")
@@ -681,6 +704,11 @@ class CaptureWindow(object):
                                  near_clip=nc, composite=True, matte=mt))
             else:
                 self.status_var.set("Matteの奥: Matte 対象が見つかりません")
+        if want_rldir:
+            # 直射のみは ShowFlag がジョブ全体（Beauty パス）を汚すため専用ジョブ。
+            # Matte 対象の非表示はメインの Beauty と同条件に揃える。
+            jobs.append(dict(base=_name("RawLightingDirect"), fmt=img_fmt,
+                             hidden=beauty_hidden, raw_light=True))
 
         def _finalize():
             # 内部素材の後始末: 生 Matte マスクと EXR 用の内部 PNG は削除。
@@ -711,6 +739,22 @@ class CaptureWindow(object):
             j = jobs.pop(0)
 
             def _jdone(ok, od, _j=j):
+                # Raw Lighting Direct ジョブ: LightingOnly を最終名へ
+                # （<base>_LightingOnly.* → <base>.*。os.replace は既存を上書き）
+                if _j.get("raw_light"):
+                    if not ok:
+                        skip_notes.append("Raw Lighting Direct: レンダ失敗")
+                    else:
+                        ext = _FMT_EXT[_j.get("fmt", "png")]
+                        lp = os.path.join(out, _j["base"] + "_LightingOnly" + ext)
+                        try:
+                            if os.path.isfile(lp):
+                                os.replace(lp, os.path.join(out, _j["base"] + ext))
+                            else:
+                                skip_notes.append("Raw Lighting Direct: 出力が見つかりません")
+                        except Exception as e:
+                            skip_notes.append("Raw Lighting Direct: 後処理エラー")
+                            self.status_var.set("Raw Lighting Direct 後処理エラー: %s" % e)
                 # behind ジョブはマットシルエットで通常 Beauty と合成し behindmatte.png を作る
                 if ok and _j.get("composite"):
                     try:
@@ -733,15 +777,19 @@ class CaptureWindow(object):
             self.status_var.set("追加 MRQ レンダ中… (%s)" % j["base"])
             self.root.update()
             try:
-                capture_mrq.render_beauty(cam, out, W, H, image_format="png",
+                capture_mrq.render_beauty(cam, out, W, H,
+                                          image_format=j.get("fmt", "png"),
                                           temporal_samples=ts, warmup=warm,
                                           file_basename=j["base"],
-                                          hidden_actors=j["hidden"],
+                                          hidden_actors=j.get("hidden"),
                                           near_clip_cm=j.get("near_clip"),
+                                          light_pass=j.get("raw_light", False),
+                                          light_direct=j.get("raw_light", False),
                                           fog_off=self.fog_off_var.get(),
                                           scene_sequence=scene_seq,
                                           scene_frame=scene_frame, on_done=_jdone)
             except Exception as e:
+                _restore_fb()   # 起動失敗で overscan filmback を残さない
                 self.status_var.set("追加 MRQ 失敗: %s" % e)
 
         def _after_beauty(ok, od):
@@ -768,6 +816,19 @@ class CaptureWindow(object):
                             os.replace(dp, os.path.join(out, _name("Depth") + ".png"))
                         else:
                             skip_notes.append("Z-Depth: PP パス出力が見つかりません")
+                    if want_rlfull:
+                        # LightingOnly パスを最終名へ（<base>_LightingOnly.* → RawLightingFull）
+                        ext = _FMT_EXT[img_fmt]
+                        lp = os.path.join(out, _name("Beauty") + "_LightingOnly" + ext)
+                        if os.path.isfile(lp):
+                            os.replace(lp, os.path.join(
+                                out, _name("RawLightingFull") + ext))
+                            # EXR + 内部 PNG 併用時は LightingOnly の PNG 片割れも出る
+                            twin = os.path.join(out, _name("Beauty") + "_LightingOnly.png")
+                            if ext != ".png" and os.path.isfile(twin):
+                                os.remove(twin)
+                        else:
+                            skip_notes.append("Raw Lighting Full: 出力が見つかりません")
                 except Exception as e:
                     _restore_fb()
                     self.status_var.set("Beautyブレンドでエラー: %s" % e)
@@ -777,11 +838,17 @@ class CaptureWindow(object):
             _restore_fb()
             self.status_var.set("MRQ 失敗: " + od)
 
+        if not beauty_needed:
+            # Raw Lighting Direct のみ: メインジョブ無しで専用ジョブだけ回す
+            _run_jobs()
+            return
+
         self.status_var.set("MRQ Beauty レンダ中… (PIEに入ります / 完了まで待機)")
         self.root.update()
         try:
             capture_mrq.render_beauty(cam, out, W, H, image_format=img_fmt,
                                       also_png=aux_png,
+                                      light_pass=want_rlfull,
                                       temporal_samples=ts, warmup=warm,
                                       file_basename=_name("Beauty"),
                                       hidden_actors=(None if matte_mat_still is not None
@@ -903,6 +970,12 @@ class CaptureWindow(object):
         matte_needed = _need("mfront") or _need("behind")
         depth_needed = _need("depth")
         objid_needed = _need("objid")
+        rlfull_needed = _need("rlfull")
+        rldir_needed = _need("rldir")
+        # Direct だけならメインジョブ自体を直射レンダにする（全編2回レンダの回避）
+        only_direct = rldir_needed and not (
+            _need("beauty") or depth_needed or matte_needed or objid_needed
+            or rlfull_needed)
 
         matte_actors = None
         if matte_needed or self.seq_matte_hide_var.get():
@@ -966,12 +1039,17 @@ class CaptureWindow(object):
             if objid_mat is not None:
                 core.delete_temp_objid_material()
 
+        seq_notes = []
+
         def _final(ok, od):
             _cleanup_materials()
-            self.status_var.set(("シーケンスレンダ完了: %s" % od) if ok
-                                else "シーケンスレンダ失敗 (Output Log 参照)")
+            msg = (("シーケンスレンダ完了: %s" % od) if ok
+                   else "シーケンスレンダ失敗 (Output Log 参照)")
+            if seq_notes:
+                msg += "（%s）" % " / ".join(seq_notes)
+            self.status_var.set(msg)
 
-        pass_files_main = ["Beauty"]
+        pass_files_main = [] if only_direct else ["Beauty"]
         if depth_needed:
             pass_files_main.append("Depth")
         if matte_mat is not None:
@@ -980,6 +1058,10 @@ class CaptureWindow(object):
             pass_files_main.append("MatteSil")
         if objid_needed:
             pass_files_main.append("ObjectID")
+        if rlfull_needed:
+            pass_files_main.append("RawLightingFull")
+        if only_direct:
+            pass_files_main.append("RawLightingDirect")
 
         def _finish_outputs(ok, od):
             """トリム → 合成 → マニフェスト → MP4 エンコード → 不要 PNG 削除。"""
@@ -990,6 +1072,8 @@ class CaptureWindow(object):
                 trim_list = list(pass_files_main)
                 if _need("behind"):
                     trim_list.append("BehindPlate")
+                if rldir_needed and not only_direct:
+                    trim_list.append("RawLightingDirect")
                 core.trim_sequence_frames(out, name_body, take_str,
                                           trim_list, cs_eff, ce_eff)
                 if _need("mfront"):
@@ -1026,6 +1110,8 @@ class CaptureWindow(object):
                     drop.append("Matte")
                 if matte_sil_mat is not None:
                     drop.append("MatteSil")
+                if rldir_needed:
+                    drop.append("DirectPlate")       # 直射ジョブの Beauty（内部素材）
                 for key, _label, pass_name in _SEQ_OUTPUTS:
                     if not wants[key][0]:
                         drop.append(pass_name)
@@ -1042,9 +1128,43 @@ class CaptureWindow(object):
             else:
                 _after_encode(True)
 
+        def _run_direct(ok, od):
+            """Raw Lighting Direct の専用ジョブ（GI/Sky/AO を切った直射のみ）。
+            only_direct のときはメインジョブが直射レンダ済みなのでスキップ。
+            このジョブの失敗ではレンダ済みのメイン素材の後処理を放棄しない
+            （rldir を無効化して完走し、完了メッセージに注記する）。"""
+            if not (ok and rldir_needed and not only_direct):
+                _finish_outputs(ok, od)
+                return
+
+            def _direct_done(dok, dod):
+                if not dok:
+                    wants["rldir"] = (False, False)
+                    seq_notes.append("Raw Lighting Direct: レンダ失敗")
+                _finish_outputs(True, od)
+
+            self.status_var.set("Raw Lighting Direct をレンダ中… (GI/Sky/AO off)")
+            self.root.update()
+            try:
+                capture_mrq.render_sequence(
+                    seq, out, W, H, name_body, take_str,
+                    do_png=True, do_mp4=False,
+                    temporal_samples=ts, warmup=warm,
+                    custom_start=cs, custom_end=ce,
+                    hidden_actors=matte_actors,
+                    light_pass=True, light_direct=True,
+                    light_label="RawLightingDirect",
+                    beauty_label="DirectPlate",
+                    fog_off=self.seq_fog_var.get(), on_done=_direct_done)
+            except Exception as e:
+                wants["rldir"] = (False, False)
+                seq_notes.append("Raw Lighting Direct: 起動失敗")
+                self.status_var.set("Raw Lighting Direct 起動失敗: %s" % e)
+                _finish_outputs(True, od)
+
         def _after_main(ok, od):
             if not (ok and _need("behind")):
-                _finish_outputs(ok, od)
+                _run_direct(ok, od)
                 return
             # Matteの奥: 開始フレームのカメラ→マット距離で near-clip した2本目ジョブ
             try:
@@ -1067,7 +1187,7 @@ class CaptureWindow(object):
                     custom_start=cs, custom_end=ce,
                     hidden_actors=matte_actors, near_clip_cm=nc,
                     beauty_label="BehindPlate",
-                    fog_off=self.seq_fog_var.get(), on_done=_finish_outputs)
+                    fog_off=self.seq_fog_var.get(), on_done=_run_direct)
             except Exception as e:
                 self.status_var.set("Matteの奥プレート起動失敗: %s" % e)
                 _final(False, od)
@@ -1086,6 +1206,11 @@ class CaptureWindow(object):
                 matte_sil_material=matte_sil_mat,
                 objid_material=objid_mat, objid_actors=objid_actors,
                 hidden_actors=hide_actors, fog_off=self.seq_fog_var.get(),
+                light_pass=(rlfull_needed or only_direct),
+                light_direct=only_direct,
+                light_label=("RawLightingDirect" if only_direct
+                             else "RawLightingFull"),
+                beauty_label=("DirectPlate" if only_direct else "Beauty"),
                 on_done=_after_main)
         except Exception as e:
             _cleanup_materials()
@@ -1366,6 +1491,8 @@ class CaptureWindow(object):
                 "mfront": self.mfront_var.get(),
                 "behind": self.behind_var.get(),
                 "objid": self.objid_var.get(),
+                "rlfull": self.rlfull_var.get(),
+                "rldir": self.rldir_var.get(),
                 "matte_names": self._pick_targets(self.matte_pick),
                 "objid_names": self._pick_targets(self.objid_pick),
                 "matte_labels": self.matte_pick.get("labels", {}),
@@ -1436,6 +1563,8 @@ class CaptureWindow(object):
         _setvar(self.mfront_var, "mfront")
         _setvar(self.behind_var, "behind")
         _setvar(self.objid_var, "objid")
+        _setvar(self.rlfull_var, "rlfull")
+        _setvar(self.rldir_var, "rldir")
 
         def _restore_picker(p, names_key, labels_key):
             names = st.get(names_key)

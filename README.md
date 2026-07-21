@@ -20,11 +20,12 @@ PNG / EXR で書き出す。映像タブは Sequencer で開いている LevelSe
 - **Matteの前（Beauty+Matte）**: クリーンな Beauty にオクルージョン考慮のマットをアルファとして焼いた RGBA(MatteBeauty)。生の白黒マットは内部素材（自動削除）。
 - **Matteの奥**: マットオブジェクトの**手前を除去して奥だけを描画**（MRQ Beauty 品質）。near-clip で手前を実除去し、マットのシルエット形状でマスク合成して出力。
 - **ObjectID**: 対象アクターを色分け（他は黒）した 1 枚 + 色 -> 名前の対応 JSON。
+- **Raw Lighting Full(Sun+GI+Sky)** / **Raw Lighting Direct**（画像タブ）: MRQ の LightingOnly パスによる「アルベド無視のライティングのみ」素材（落ち影 + シェーディング）。Full は太陽 + GI + スカイライト込み（Beauty と同一ジョブ）、Direct は GI / スカイライト / AO を ShowFlag で切った直射のみ（影は完全な黒。専用ジョブを 1 本追加）。出力形式は Beauty と同じ選択に従う。
 - **Overscan**: 元フレームを中央に保ったまま周囲に余白を追加。`%`（一律）/ `px`（X,Y 別）。カメラ filmback を一時拡大して実現。
 - **クリーンプレート**: Matte ON のとき Beauty と Z-Depth からマット対象を自動除外（隠せば影/AO も自動で消える）。
 - **解像度**: Use Camera Setting（アスペクト表示）/ Override（アスペクト維持トグルで幅⇄高さ自動）。出力名は `[任意名]_[カメラ名]_素材名_NNN`。
 - **anti-aliasing**: Spatial Supersample (1x / 2x / 4x)。Beauty は MRQ の TSR/Temporal。
-- **シーケンスレンダ（映像タブ）**: Sequencer で開いている LevelSequence をカメラカットに従って MRQ レンダ。**5素材（Beauty / Z-Depth / Beauty+Matte(Matteの前) / Matteの奥 / ObjectID）それぞれに PNG 連番と H.264 MP4 を個別指定**できる。MRQ は PNG 連番（マスター）を出力し、MP4 は **ffmpeg でシーケンスの Display Rate どおりに**エンコード（CRF プリセット 17/20/24/28 + 数値直接入力・音声なし・余剰フレームは自動トリム）。Matte 系の対象は画像タブの Matte targets、ObjectID は Object ID targets を共用（色↔名前の JSON マニフェスト付き。レンダ中のみ r.CustomDepth=3 に切替えて復元）。フレーム範囲はシーケンス設定または指定。テイク毎サブフォルダ出力のトグルあり。「画像キャプチャの設定を転送」ボタンで画像タブの解像度 / 出力先 / 品質 / Depth 設定を一括コピー。
+- **シーケンスレンダ（映像タブ）**: Sequencer で開いている LevelSequence をカメラカットに従って MRQ レンダ。**7素材（Beauty / Z-Depth / Beauty+Matte(Matteの前) / Matteの奥 / ObjectID / Raw Lighting Full(Sun+GI+Sky) / Raw Lighting Direct）それぞれに PNG 連番と H.264 MP4 を個別指定**できる（Raw Lighting Direct は GI/スカイライト/AO を切った直射のみの専用ジョブ。Direct 以外と併用時は2本目ジョブとして自動チェーン）。MRQ は PNG 連番（マスター）を出力し、MP4 は **ffmpeg でシーケンスの Display Rate どおりに**エンコード（CRF プリセット 17/20/24/28 + 数値直接入力・音声なし・余剰フレームは自動トリム）。Matte 系の対象は画像タブの Matte targets、ObjectID は Object ID targets を共用（色↔名前の JSON マニフェスト付き。レンダ中のみ r.CustomDepth=3 に切替えて復元）。フレーム範囲はシーケンス設定または指定。テイク毎サブフォルダ出力のトグルあり。「画像キャプチャの設定を転送」ボタンで画像タブの解像度 / 出力先 / 品質 / Depth 設定を一括コピー。
 - **設定の保持**: 両タブの入力は `Saved/UE5Capture_ui_settings.json` に保存され、次回起動時に復元される。
 - GUI (tkinter) は UE の Slate tick に非ブロッキング統合。tkinter が無い環境は CONFIG ベースの CUI に自動フォールバック。
 

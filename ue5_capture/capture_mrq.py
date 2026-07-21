@@ -144,6 +144,23 @@ _HQ_CVARS = [
 ]
 
 
+# Raw Lighting Direct 用: GI/スカイライト/AO を切って直接光のみにする ShowFlag cvar
+# （cvar なのでレンダ後にエンジンが自動復元。静止画/シーケンスの両ジョブで共用）
+_DIRECT_ONLY_CVARS = [
+    ("ShowFlag.GlobalIllumination", 0),
+    ("ShowFlag.SkyLighting", 0),
+    ("ShowFlag.AmbientOcclusion", 0),
+]
+
+
+def _lighting_only_class():
+    cls = getattr(unreal, "MoviePipelineDeferredPass_LightingOnly", None)
+    if cls is None:
+        raise RuntimeError("この UE には LightingOnly パス "
+                           "(MoviePipelineDeferredPass_LightingOnly) がありません。")
+    return cls
+
+
 def _cv_entries(pairs):
     """(name, value) の並びを MoviePipelineConsoleVariableEntry 配列にする。"""
     out = []
@@ -196,8 +213,13 @@ def render_beauty(camera_actor, output_dir, width, height,
                   warmup=32, file_basename="beauty", hidden_actors=None, on_done=None,
                   near_clip_cm=None, overscan=0.0, fog_off=False,
                   scene_sequence=None, scene_frame=None,
-                  matte_material=None, matte_actors=None, depth_material=None):
+                  matte_material=None, matte_actors=None, depth_material=None,
+                  light_pass=False, light_direct=False):
     """対象カメラを MRQ で Beauty レンダリング（非同期）。executor を返す。
+    light_pass=True で LightingOnly レンダパス（アルベド無視のライティングのみ＝
+    落ち影+シェーディング）を同一ジョブに追加する（出力: file_basename_LightingOnly.*）。
+    light_direct=True はこのジョブ全体の GI/スカイライト/AO を ShowFlag cvar で切り、
+    LightingOnly を直射のみにする（Beauty パスも直射のみになるため専用ジョブで使う）。
     hidden_actors を渡すと、そのアクターを非表示にしてレンダ（Beauty 品質のクリーンプレート）。
     near_clip_cm を渡すと、その距離(cm)より手前を描画時クリップする（fronto-parallel 近似の behind-matte）。
     scene_sequence / scene_frame を渡すと、シーンをそのシーケンスの指定フレームの
@@ -257,7 +279,8 @@ def render_beauty(camera_actor, output_dir, width, height,
                              spatial_samples, temporal_samples, warmup,
                              file_basename, on_done, near_clip_cm, overscan,
                              fog_off, _restore_scene, scene_sequence, scene_frame,
-                             matte_material, depth_material)
+                             matte_material, depth_material,
+                             light_pass, light_direct)
     except Exception:
         # 起動に失敗したら状態を巻き戻す（次回レンダを塞がない）
         _restore_scene()
@@ -271,7 +294,8 @@ def _start_render(sub, camera_actor, output_dir, width, height,
                   spatial_samples, temporal_samples, warmup,
                   file_basename, on_done, near_clip_cm, overscan,
                   fog_off, restore_scene, scene_sequence=None, scene_frame=None,
-                  matte_material=None, depth_material=None):
+                  matte_material=None, depth_material=None,
+                  light_pass=False, light_direct=False):
     seq, seq_path = _create_temp_sequence(camera_actor,
                                           scene_sequence=scene_sequence,
                                           scene_frame=scene_frame)
@@ -285,7 +309,6 @@ def _start_render(sub, camera_actor, output_dir, width, height,
     job.sequence = unreal.SoftObjectPath(seq_path)
 
     cfg = job.get_configuration()
-    deferred = cfg.find_or_add_setting_by_class(unreal.MoviePipelineDeferredPassBase)
     extra_passes = []
     for pass_name, pass_mat in (("Matte", matte_material), ("Depth", depth_material)):
         if pass_mat is None:
@@ -295,13 +318,25 @@ def _start_render(sub, camera_actor, output_dir, width, height,
         ppp.set_editor_property("name", pass_name)
         ppp.set_editor_property("material", pass_mat)
         extra_passes.append(ppp)
-    if extra_passes:
-        deferred.set_editor_property("additional_post_process_materials", extra_passes)
+    # 直射専用ジョブ（light_direct）は Beauty(FinalImage) パスを持たない＝捨てる
+    # だけの出力にレンダ時間を払わない。追加 PP 材は DeferredPassBase が搬送役
+    # なので、あるときはパスを残す。
+    if extra_passes or not light_direct:
+        deferred = cfg.find_or_add_setting_by_class(unreal.MoviePipelineDeferredPassBase)
+        if extra_passes:
+            deferred.set_editor_property("additional_post_process_materials", extra_passes)
+    if light_pass:
+        # LightingOnly は独立したレンダパス（追加 PP 材とは別系統）。
+        # 出力は <basename>_LightingOnly.* になる（{render_pass} 命名が必須になる）。
+        cfg.find_or_add_setting_by_class(_lighting_only_class())
     # image_format: "png"（既定）/ "jpg" / "exr"。exr のとき also_png=True で
     # PNG も同時出力する（Matte 系合成が PIL で読める画像を必要とするため）。
     fmt = (image_format or ("exr" if use_exr else "png")).lower()
     if fmt == "exr":
-        cfg.find_or_add_setting_by_class(unreal.MoviePipelineImageSequenceOutput_EXR)
+        exr_out = cfg.find_or_add_setting_by_class(unreal.MoviePipelineImageSequenceOutput_EXR)
+        if light_pass:
+            # マルチレイヤ EXR だと LightingOnly が別ファイルにならないため分割する
+            exr_out.set_editor_property("multilayer", False)
         if also_png:
             png_fmt = cfg.find_or_add_setting_by_class(unreal.MoviePipelineImageSequenceOutput_PNG)
             try:
@@ -323,7 +358,7 @@ def _start_render(sub, camera_actor, output_dir, width, height,
     out = cfg.find_or_add_setting_by_class(unreal.MoviePipelineOutputSetting)
     out.set_editor_property("output_directory", unreal.DirectoryPath(output_dir))
     out.set_editor_property("output_resolution", unreal.IntPoint(int(width), int(height)))
-    if extra_passes:
+    if extra_passes or light_pass:
         # 追加パスがあるときは {render_pass} が必須（完了時にリネームで整える）
         out.set_editor_property("file_name_format", file_basename + "_{render_pass}")
     else:
@@ -375,6 +410,10 @@ def _start_render(sub, camera_actor, output_dir, width, height,
     if fog_off:
         pairs += [("r.Fog", 0), ("r.VolumetricFog", 0)]
         _log("fog off")
+    if light_direct:
+        # 直射のみ: LightingOnly が「直接光の落ち影+シェーディングのみ・影は完全な黒」になる。
+        pairs += list(_DIRECT_ONLY_CVARS)
+        _log("direct lighting only (GI/Sky/AO off)")
     cv = cfg.find_or_add_setting_by_class(unreal.MoviePipelineConsoleVariableSetting)
     cv.set_editor_property("cvars", _cv_entries(pairs))   # レンダ後にエンジンが自動復元
     cmds = []
@@ -391,7 +430,7 @@ def _start_render(sub, camera_actor, output_dir, width, height,
         _log("MRQ レンダ完了 success=%s -> %s" % (success, output_dir))
         _delete_temp_sequence()
         restore_scene()                 # 非表示 / matte / auto-play / アスペクトを戻す
-        if extra_passes:
+        if extra_passes or light_pass:
             # <base>_FinalImage<Name>.* → <base>_<Name>.* / <base>_FinalImage.* → <base>.*
             try:
                 for f in os.listdir(output_dir):
@@ -589,7 +628,9 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
                     matte_sil_material=None,
                     objid_material=None, objid_actors=None,
                     hidden_actors=None, near_clip_cm=None, beauty_label="Beauty",
-                    fog_off=False, on_done=None):
+                    fog_off=False, on_done=None,
+                    light_pass=False, light_direct=False,
+                    light_label="RawLightingFull"):
     """開いている/指定の LevelSequence を MRQ でレンダリング（非同期）。
     一時シーケンスは作らず job.sequence に直接指定し、カメラはシーケンスの
     カメラカットトラックに従う。fps はシーケンスの Display Rate。
@@ -605,7 +646,11 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
     出力名: name_body_{render_pass}_take.{frame_number} 。レンダパス名は完了時に
     FinalImage→beauty_label（既定 Beauty）/ FinalImageDepth→Depth /
     FinalImageMatte→Matte にリネーム。beauty_label は behind プレートの2本目ジョブが
-    メインの Beauty と衝突しないための上書き用（例 "BehindPlate"）。"""
+    メインの Beauty と衝突しないための上書き用（例 "BehindPlate"）。
+    light_pass=True で LightingOnly レンダパス（ライティングのみ素材）を追加し、
+    完了時に _LightingOnly → _light_label にリネーム。light_direct=True はジョブ全体の
+    GI/スカイライト/AO を ShowFlag cvar で切る（直射のみ。Beauty パスも汚れるため
+    beauty_label を内部名にして専用ジョブで使う）。"""
     output_dir = os.path.normpath(output_dir)
     if not os.path.isdir(output_dir):
         os.makedirs(output_dir)
@@ -671,7 +716,8 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
                                       depth_material, matte_material, matte_sil_material,
                                       objid_material,
                                       near_clip_cm, beauty_label, fog_off,
-                                      _restore_scene, on_done)
+                                      _restore_scene, on_done,
+                                      light_pass, light_direct, light_label)
     except Exception:
         _restore_scene()
         _KEEP.clear()      # 起動失敗時に次回レンダを塞がない
@@ -683,7 +729,9 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
                            temporal_samples, warmup, custom_start, custom_end,
                            depth_material, matte_material, matte_sil_material,
                            objid_material,
-                           near_clip_cm, beauty_label, fog_off, restore_scene, on_done):
+                           near_clip_cm, beauty_label, fog_off, restore_scene, on_done,
+                           light_pass=False, light_direct=False,
+                           light_label="RawLightingFull"):
     queue = sub.get_queue()
     for j in list(queue.get_jobs()):
         queue.delete_job(j)
@@ -693,7 +741,6 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
     job.sequence = unreal.SoftObjectPath(level_sequence.get_path_name())
 
     cfg = job.get_configuration()
-    deferred = cfg.find_or_add_setting_by_class(unreal.MoviePipelineDeferredPassBase)
     extra_passes = []
     for pass_name, pass_mat in (("Depth", depth_material), ("Matte", matte_material),
                                 ("MatteSil", matte_sil_material),
@@ -705,8 +752,16 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
         ppp.set_editor_property("name", pass_name)
         ppp.set_editor_property("material", pass_mat)
         extra_passes.append(ppp)
-    if extra_passes:
-        deferred.set_editor_property("additional_post_process_materials", extra_passes)
+    # 直射専用ジョブは Beauty(FinalImage) パスを持たない（全フレーム分の捨て出力を
+    # レンダしない）。追加 PP 材があるときは搬送役の DeferredPassBase を残す。
+    if extra_passes or not light_direct:
+        deferred = cfg.find_or_add_setting_by_class(unreal.MoviePipelineDeferredPassBase)
+        if extra_passes:
+            deferred.set_editor_property("additional_post_process_materials", extra_passes)
+    if light_pass:
+        # LightingOnly は独立したレンダパス（出力 <name>_LightingOnly_take.####、
+        # 完了時に _light_label へリネーム）
+        cfg.find_or_add_setting_by_class(_lighting_only_class())
 
     if do_png:
         png = cfg.find_or_add_setting_by_class(unreal.MoviePipelineImageSequenceOutput_PNG)
@@ -778,6 +833,9 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
     if fog_off:
         pairs += [("r.Fog", 0), ("r.VolumetricFog", 0)]
         _log("fog off")
+    if light_direct:
+        pairs += list(_DIRECT_ONLY_CVARS)
+        _log("direct lighting only (GI/Sky/AO off)")
     cv = cfg.find_or_add_setting_by_class(unreal.MoviePipelineConsoleVariableSetting)
     cv.set_editor_property("cvars", _cv_entries(pairs))   # レンダ後にエンジンが自動復元
     cmds = []
@@ -799,7 +857,8 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
                     _editor_world(), "r.SetNearClipPlane 10")
             except Exception:
                 pass
-        _rename_final_image(output_dir, beauty_label)   # FinalImage -> Beauty ほか
+        _rename_final_image(output_dir, beauty_label,
+                            light_label if light_pass else None)   # FinalImage -> Beauty ほか
         _KEEP.clear()
         if on_done:
             try:
@@ -818,19 +877,23 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
     return executor
 
 
-def _rename_final_image(output_dir, beauty_label="Beauty"):
+def _rename_final_image(output_dir, beauty_label="Beauty", light_label=None):
     """MRQ のレンダパス名をツールの素材名に揃える。
     追加 PP パスの識別子は "FinalImage"+Name（例 FinalImageDepth）なので、
-    長い方を先に置換してから素の FinalImage を beauty_label にする。"""
+    長い方を先に置換してから素の FinalImage を beauty_label にする。
+    light_label を渡すと LightingOnly レンダパスも _light_label にリネームする。"""
     try:
         for f in os.listdir(output_dir):
-            if "_FinalImage" not in f:
+            if "_FinalImage" not in f and (light_label is None
+                                           or "_LightingOnly" not in f):
                 continue
             nf = f
             # MatteSil は Matte より先（長い識別子から置換しないと _MatteSil が壊れる）
             for pass_name in ("Depth", "MatteSil", "Matte", "ObjectID"):
                 nf = nf.replace("_FinalImage" + pass_name, "_" + pass_name)
             nf = nf.replace("_FinalImage", "_" + beauty_label)
+            if light_label:
+                nf = nf.replace("_LightingOnly", "_" + light_label)
             try:
                 os.replace(os.path.join(output_dir, f), os.path.join(output_dir, nf))
             except Exception as e:
