@@ -1315,10 +1315,16 @@ def volumetrics_nearer_than(dist_cm, cam):
                 continue
         except Exception:
             continue
-        loc = a.get_actor_location()
-        d = ((loc.x - cam_loc.x) * fwd.x + (loc.y - cam_loc.y) * fwd.y
-             + (loc.z - cam_loc.z) * fwd.z)
-        if d < float(dist_cm):
+        # 中心でなくバウンズの最近点で判定する: クリップ面を跨ぐ大きな雲
+        # （中心は奥・手前に張り出し）がゴーストとして残るのを防ぐ
+        try:
+            origin, ext = a.get_actor_bounds(False)
+        except Exception:
+            origin, ext = a.get_actor_location(), unreal.Vector(0, 0, 0)
+        d = ((origin.x - cam_loc.x) * fwd.x + (origin.y - cam_loc.y) * fwd.y
+             + (origin.z - cam_loc.z) * fwd.z)
+        d_near = d - (abs(ext.x * fwd.x) + abs(ext.y * fwd.y) + abs(ext.z * fwd.z))
+        if d_near < float(dist_cm):
             out.append(a)
     return out
 
@@ -1454,20 +1460,27 @@ def _read_linear_gray(path, ffmpeg):
             _warn("バッキング: EXR 変換失敗 %s: %s" % (path, r.stderr.decode(errors="replace")[-200:]))
             return None
         p = tmp
-    im = _PILImage.open(p)
-    a = _np.asarray(im).astype(_np.float32)
-    if im.mode in ("I;16", "I"):
-        a = a / 65535.0
-    elif im.mode != "F":
-        a = a / 255.0
-    if a.ndim == 3:
-        a = a.mean(axis=-1)
-    if tmp:
-        try:
-            os.remove(tmp)
-        except Exception:
-            pass
-    return a
+    try:
+        im = _PILImage.open(p)
+        a = _np.asarray(im).astype(_np.float32)
+        if im.mode in ("I;16", "I"):
+            a = a / 65535.0
+        elif im.mode != "F":
+            a = a / 255.0
+        if a.ndim == 3:
+            a = a.mean(axis=-1)
+        return a
+    except Exception as e:
+        # 例外を呼び出し側の連番ループへ漏らさない（1フレームの破損で
+        # 後続フレーム処理と EXR 掃除が丸ごと飛ぶのを防ぐ）
+        _warn("バッキング: 画像読み込み失敗 %s: %s" % (p, e))
+        return None
+    finally:
+        if tmp:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
 
 
 def _backing_t_from_array(w, scale=None):
@@ -1519,11 +1532,14 @@ def backing_t_sequence(output_dir, name_body, take_str, start, end, ffmpeg):
             continue
         wp = os.path.join(output_dir, frames[fr])
         op = os.path.join(output_dir, "%s_BackingT_%s.%s.png" % (name_body, take_str, fr))
-        r, scale = backing_t_png(wp, op, ffmpeg=ffmpeg, scale=scale)
+        r, sc = backing_t_png(wp, op, ffmpeg=ffmpeg, scale=scale)
         if r:
             n += 1
+            if scale is None:
+                scale = sc      # 失敗フレームで固定スケールを潰さない（チラつき防止）
+    prefix = "%s_BackingW_%s." % (name_body, take_str)
     for f in os.listdir(output_dir):
-        if "_BackingW_" in f and f.endswith(".exr") and f.startswith(name_body):
+        if f.startswith(prefix) and f.endswith(".exr"):
             try:
                 os.remove(os.path.join(output_dir, f))
             except Exception:
@@ -1592,14 +1608,19 @@ def merge_cloud_objid(objid_png, manifest_path, cloud_entries, threshold=0.5):
         vis = ca >= float(threshold)
         if not bool(vis.any()):
             continue
-        hue = (idx * 0.6180339887498949) % 1.0
-        sat = 0.75 + 0.20 * ((idx // 6) % 2)
-        val = 1.0 - 0.20 * ((idx // 3) % 2)
-        idx += 1
-        r, g, b = colorsys.hsv_to_rgb(hue, sat, val)
-        col = _np.array([r, g, b], dtype=_np.float32) * 255.0
+        # 既存マニフェスト（メッシュ側パレット）と偶然同色になったらずらす
+        for _ in range(64):
+            hue = (idx * 0.6180339887498949) % 1.0
+            sat = 0.75 + 0.20 * ((idx // 6) % 2)
+            val = 1.0 - 0.20 * ((idx // 3) % 2)
+            idx += 1
+            r, g, b = colorsys.hsv_to_rgb(hue, sat, val)
+            col = _np.array([r, g, b], dtype=_np.float32) * 255.0
+            key = "#%02X%02X%02X" % (int(col[0]), int(col[1]), int(col[2]))
+            if key not in man:
+                break
         img[vis] = col
-        man["#%02X%02X%02X" % (int(col[0]), int(col[1]), int(col[2]))] = label
+        man[key] = label
         n += 1
     _write_png_u8(objid_png, img)
     try:

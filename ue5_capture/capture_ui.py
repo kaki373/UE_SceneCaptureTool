@@ -896,13 +896,15 @@ class CaptureWindow(object):
                             ffmpeg=core.find_ffmpeg(getattr(self, "_ffmpeg_hint", None)))
                         if t_png:
                             backing["t"] = t_png
-                            if want_mfront:
-                                try:
-                                    _compose_mfront()
-                                except Exception as e:
-                                    self.status_var.set("雲マット合成エラー: %s" % e)
                         else:
                             skip_notes.append("雲マット: バッキングTの計算に失敗")
+                    if want_mfront:
+                        # バッキングが失敗しても板のみで MatteBeauty を必ず確定させる
+                        # （backing["t"] が無ければ _compose_mfront は板マスクのみで合成）
+                        try:
+                            _compose_mfront()
+                        except Exception as e:
+                            self.status_var.set("雲マット合成エラー: %s" % e)
                 # CloudMatte / 雲ObjectID ジョブ: αを回収して合成へ
                 elif _j.get("cloud_kind"):
                     cp = os.path.join(out, _j["base"] + ".png")
@@ -979,8 +981,11 @@ class CaptureWindow(object):
                                           scene_sequence=scene_seq,
                                           scene_frame=scene_frame, on_done=_jdone)
             except Exception as e:
-                _restore_fb()   # 起動失敗で overscan filmback を残さない
+                # チェーンを死なせず _finalize まで確定させる（中間物の掃除・
+                # filmback/PropagateAlpha の復元・保留中の合成の後始末）
+                skip_notes.append("追加ジョブ起動失敗 (%s)" % j["base"])
                 self.status_var.set("追加 MRQ 失敗: %s" % e)
+                _finalize()
 
         def _after_beauty(ok, od):
             nonlocal matte_path
@@ -1491,7 +1496,6 @@ class CaptureWindow(object):
                 seq_notes.append("雲マット: バッキング起動失敗")
                 self.status_var.set("バッキング起動失敗: %s" % e)
                 _finish_outputs(True, od)
-                _finish_outputs(True, od)
 
         def _run_direct(ok, od):
             """Raw Lighting Direct の専用ジョブ（GI/Sky/AO を切った直射のみ）。
@@ -1554,8 +1558,11 @@ class CaptureWindow(object):
                 # HV(雲)は near-clip を無視して写り込むため手前の雲はアクター単位で隠す
                 front_vols = core.volumetrics_nearer_than(nc, cs_cam) if vdb else []
             except Exception as e:
+                # Behind だけ諦めて、レンダ済みのメイン素材の後処理は続行する
+                seq_notes.append("Matteの奥: near-clip 計算失敗のためスキップ")
                 self.status_var.set("Matteの奥: near-clip 計算失敗: %s" % e)
-                _final(False, od)
+                wants["behind"] = (False, False)
+                _run_direct(True, od)
                 return
             self.status_var.set("Matteの奥プレートをレンダ中… (near-clip %.0fcm)" % nc)
             self.root.update()
@@ -1569,8 +1576,10 @@ class CaptureWindow(object):
                     beauty_label="BehindPlate",
                     fog_off=self.seq_fog_var.get(), on_done=_run_direct)
             except Exception as e:
+                seq_notes.append("Matteの奥: プレート起動失敗のためスキップ")
                 self.status_var.set("Matteの奥プレート起動失敗: %s" % e)
-                _final(False, od)
+                wants["behind"] = (False, False)
+                _run_direct(True, od)
 
         self.status_var.set("シーケンスレンダ中… (PIE / %d〜%dF @%gfps)"
                             % (cs_eff, ce_eff - 1, float(fps_num) / fps_den))

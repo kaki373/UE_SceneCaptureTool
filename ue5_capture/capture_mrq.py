@@ -305,6 +305,13 @@ def render_beauty(camera_actor, output_dir, width, height,
     except Exception:
         # 起動に失敗したら状態を巻き戻す（次回レンダを塞がない）
         _restore_scene()
+        if near_clip_cm is not None:
+            # 起動前にグローバル適用済みの near clip を戻す
+            try:
+                unreal.SystemLibrary.execute_console_command(
+                    _editor_world(), "r.SetNearClipPlane 10")
+            except Exception:
+                pass
         _delete_temp_sequence()
         _KEEP.clear()
         raise
@@ -927,6 +934,13 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
                                       backing=bool(backing_actors), use_exr=use_exr)
     except Exception:
         _restore_scene()
+        if near_clip_cm is not None:
+            # 起動前にグローバル適用済みの near clip を戻す
+            try:
+                unreal.SystemLibrary.execute_console_command(
+                    _editor_world(), "r.SetNearClipPlane 10")
+            except Exception:
+                pass
         _KEEP.clear()      # 起動失敗時に次回レンダを塞がない
         raise
 
