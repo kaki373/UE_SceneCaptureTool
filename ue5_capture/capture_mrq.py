@@ -463,6 +463,11 @@ def _start_render(sub, camera_actor, output_dir, width, height,
         # r.SetNearClipPlane は cvar でなくコマンド＝自動復元されない（完了時に手動復元）。
         cmds.append("r.SetNearClipPlane %f" % float(near_clip_cm))
         _log("near clip = %.1f cm" % float(near_clip_cm))
+        # start_console_commands だけだとウォームアップ/最初のサブフレームに間に合わず、
+        # クリップ有り/無しが平均されて手前オブジェクトが半透明ゴースト化する（実測）。
+        # レンダ起動前にグローバルへも適用しておく（_on_finished が既定 10cm へ復元）。
+        unreal.SystemLibrary.execute_console_command(
+            _editor_world(), "r.SetNearClipPlane %f" % float(near_clip_cm))
     cv.set_editor_property("start_console_commands", cmds)
 
     executor = unreal.MoviePipelinePIEExecutor()
@@ -1057,6 +1062,10 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
         # r.SetNearClipPlane は cvar でなくコマンド＝自動復元されない（完了時に手動復元）
         cmds.append("r.SetNearClipPlane %f" % float(near_clip_cm))
         _log("near clip = %.1f cm" % float(near_clip_cm))
+        # ウォームアップ/先頭サブフレームにも効かせるため起動前にグローバル適用
+        # （半透明ゴースト防止・_on_finished が既定 10cm へ復元）
+        unreal.SystemLibrary.execute_console_command(
+            _editor_world(), "r.SetNearClipPlane %f" % float(near_clip_cm))
     cv.set_editor_property("start_console_commands", cmds)
 
     executor = unreal.MoviePipelinePIEExecutor()

@@ -776,8 +776,10 @@ class CaptureWindow(object):
                 # HV(雲)は near-clip の描画クリップを無視して写り込むため、
                 # 板より手前の雲はアクター単位で隠す（板の後ろの雲は窓の中身として残す）
                 front_vols = core.volumetrics_nearer_than(nc, cs_cam)
+                # 凍結静止画のプレートは TS=1 固定（TS>1 は無意味なうえ、クリップの
+                # サブフレーム片効きで手前が半透明ゴースト化する素地になる）
                 jobs.append(dict(hidden=list(mt_p) + front_vols,
-                                 base=_name("BehindPlate"),
+                                 base=_name("BehindPlate"), ts1=True,
                                  near_clip=nc, composite=True, matte=mt_p))
                 if mt_v:
                     skip_notes.append("Matteの奥: 雲対象はシルエット非対応（板のみで合成）")
@@ -949,7 +951,8 @@ class CaptureWindow(object):
                                           # CloudMatte 系はライティング非依存のαのみ。
                                           # TS>1 だと空のサブフレームが平均されて
                                           # αが 1/TS に希釈される（TS=2 で最大128 実測）
-                                          temporal_samples=(1 if j.get("cloud_kind")
+                                          temporal_samples=(1 if (j.get("cloud_kind")
+                                                                  or j.get("ts1"))
                                                             else ts),
                                           warmup=warm,
                                           file_basename=j["base"],
