@@ -809,6 +809,34 @@ def _capture_object_id(world, settings, cam, w, h, ts, spawned):
     return outs
 
 
+# HeterogeneousVolume（VDB/SVT の雲等）。CustomDepth/SceneDepth を書かないため
+# 既存のマット/ObjectID 機構（ステンシル・深度一致）には一切写らない。
+# マット系はアルファレンダ（capture_mrq の cloud_matte ジョブ）で扱う。
+_HV_COMP_CLASS = getattr(unreal, "HeterogeneousVolumeComponent", None)
+
+
+def _is_hv_comp(comp):
+    return _HV_COMP_CLASS is not None and isinstance(comp, _HV_COMP_CLASS)
+
+
+def is_volumetric_actor(actor):
+    """HeterogeneousVolume(VDB) コンポーネントを持つアクターか。"""
+    if _HV_COMP_CLASS is None or actor is None:
+        return False
+    try:
+        return bool(actor.get_components_by_class(_HV_COMP_CLASS))
+    except Exception:
+        return False
+
+
+def split_volumetric_targets(actors):
+    """対象アクターを (通常プリミティブ, ボリューム(HV)) に分ける。"""
+    prims, vols = [], []
+    for a in actors or []:
+        (vols if is_volumetric_actor(a) else prims).append(a)
+    return prims, vols
+
+
 def _matte_clip_plane(actors, cam):
     """マット対象群の代表平面（base, normal）を求める。normal は『奥』を向くよう調整。
     平面マットは actor の up ベクトルが面法線。複数なら可視点に最も近い1つを採用。"""
@@ -836,6 +864,8 @@ def set_matte_shadow_occlusion(actors, enabled):
         if a is None:
             continue
         for comp in a.get_components_by_class(unreal.PrimitiveComponent):
+            if _is_hv_comp(comp):
+                continue   # ボリューム(雲)は板ではない: ライティング分離しない
             try:
                 comp.set_editor_property("cast_shadow", bool(enabled))
             except Exception:
@@ -896,6 +926,10 @@ def set_matte_unlit(actors):
             continue
         tags = [unreal.Name(str(t)) for t in a.tags]
         for comp in a.get_components_by_class(unreal.MeshComponent):
+            if _is_hv_comp(comp):
+                # ボリューム(雲)は板ではない。Volume ドメイン材が必要で差替え不可、
+                # かつ現在材は BP が作る Transient MID で退避パスも復元不能になる。
+                continue
             cname = comp.get_name()
             for i in range(comp.get_num_materials()):
                 cur = comp.get_material(i)
@@ -1055,10 +1089,12 @@ def delete_pass_frames(output_dir, name_body, take_str, pass_names):
     return n
 
 
-def composite_mattefront_sequence(output_dir, name_body, take_str):
+def composite_mattefront_sequence(output_dir, name_body, take_str, use_cloud=False):
     """Beauty（クリーン）に Matte をアルファとして焼いた MatteBeauty 連番を書く
     （Matteの前＝マット部分が穴。選択=黒がアルファ0）。RGB はアルファ乗算済みなので
-    MP4 化しても穴が黒になる。出力フレーム数を返す。"""
+    MP4 化しても穴が黒になる。use_cloud=True なら CloudMatte 連番（PNG の α=
+    雲の可視不透明度）も mask×(1-α) で統合する（板マスクが無い雲のみの場合は
+    白地から作る）。出力フレーム数を返す。"""
     if not (_HAS_NUMPY and _HAS_PIL):
         return 0
     pat = re.compile(re.escape("%s_Beauty_%s." % (name_body, take_str)) + r"(\d+)\.png$")
@@ -1069,12 +1105,22 @@ def composite_mattefront_sequence(output_dir, name_body, take_str):
             continue
         fr = m.group(1)
         matte_p = os.path.join(output_dir, "%s_Matte_%s.%s.png" % (name_body, take_str, fr))
-        if not os.path.isfile(matte_p):
-            _warn("MatteBeauty 合成: フレーム %s の Matte が無い" % fr)
-            continue
+        cloud_p = os.path.join(output_dir, "%s_CloudMatte_%s.%s.png" % (name_body, take_str, fr))
         beauty = _np.asarray(_PILImage.open(os.path.join(output_dir, f)).convert("RGB"),
                              dtype=_np.float32)
-        matte = _np.asarray(_PILImage.open(matte_p).convert("L"), dtype=_np.float32)
+        matte = None
+        if os.path.isfile(matte_p):
+            matte = _np.asarray(_PILImage.open(matte_p).convert("L"), dtype=_np.float32)
+        if use_cloud and os.path.isfile(cloud_p):
+            cim = _PILImage.open(cloud_p)
+            if cim.mode == "RGBA":
+                ca = _np.asarray(cim)[:, :, 3].astype(_np.float32) / 255.0
+                if matte is None:
+                    matte = _np.full(ca.shape, 255.0, dtype=_np.float32)
+                matte = matte * (1.0 - ca)
+        if matte is None:
+            _warn("MatteBeauty 合成: フレーム %s の Matte/CloudMatte が無い" % fr)
+            continue
         rgb = beauty * (matte / 255.0)[:, :, None]
         rgba = _np.dstack([rgb, matte])
         out = os.path.join(output_dir, "%s_MatteBeauty_%s.%s.png" % (name_body, take_str, fr))
@@ -1218,6 +1264,88 @@ def compose_rgba(rgb_path, mask_path, out_path):
     _write_png_u8(out_path, _np.dstack([rgb, m]))
     _log("behind-matte 合成出力: %s" % out_path)
     return out_path
+
+
+def merge_cloud_alpha_into_matte(matte_path, cloud_png_path, out_path, size_wh=None):
+    """Matte マスク（選択=黒/周囲=白）へ CloudMatte のα（雲の可視不透明度）を合成する。
+    mask' = mask × (1 - cloud_α)。matte_path が無ければ白地から作る
+    （雲だけがマット対象のケース）。出力パスを返す（入力不足なら None）。"""
+    if not (_HAS_NUMPY and _HAS_PIL):
+        return None
+    if not (cloud_png_path and os.path.isfile(cloud_png_path)):
+        _warn("merge_cloud_alpha: CloudMatte 画像がありません: %s" % cloud_png_path)
+        return None
+    im = _PILImage.open(cloud_png_path)
+    if im.mode != "RGBA":
+        _warn("merge_cloud_alpha: CloudMatte にαがありません（mode=%s）" % im.mode)
+        return None
+    ca = _np.asarray(im)[:, :, 3].astype(_np.float32) / 255.0
+    H, W = ca.shape
+    if matte_path and os.path.isfile(matte_path):
+        mask = _np.asarray(_PILImage.open(matte_path).convert("L"), dtype=_np.float32)
+        if mask.shape != (H, W):
+            mask = _np.asarray(_PILImage.fromarray(mask.astype(_np.uint8)).resize((W, H)),
+                               dtype=_np.float32)
+    else:
+        mask = _np.full((H, W), 255.0, dtype=_np.float32)
+    merged = mask * (1.0 - ca)
+    _write_png_u8(out_path, merged)
+    _log("Matte マスクへ雲αを合成: %s" % out_path)
+    return out_path
+
+
+def merge_cloud_objid(objid_png, manifest_path, cloud_entries, threshold=0.5):
+    """ObjectID 静止画へ雲のIDを合成する。cloud_entries = [(label, cloud_png_path)]。
+    各雲は CloudMatte のα >= threshold の画素を専用色で塗る（後勝ち）。
+    色相は既存マニフェストのエントリ数から黄金角で継続。JSON も更新する。"""
+    import colorsys
+    import json as _json
+    if not (_HAS_NUMPY and _HAS_PIL):
+        return None
+    if not (objid_png and os.path.isfile(objid_png)):
+        _warn("merge_cloud_objid: ObjectID 画像がありません: %s" % objid_png)
+        return None
+    img = _np.asarray(_PILImage.open(objid_png).convert("RGB")).astype(_np.float32)
+    man = {}
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            man = _json.load(f)
+    except Exception:
+        pass
+    idx = len(man)
+    n = 0
+    for label, cpath in cloud_entries:
+        if not (cpath and os.path.isfile(cpath)):
+            _warn("merge_cloud_objid: %s のCloudMatteがありません" % label)
+            continue
+        im = _PILImage.open(cpath)
+        if im.mode != "RGBA":
+            continue
+        ca = _np.asarray(im)[:, :, 3].astype(_np.float32) / 255.0
+        if ca.shape != img.shape[:2]:
+            ca = _np.asarray(_PILImage.fromarray((ca * 255).astype(_np.uint8))
+                             .resize((img.shape[1], img.shape[0])),
+                             dtype=_np.float32) / 255.0
+        vis = ca >= float(threshold)
+        if not bool(vis.any()):
+            continue
+        hue = (idx * 0.6180339887498949) % 1.0
+        sat = 0.75 + 0.20 * ((idx // 6) % 2)
+        val = 1.0 - 0.20 * ((idx // 3) % 2)
+        idx += 1
+        r, g, b = colorsys.hsv_to_rgb(hue, sat, val)
+        col = _np.array([r, g, b], dtype=_np.float32) * 255.0
+        img[vis] = col
+        man["#%02X%02X%02X" % (int(col[0]), int(col[1]), int(col[2]))] = label
+        n += 1
+    _write_png_u8(objid_png, img)
+    try:
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            _json.dump(man, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        _warn("merge_cloud_objid: JSON 更新に失敗: %s" % e)
+    _log("ObjectID へ雲ID %d 件を合成: %s" % (n, objid_png))
+    return objid_png
 
 
 def blend_with_beauty(beauty_path, matte_path=None, objid_path=None,

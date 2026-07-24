@@ -78,6 +78,29 @@ NNN は出力フォルダ内の通し番号）。素材名（クリーン名）�
 - **Fog OFF**：Beauty レンダ時に `r.Fog 0` / `r.VolumetricFog 0`。
 - **MRQ 品質**：Warmup（Lumen/影の収束。**32 以上推奨**。低いと暗くなる）、Temporal サンプル数、EXR。
 
+## VDB雲（HeterogeneousVolume）のマット / ObjectID
+Matte / ObjectID 対象に **HeterogeneousVolumeComponent**（SparseVolumeTexture=VDB の雲等）を
+含めると自動で専用処理になる（ボリュームは CustomDepth/SceneDepth を書かないため、
+従来のステンシル/深度比較のマスクには一切写らない）。
+
+- **雲マット**: 追加の MRQ **CloudMatte ジョブ**（TS=1）で PNG の α に雲の可視不透明度を出し、
+  板マスクと `mask×(1-α)` で統合して Matteの前 (MatteBeauty) / 映像の Matte 連番に反映する。
+- **雲 ObjectID**（静止画のみ）: 対象の雲1つずつ CloudMatte ジョブを回し、α≥0.5 の画素を
+  色分けして ObjectID PNG / JSON マニフェストへ合成する。映像の ObjectID は雲非対応。
+- **方式は分離モード固定**＝雲以外を全部隠して撮る遮蔽なしの全投影α（完了メッセージに注記）。
+  αは MRQ が自動で有効化する `r.PostProcessing.PropagateAlpha` の透過率合成から得る。
+  ⚠️ 遮蔽考慮の**ホールドアウト方式は UE5.7 では使えない**（実測 2026-07-24）:
+  `r.Deferred.SupportPrimitiveAlphaHoldout=True` を単独有効化すると HV 描画で
+  RWHoldoutTexture 未束縛の Fatal クラッシュ、`r.PostProcessing.PropagateAlpha=True` と
+  ペアならクラッシュしないが holdout αがほぼ 0 のまま（出力が壊れている）。
+  コード上は `_set_cloud_matte_mode(use_holdout=...)` に経路を残してある（エンジン修正待ち）。
+- 雲対象はマット板の自動ライティング分離（アンリット化）の対象外。Matteの奥の
+  シルエットにも使われない（板のみ）。
+- **雲は常に「通常オブジェクト」扱い**: マット板と違い Beauty から隠さず
+  **写ったまま**、Matteの前 (MatteBeauty) のαにだけ雲の不透明度が載る
+  （=通常オブジェクトのアルファ付きレンダ相当）。板（プリミティブ）対象のみ
+  従来どおり隠して穴を開ける。
+
 ---
 
 ## UE5.7 API の要点（ハマりどころ）

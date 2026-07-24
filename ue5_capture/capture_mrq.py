@@ -19,7 +19,8 @@ SceneCapture2D では CineCamera の物理露出やシーケンサ相当の品�
 import os
 import unreal
 
-from capture_core import MATTE_STENCIL
+from capture_core import (MATTE_STENCIL, _HV_COMP_CLASS, _is_hv_comp,
+                          is_volumetric_actor)
 
 _TAG = "[SceneCapture/MRQ] "
 def _log(m): unreal.log(_TAG + str(m))
@@ -214,8 +215,12 @@ def render_beauty(camera_actor, output_dir, width, height,
                   near_clip_cm=None, overscan=0.0, fog_off=False,
                   scene_sequence=None, scene_frame=None,
                   matte_material=None, matte_actors=None, depth_material=None,
-                  light_pass=False, light_direct=False):
+                  light_pass=False, light_direct=False,
+                  cloud_matte_actors=None):
     """対象カメラを MRQ で Beauty レンダリング（非同期）。executor を返す。
+    cloud_matte_actors を渡すと CloudMatte ジョブになる: 対象 HV ボリューム(雲)を
+    holdout・他プリミティブも holdout・大気/フォグ OFF で、PNG のαに可視雲
+    不透明度が入る（RGB はほぼ黒＝マット専用）。要 cloud_matte_ready()。
     light_pass=True で LightingOnly レンダパス（アルベド無視のライティングのみ＝
     落ち影+シェーディング）を同一ジョブに追加する（出力: file_basename_LightingOnly.*）。
     light_direct=True はこのジョブ全体の GI/スカイライト/AO を ShowFlag cvar で切り、
@@ -256,6 +261,12 @@ def render_beauty(camera_actor, output_dir, width, height,
     saved_matte = None
     if matte_material is not None:
         saved_matte = _set_matte_render_mode(matte_actors)
+    saved_cloud = None
+    if cloud_matte_actors:
+        # UE5.7 は holdout 方式のα出力が実質壊れている（cvarペア有効でも最大2/255・
+        # 2026-07-24実測）ため分離モード固定。エンジン修正後に
+        # use_holdout=cloud_matte_holdout_ready() へ戻す。
+        saved_cloud = _set_cloud_matte_mode(cloud_matte_actors, use_holdout=False)
     saved_players = _suppress_autoplay_players()
     saved_cam = [c for c in (_fill_aspect_comp(camera_actor, width, height),)
                  if c is not None]
@@ -270,6 +281,8 @@ def render_beauty(camera_actor, output_dir, width, height,
                 pass
         if saved_matte:
             _restore_matte_render_mode(saved_matte)
+        if saved_cloud:
+            _restore_cloud_matte_mode(saved_cloud)
         _restore_autoplay_players(saved_players)
         _restore_cameras_aspect(saved_cam)
 
@@ -280,7 +293,8 @@ def render_beauty(camera_actor, output_dir, width, height,
                              file_basename, on_done, near_clip_cm, overscan,
                              fog_off, _restore_scene, scene_sequence, scene_frame,
                              matte_material, depth_material,
-                             light_pass, light_direct)
+                             light_pass, light_direct,
+                             cloud_matte=bool(cloud_matte_actors))
     except Exception:
         # 起動に失敗したら状態を巻き戻す（次回レンダを塞がない）
         _restore_scene()
@@ -295,7 +309,7 @@ def _start_render(sub, camera_actor, output_dir, width, height,
                   file_basename, on_done, near_clip_cm, overscan,
                   fog_off, restore_scene, scene_sequence=None, scene_frame=None,
                   matte_material=None, depth_material=None,
-                  light_pass=False, light_direct=False):
+                  light_pass=False, light_direct=False, cloud_matte=False):
     seq, seq_path = _create_temp_sequence(camera_actor,
                                           scene_sequence=scene_sequence,
                                           scene_frame=scene_frame)
@@ -325,6 +339,9 @@ def _start_render(sub, camera_actor, output_dir, width, height,
         deferred = cfg.find_or_add_setting_by_class(unreal.MoviePipelineDeferredPassBase)
         if extra_passes:
             deferred.set_editor_property("additional_post_process_materials", extra_passes)
+        if cloud_matte:
+            # タイル蓄積にαを含める（これが無いと最終画像のαが 1 固定になる）
+            deferred.set_editor_property("accumulator_includes_alpha", True)
     if light_pass:
         # LightingOnly は独立したレンダパス（追加 PP 材とは別系統）。
         # 出力は <basename>_LightingOnly.* になる（{render_pass} 命名が必須になる）。
@@ -351,7 +368,7 @@ def _start_render(sub, camera_actor, output_dir, width, height,
     else:
         out_fmt = cfg.find_or_add_setting_by_class(unreal.MoviePipelineImageSequenceOutput_PNG)
         try:
-            out_fmt.set_editor_property("write_alpha", False)
+            out_fmt.set_editor_property("write_alpha", bool(cloud_matte))
         except Exception:
             pass
 
@@ -414,6 +431,15 @@ def _start_render(sub, camera_actor, output_dir, width, height,
         # 直射のみ: LightingOnly が「直接光の落ち影+シェーディングのみ・影は完全な黒」になる。
         pairs += list(_DIRECT_ONLY_CVARS)
         _log("direct lighting only (GI/Sky/AO off)")
+    if cloud_matte:
+        # α伝播（MRQ 既定でも ON になるが明示）+ αを埋める大気/フォグを OFF。
+        # ⚠️ ShowFlag.Cloud 0 は VolumetricCloud だけでなく HV(VDB雲)も消す（実測）
+        # ため使用禁止。雲海は _set_cloud_matte_mode が VolumetricCloudComponent を
+        # visible=False で個別に切る。
+        pairs += [("r.PostProcessing.PropagateAlpha", 1),
+                  ("ShowFlag.Atmosphere", 0), ("ShowFlag.Fog", 0),
+                  ("ShowFlag.VolumetricFog", 0)]
+        _log("cloud matte (alpha / atmosphere+fog off)")
     cv = cfg.find_or_add_setting_by_class(unreal.MoviePipelineConsoleVariableSetting)
     cv.set_editor_property("cvars", _cv_entries(pairs))   # レンダ後にエンジンが自動復元
     cmds = []
@@ -480,6 +506,8 @@ def _set_matte_render_mode(actors):
         if a is None:
             continue
         for comp in a.get_components_by_class(unreal.PrimitiveComponent):
+            if _is_hv_comp(comp):
+                continue   # HV(雲)は CustomDepth に写らない: cloud_matte 側で扱う
             try:
                 saved.append((comp,
                               comp.get_editor_property("render_in_main_pass"),
@@ -512,6 +540,97 @@ def _restore_matte_render_mode(saved):
             comp.set_editor_property("affect_dynamic_indirect_lighting", dil)
         except Exception as e:
             _warn("Matte レンダモード復元に失敗: %s" % e)
+
+
+def cloud_matte_holdout_ready():
+    """ホールドアウト方式（遮蔽考慮の雲マット）が使えるか。
+    r.Deferred.SupportPrimitiveAlphaHoldout は読み取り専用 cvar（ini・要再起動）。
+    ⚠️ UE5.7 では有効化するとエディタビューポートの HV 描画で
+    RWHoldoutTexture 未束縛の Fatal クラッシュ（エンジンバグ・2026-07-24 実測）。
+    通常は無効のままで、CloudMatte は分離モード（遮蔽なし）で撮る。"""
+    try:
+        return unreal.SystemLibrary.get_console_variable_int_value(
+            "r.Deferred.SupportPrimitiveAlphaHoldout") != 0
+    except Exception:
+        return False
+
+
+def _set_cloud_matte_mode(vol_targets, use_holdout=False):
+    """CloudMatte ジョブ用のシーン状態。
+    use_holdout=True（要 cloud_matte_holdout_ready・UE5.7 ではエンジンバグで通常不可）:
+      - 対象ボリューム: holdout=True（合成シェーダでαに可視不透明度が加算される）
+      - 対象外のボリューム: 非表示 / その他の全プリミティブ: holdout（遮蔽のみ）
+    use_holdout=False（分離モード・既定）:
+      - 対象以外のアクターを**アクター単位で**隠す。ただし**ライトコンポーネントを
+        持つアクター（UDS/UDW/各ライト）は隠さない** — HV は無照明だとαも出ず全黒
+        （2026-07-24実測）。ライト持ちの見た目（大気/フォグ）は ShowFlag 側で消す。
+      - ⚠️ 他アクターの SCS コンポーネント単位で hidden_in_game/visible を編集する
+        方式は不可（BP再構築の副作用で HV が全黒になる・実測）。ShowFlag.Cloud も
+        HV ごと消すため不可。αは遮蔽を考慮しない全投影の雲不透明度になる。
+    返り値: (holdout解除リスト, アクター再表示リスト, コンポーネント再表示リスト)。"""
+    targets = set(a.get_name() for a in vol_targets or [])
+    holdout_comps, hidden_actors, hidden_comps = [], [], []
+    actors = unreal.get_editor_subsystem(
+        unreal.EditorActorSubsystem).get_all_level_actors()
+    for a in actors:
+        if a.get_name() in targets:
+            if use_holdout and _HV_COMP_CLASS is not None:
+                for c in a.get_components_by_class(_HV_COMP_CLASS):
+                    try:
+                        if not c.get_editor_property("holdout"):
+                            c.set_editor_property("holdout", True)
+                            holdout_comps.append(c)
+                    except Exception:
+                        pass
+            continue
+        if not use_holdout:
+            try:
+                if a.get_components_by_class(unreal.LightComponentBase):
+                    continue   # ライト持ちは残す（隠すと HV が無照明でα全黒）
+                if not a.get_editor_property("hidden"):
+                    a.set_actor_hidden_in_game(True)
+                    hidden_actors.append(a)
+            except Exception:
+                pass
+            continue
+        if is_volumetric_actor(a):
+            try:
+                if not a.get_editor_property("hidden"):
+                    a.set_actor_hidden_in_game(True)
+                    hidden_actors.append(a)
+            except Exception:
+                pass
+            continue
+        for c in a.get_components_by_class(unreal.PrimitiveComponent):
+            try:
+                if not c.get_editor_property("holdout"):
+                    c.set_editor_property("holdout", True)
+                    holdout_comps.append(c)
+            except Exception:
+                pass
+    _log("CloudMatte(%s): holdout %d comps / 非表示 %d actors / %d comps"
+         % ("holdout" if use_holdout else "分離", len(holdout_comps),
+            len(hidden_actors), len(hidden_comps)))
+    return holdout_comps, hidden_actors, hidden_comps
+
+
+def _restore_cloud_matte_mode(saved):
+    holdout_comps, hidden_actors, hidden_comps = saved or ([], [], [])
+    for c in holdout_comps:
+        try:
+            c.set_editor_property("holdout", False)
+        except Exception:
+            pass
+    for a in hidden_actors:
+        try:
+            a.set_actor_hidden_in_game(False)
+        except Exception:
+            pass
+    for c, prop, val in hidden_comps:
+        try:
+            c.set_editor_property(prop, val)
+        except Exception:
+            pass
 
 
 def _set_objid_render_mode(actors):
@@ -549,8 +668,9 @@ def _restore_objid_render_mode(saved):
 
 
 def _camera_cut_camera_actors(level_sequence, world):
-    """カメラカットに束縛された CineCameraActor を全セクションから解決して返す
-    （スポーナブルはエディタワールドに実体が無く解決できない＝既知の限界）。"""
+    """カメラカットに束縛されたカメラアクターを全セクションから解決して返す
+    （CineCameraActor / 素の CameraActor の両方。スポーナブルはエディタワールドに
+    実体が無く解決できない＝既知の限界）。"""
     ext = unreal.MovieSceneSequenceExtensions
     actors = []
     guids = []
@@ -558,28 +678,37 @@ def _camera_cut_camera_actors(level_sequence, world):
             level_sequence, unreal.MovieSceneCameraCutTrack) or []):
         for sec in tr.get_sections():
             try:
-                guids.append(sec.get_camera_binding_id().get_editor_property("guid"))
+                # Guid 構造体の == は UE5.7 Python では常に False（実測）。
+                # export_text() の文字列で比較する。
+                guids.append(sec.get_camera_binding_id()
+                             .get_editor_property("guid").export_text())
             except Exception:
                 pass
     for b in ext.get_bindings(level_sequence):
-        if any(b.get_id() == g for g in guids):
+        if b.get_id().export_text() in guids:
             for o in ext.locate_bound_objects(level_sequence, b, world):
-                if isinstance(o, unreal.CineCameraActor) and o not in actors:
+                if isinstance(o, unreal.CameraActor) and o not in actors:
                     actors.append(o)
     return actors
 
 
 def _fill_aspect_comp(camera_actor, width, height):
     """カメラのアスペクト拘束が出力解像度とミスマッチなら constrain_aspect_ratio を
-    False にしてそのコンポーネントを返す（一致 or 非拘束 or 非Cineカメラは None）。"""
+    False にしてそのコンポーネントを返す（一致 or 非拘束なら None）。
+    CineCamera は filmback、素の CameraActor は aspect_ratio プロパティで判定する
+    （素のカメラも constrain_aspect_ratio + aspect_ratio で黒帯が出る。従来は
+    Cine 専用で素のカメラは放置＝黒帯+パス間ズレになっていた）。"""
     try:
-        comp = camera_actor.get_cine_camera_component()
+        comp = camera_actor.camera_component
         if not bool(comp.get_editor_property("constrain_aspect_ratio")):
             return None
-        fb = comp.get_editor_property("filmback")
-        fb_asp = (float(fb.get_editor_property("sensor_width"))
-                  / max(float(fb.get_editor_property("sensor_height")), 1e-6))
-        if abs(fb_asp - float(width) / float(height)) < 1e-3:
+        try:
+            fb = comp.get_editor_property("filmback")
+            cam_asp = (float(fb.get_editor_property("sensor_width"))
+                       / max(float(fb.get_editor_property("sensor_height")), 1e-6))
+        except Exception:
+            cam_asp = float(comp.get_editor_property("aspect_ratio"))
+        if cam_asp <= 0.0 or abs(cam_asp - float(width) / float(height)) < 1e-3:
             return None            # 一致していれば拘束は無害（黒帯が出ない）
         comp.set_editor_property("constrain_aspect_ratio", False)
         return comp
@@ -599,10 +728,10 @@ def _set_cameras_fill_aspect(level_sequence, width, height):
         _warn("カメラカットのカメラ解決に失敗: %s" % e)
         actors = []
     if not actors:
-        # フォールバック: レベル内の全 CineCamera（ミスマッチのものだけ触り、復元する）
+        # フォールバック: レベル内の全カメラ（ミスマッチのものだけ触り、復元する）
         try:
             actors = unreal.GameplayStatics.get_all_actors_of_class(
-                _editor_world(), unreal.CineCameraActor)
+                _editor_world(), unreal.CameraActor)
         except Exception:
             actors = []
     saved = [c for c in (_fill_aspect_comp(a, width, height) for a in actors)
@@ -630,7 +759,8 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
                     hidden_actors=None, near_clip_cm=None, beauty_label="Beauty",
                     fog_off=False, on_done=None,
                     light_pass=False, light_direct=False,
-                    light_label="RawLightingFull"):
+                    light_label="RawLightingFull",
+                    cloud_matte_actors=None):
     """開いている/指定の LevelSequence を MRQ でレンダリング（非同期）。
     一時シーケンスは作らず job.sequence に直接指定し、カメラはシーケンスの
     カメラカットトラックに従う。fps はシーケンスの Display Rate。
@@ -678,10 +808,12 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
     # シーン状態の変更（レンダ後・起動失敗時に必ず復元）
     saved_matte = None
     saved_objid = None
+    saved_cloud = None
     hidden = []
     if matte_material is not None or matte_sil_material is not None:
         saved_matte = _set_matte_render_mode(matte_actors)
-    elif hidden_actors:
+    if hidden_actors:
+        # matte レンダモードと独立に適用する（板＝matte機構 / 雲＝単純非表示 の併用）
         for a in hidden_actors:
             try:
                 a.set_actor_hidden_in_game(True)
@@ -690,6 +822,9 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
                 pass
     if objid_material is not None:
         saved_objid = _set_objid_render_mode(objid_actors)
+    if cloud_matte_actors:
+        # 分離モード固定（render_beauty 側の注記参照。holdout は UE5.7 で出力が壊れている）
+        saved_cloud = _set_cloud_matte_mode(cloud_matte_actors, use_holdout=False)
     # レンダ対象以外の auto-play プレイヤーが PIE で並走するとシーンが二重評価される
     saved_players = _suppress_autoplay_players()
     # 全ジョブで適用する。メイン/BehindPlate 間でビュー矩形が食い違うと
@@ -701,6 +836,8 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
             _restore_matte_render_mode(saved_matte)
         if saved_objid:
             _restore_objid_render_mode(saved_objid)
+        if saved_cloud:
+            _restore_cloud_matte_mode(saved_cloud)
         for a in hidden:
             try:
                 a.set_actor_hidden_in_game(False)
@@ -717,7 +854,8 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
                                       objid_material,
                                       near_clip_cm, beauty_label, fog_off,
                                       _restore_scene, on_done,
-                                      light_pass, light_direct, light_label)
+                                      light_pass, light_direct, light_label,
+                                      cloud_matte=bool(cloud_matte_actors))
     except Exception:
         _restore_scene()
         _KEEP.clear()      # 起動失敗時に次回レンダを塞がない
@@ -731,7 +869,7 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
                            objid_material,
                            near_clip_cm, beauty_label, fog_off, restore_scene, on_done,
                            light_pass=False, light_direct=False,
-                           light_label="RawLightingFull"):
+                           light_label="RawLightingFull", cloud_matte=False):
     queue = sub.get_queue()
     for j in list(queue.get_jobs()):
         queue.delete_job(j)
@@ -758,6 +896,8 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
         deferred = cfg.find_or_add_setting_by_class(unreal.MoviePipelineDeferredPassBase)
         if extra_passes:
             deferred.set_editor_property("additional_post_process_materials", extra_passes)
+        if cloud_matte:
+            deferred.set_editor_property("accumulator_includes_alpha", True)
     if light_pass:
         # LightingOnly は独立したレンダパス（出力 <name>_LightingOnly_take.####、
         # 完了時に _light_label へリネーム）
@@ -766,7 +906,7 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
     if do_png:
         png = cfg.find_or_add_setting_by_class(unreal.MoviePipelineImageSequenceOutput_PNG)
         try:
-            png.set_editor_property("write_alpha", False)
+            png.set_editor_property("write_alpha", bool(cloud_matte))
         except Exception:
             pass
     if do_mp4:
@@ -836,6 +976,12 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
     if light_direct:
         pairs += list(_DIRECT_ONLY_CVARS)
         _log("direct lighting only (GI/Sky/AO off)")
+    if cloud_matte:
+        # ShowFlag.Cloud は HV も巻き込むため不使用（render_beauty 側の注記参照）
+        pairs += [("r.PostProcessing.PropagateAlpha", 1),
+                  ("ShowFlag.Atmosphere", 0), ("ShowFlag.Fog", 0),
+                  ("ShowFlag.VolumetricFog", 0)]
+        _log("cloud matte (alpha / atmosphere+fog off)")
     cv = cfg.find_or_add_setting_by_class(unreal.MoviePipelineConsoleVariableSetting)
     cv.set_editor_property("cvars", _cv_entries(pairs))   # レンダ後にエンジンが自動復元
     cmds = []
