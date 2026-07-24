@@ -1251,6 +1251,52 @@ def matte_near_clip_cm(actors, cam):
     return max(1.0, float(dist))
 
 
+def render_matte_sil_sequence(output_dir, name_body, take_str, start, end,
+                              actors, width, height, camera_for_frame, aa=2):
+    """映像 Behind 用: 各フレームをシーケンサーでスクラブ評価し、マット対象の
+    全投影シルエット（選択=黒/周囲=白）を show-only 深度から MatteSil 連番として
+    書く（静止画側の composite_behind_in_matte と同一手法）。
+    メインジョブの MatteSil PP パスは使わない: ObjectID 対象のステンシルが
+    「板より手前」の画素でシルエットを上書きして穴を開け、合成が Beauty 側
+    （手前オブジェクト入り）を選んでしまう（実測 2026-07-24）。
+    camera_for_frame(frame) はスクラブ込みでそのフレームのカメラアクターを返す。
+    書いたフレーム数を返す。"""
+    if not (_HAS_NUMPY and _HAS_PIL):
+        return 0
+    world = _get_editor_world()
+    try:
+        t0 = unreal.LevelSequenceEditorBlueprintLibrary.get_current_time()
+    except Exception:
+        t0 = None
+    n = 0
+    try:
+        for fr in range(int(start), int(end) + 1):
+            cam_actor = camera_for_frame(fr)
+            if cam_actor is None:
+                _warn("MatteSil 生成: フレーム %d のカメラを特定できずスキップ" % fr)
+                continue
+            cam = get_camera_settings(cam_actor)
+            tmp = []
+            try:
+                d = _render_depth_r(world, cam, width * aa, height * aa, tmp,
+                                    show_only_actors=actors)
+            finally:
+                _destroy_actors(tmp)
+            sil = _downscale((d < _DEPTH_FAR_CM).astype(_np.float32) * 255.0, aa)
+            out = os.path.join(output_dir,
+                               "%s_MatteSil_%s.%04d.png" % (name_body, take_str, fr))
+            _write_png_u8(out, 255.0 - sil)     # 選択=黒 / 周囲=白
+            n += 1
+    finally:
+        if t0 is not None:
+            try:
+                unreal.LevelSequenceEditorBlueprintLibrary.set_current_time(int(t0))
+            except Exception:
+                pass
+    _log("MatteSil 生成（スクラブ+show-only深度）: %d フレーム" % n)
+    return n
+
+
 def volumetrics_nearer_than(dist_cm, cam):
     """カメラ視線方向の深度が dist_cm より手前にある HV(VDB雲) アクターを返す。
     HV は r.SetNearClipPlane の描画クリップを無視して写り込む（実測 2026-07-24）
@@ -1396,9 +1442,11 @@ def _read_linear_gray(path, ffmpeg):
             _warn("バッキング差分: ffmpeg が見つからず EXR を読めません")
             return None
         tmp = path + "._gray16.png"
+        # creationflags: コンソールウインドウを出さない（フレーム毎の起動で
+        # ウインドウが連続開閉してエディタの UI 操作を奪う・ユーザー報告）
         r = _subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", path,
                              "-pix_fmt", "gray16be", tmp],
-                            capture_output=True)
+                            capture_output=True, creationflags=0x08000000)
         if r.returncode != 0 or not os.path.isfile(tmp):
             _warn("バッキング差分: EXR 変換失敗 %s: %s" % (path, r.stderr.decode(errors="replace")[-200:]))
             return None

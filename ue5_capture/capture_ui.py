@@ -1259,9 +1259,9 @@ class CaptureWindow(object):
                 matte_mat = core.create_temp_matte_material()
             if _need("behind"):
                 if matte_prims:
-                    # Behind 合成は遮蔽非依存の全投影シルエットでマスクする
-                    # （可視性マスクだと手前のオブジェクトが Beauty 側で写り込む）
-                    matte_sil_mat = core.create_temp_matte_sil_material()
+                    # シルエットはレンダ後にスクラブ+show-only深度で生成する
+                    # （静止画側と同一手法。メインジョブの MatteSil PP パスは
+                    # ObjectID ステンシルに穴を開けられるため廃止）
                     if matte_vols:
                         seq_notes.append("Matteの奥: 雲対象はシルエット非対応（板のみで合成）")
                 else:
@@ -1347,7 +1347,13 @@ class CaptureWindow(object):
                                                        use_cloud=cloud_seq["run"],
                                                        use_backing=backing_seq["run"])
                 if _need("behind"):
-                    core.composite_behind_sequence(out, name_body, take_str)
+                    ns = core.render_matte_sil_sequence(
+                        out, name_body, take_str, cs_eff, ce_eff, matte_prims, W, H,
+                        camera_for_frame=lambda f: self._sequence_camera_at(seq, f))
+                    if ns > 0:
+                        core.composite_behind_sequence(out, name_body, take_str)
+                    else:
+                        seq_notes.append("Matteの奥: シルエット生成に失敗")
                 if objid_needed and objid_actors:
                     man = {}
                     # ステンシルは 1..MATTE_STENCIL-1（MATTE_STENCIL はマット用予約）
@@ -1376,7 +1382,7 @@ class CaptureWindow(object):
                 drop = ["BehindPlate", "CloudMatte", "BackingT"]   # 中間素材は削除
                 if matte_mat is not None:
                     drop.append("Matte")
-                if matte_sil_mat is not None:
+                if _need("behind"):
                     drop.append("MatteSil")
                 if rldir_needed:
                     drop.append("DirectPlate")       # 直射ジョブの Beauty（内部素材）
@@ -1525,13 +1531,26 @@ class CaptureWindow(object):
             if not (ok and _need("behind")):
                 _run_direct(ok, od)
                 return
-            # Matteの奥: 開始フレームのカメラ→マット距離で near-clip した2本目ジョブ
+            # Matteの奥: near-clip した2本目ジョブ。カメラは動く前提で、範囲内の
+            # 数フレームをサンプリングした最小距離を使う（fronto-parallel 近似）
             try:
-                cam_actor = self._sequence_camera_at(seq, cs_eff)
-                if cam_actor is None:
+                ncs = []
+                cs_cam = None
+                for f in sorted({cs_eff, (cs_eff + ce_eff) // 2,
+                                 max(cs_eff, ce_eff - 1)}):
+                    try:
+                        ca = self._sequence_camera_at(seq, f)
+                    except Exception:
+                        ca = None
+                    if ca is None:
+                        continue
+                    c = {"transform": ca.get_actor_transform()}
+                    if cs_cam is None:
+                        cs_cam = c
+                    ncs.append(core.matte_near_clip_cm(matte_prims, c))
+                if not ncs:
                     raise RuntimeError("シーケンスカメラを特定できません")
-                cs_cam = {"transform": cam_actor.get_actor_transform()}
-                nc = core.matte_near_clip_cm(matte_prims, cs_cam)
+                nc = min(ncs)
                 # HV(雲)は near-clip を無視して写り込むため手前の雲はアクター単位で隠す
                 front_vols = core.volumetrics_nearer_than(nc, cs_cam)
             except Exception as e:
@@ -1546,7 +1565,7 @@ class CaptureWindow(object):
                     do_png=True, do_mp4=False,
                     temporal_samples=ts, warmup=warm,
                     custom_start=cs, custom_end=ce,
-                    hidden_actors=list(matte_actors) + front_vols, near_clip_cm=nc,
+                    hidden_actors=list(matte_prims) + front_vols, near_clip_cm=nc,
                     beauty_label="BehindPlate",
                     fog_off=self.seq_fog_var.get(), on_done=_run_direct)
             except Exception as e:
@@ -1564,9 +1583,15 @@ class CaptureWindow(object):
                 custom_start=cs, custom_end=ce,
                 depth_material=depth_mat,
                 matte_material=matte_mat, matte_actors=matte_prims,
-                matte_sil_material=matte_sil_mat,
                 objid_material=objid_mat, objid_actors=objid_actors,
-                hidden_actors=hide_actors, fog_off=self.seq_fog_var.get(),
+                # Matteの奥のみ（Matteの前なし）のとき: MatteSil はプレートジョブ側に
+                # 移したため、メインの Beauty から板を消すには単純非表示にする
+                hidden_actors=(hide_actors if hide_actors
+                               else (matte_prims if (_need("behind")
+                                                     and matte_mat is None
+                                                     and matte_prims)
+                                     else None)),
+                fog_off=self.seq_fog_var.get(),
                 light_pass=(rlfull_needed or only_direct),
                 light_direct=only_direct,
                 light_label=("RawLightingDirect" if only_direct
