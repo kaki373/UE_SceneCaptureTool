@@ -251,6 +251,13 @@ class CaptureWindow(object):
         self.fog_off_var = tk.BooleanVar(master=self.root, value=False)
         ttk.Checkbutton(mrqf2, text="Fogなし", variable=self.fog_off_var).pack(
             side="left", padx=(8, 0))
+        # VDB雲モード: Auto=レベルに HV(VDB雲) があれば自動で雲対応（バッキングT/
+        # 雲ObjectID/Behindの手前雲hide）。ON=検出に関わらず強制有効。
+        # OFF=雲を完全無視した従来の書き出し。画像/映像タブ共通の1セレクタ。
+        ttk.Label(mrqf2, text="VDB雲:").pack(side="left", padx=(8, 0))
+        self.vdb_var = tk.StringVar(master=self.root, value="Auto")
+        ttk.Combobox(mrqf2, textvariable=self.vdb_var, width=5, state="readonly",
+                     values=("Auto", "ON", "OFF")).pack(side="left")
         mrqf2.grid(row=row, column=0, columnspan=3, sticky="w", padx=24)
         row += 1
 
@@ -390,9 +397,13 @@ class CaptureWindow(object):
         tk.Entry(res, textvariable=self.seq_ts_var, width=5).pack(side="left", padx=2)
         res.grid(row=row, column=0, columnspan=3, sticky="w", **pad)
         row += 1
+        seqf2 = ttk.Frame(frm)
         self.seq_fog_var = tk.BooleanVar(master=self.root, value=False)
-        ttk.Checkbutton(frm, text="Fogなし", variable=self.seq_fog_var).grid(
-            row=row, column=0, columnspan=3, sticky="w", padx=8)
+        ttk.Checkbutton(seqf2, text="Fogなし", variable=self.seq_fog_var).pack(side="left")
+        ttk.Label(seqf2, text="VDB雲:").pack(side="left", padx=(8, 0))
+        ttk.Combobox(seqf2, textvariable=self.vdb_var, width=5, state="readonly",
+                     values=("Auto", "ON", "OFF")).pack(side="left")
+        seqf2.grid(row=row, column=0, columnspan=3, sticky="w", padx=8)
         row += 1
 
         ttk.Separator(frm, orient="horizontal").grid(
@@ -682,10 +693,13 @@ class CaptureWindow(object):
         except Exception as e:
             self.status_var.set("データパス出力でエラー: %s" % e)
 
+        # VDB雲: Auto=レベル内のHV検出で自動 / ON=強制 / OFF=雲を完全無視した従来書き出し
+        vdb = self._vdb_enabled()
+
         # ObjectID 対象に HV ボリューム(雲)が含まれるか（SceneCapture 系には写らない
         # ため、雲は後段の per-cloud CloudMatte ジョブで色付けして合成する）
         objid_cloud_vols = []
-        if s.do_object_id:
+        if s.do_object_id and vdb:
             _oa = core._resolve_target_actors(s.objid_actors, s.objid_actor_names)
             _op, objid_cloud_vols = core.split_volumetric_targets(_oa)
             if objid_cloud_vols:
@@ -730,6 +744,10 @@ class CaptureWindow(object):
                                     % len(beauty_hidden))
             else:
                 self.status_var.set("Matte 対象が見つかりません（Beauty は全表示で撮ります）")
+        if not vdb and matte_vols:
+            # OFF: 雲は対象から外す（Beauty からも隠さない・合成は板のみで即確定）
+            skip_notes.append("VDB雲モード OFF: 雲対象は無視されます")
+            matte_vols = []
         if want_mfront and matte_vols and not matte_prims:
             # 板なし（雲のみ対象）のときだけ従来の分離モード（遮蔽なし）。UE5.7 は
             # holdout 方式がクラッシュ（単独cvar時）または空出力（ペア時）で使えない。
@@ -755,14 +773,14 @@ class CaptureWindow(object):
         # 板あり: 白/黒バッキング差分で「板より手前の透過率T」を取り、板マスクの穴を
         # 遮蔽関係どおりに塞ぐ（板の手前の雲・半透明が他オブジェクトと同じ挙動になり、
         # 板の後ろの雲は板に遮られて写らないので自動的に無効）。何も隠さず照明も素のまま。
-        use_backing = bool(matte_prims) and want_mfront and core.level_has_volumetrics()
+        use_backing = vdb and bool(matte_prims) and want_mfront
         backing = {}
         if use_backing:
             jobs.append(dict(base=_name("BackingW"), backing=matte_prims,
                              backing_white=True, fmt="exr", cloud_kind="backing_w"))
             if matte_vols:
                 skip_notes.append("雲マット: 板の手前の雲は自動反映（雲の対象指定は不要）")
-        elif want_mfront and matte_vols:
+        elif want_mfront and matte_vols and vdb:
             jobs.append(dict(base=_name("CloudMatte"), cloud=matte_vols,
                              cloud_kind="matte"))
         if want_behind:
@@ -773,7 +791,7 @@ class CaptureWindow(object):
                 nc = core.matte_near_clip_cm(mt_p, cs_cam)
                 # HV(雲)は near-clip の描画クリップを無視して写り込むため、
                 # 板より手前の雲はアクター単位で隠す（板の後ろの雲は窓の中身として残す）
-                front_vols = core.volumetrics_nearer_than(nc, cs_cam)
+                front_vols = core.volumetrics_nearer_than(nc, cs_cam) if vdb else []
                 # 凍結静止画のプレートは TS=1 固定（TS>1 は無意味なうえ、クリップの
                 # サブフレーム片効きで手前が半透明ゴースト化する素地になる）
                 jobs.append(dict(hidden=list(mt_p) + front_vols,
@@ -1051,6 +1069,15 @@ class CaptureWindow(object):
         except Exception:
             return None
 
+    def _vdb_enabled(self):
+        """VDB雲セレクタの実効値。Auto はレベル内の HV(VDB雲) 検出で決める。"""
+        sel = (self.vdb_var.get() or "Auto").lower()
+        if sel == "on":
+            return True
+        if sel == "off":
+            return False
+        return core.level_has_volumetrics()
+
     def _sequence_camera_at(self, seq, frame):
         """プレイヘッドを frame に合わせ、カメラカットに束縛されたカメラアクターを返す。
         バインディング解決に失敗した場合はレベル内の先頭カメラにフォールバック。"""
@@ -1199,6 +1226,7 @@ class CaptureWindow(object):
             or rlfull_needed)
 
         seq_notes = []
+        vdb = self._vdb_enabled()
         matte_actors = None
         matte_prims, matte_vols = [], []
         if matte_needed or self.seq_matte_hide_var.get():
@@ -1210,6 +1238,10 @@ class CaptureWindow(object):
                 return
             # 板(プリミティブ)/雲(HVボリューム) 分割。雲は専用 CloudMatte ジョブで扱う。
             matte_prims, matte_vols = core.split_volumetric_targets(matte_actors)
+            if not vdb and matte_vols:
+                # OFF: 雲は対象から外す（従来の書き出しと同一の流れにする）
+                seq_notes.append("VDB雲モード OFF: 雲対象は無視されます")
+                matte_vols = []
             if matte_vols and _need("mfront") and not matte_prims:
                 seq_notes.append("雲マット: 分離モード（手前ジオメトリの遮蔽は反映されない）")
         objid_actors = None
@@ -1293,9 +1325,9 @@ class CaptureWindow(object):
 
         # 雲マット: 板あり＝バッキング差分（何も隠さない・遮蔽正確）/
         # 板なし（雲のみ対象）＝従来の分離モード（CloudMatte ジョブ）
-        backing_seq = {"run": bool(matte_prims) and _need("mfront")
-                       and core.level_has_volumetrics()}
-        cloud_seq = {"run": bool(matte_vols) and not matte_prims and _need("mfront")}
+        backing_seq = {"run": vdb and bool(matte_prims) and _need("mfront")}
+        cloud_seq = {"run": vdb and bool(matte_vols) and not matte_prims
+                     and _need("mfront")}
         pa0 = (unreal.SystemLibrary.get_console_variable_bool_value(
             "r.PostProcessing.PropagateAlpha") if cloud_seq["run"] else None)
         if backing_seq["run"]:
@@ -1520,7 +1552,7 @@ class CaptureWindow(object):
                     raise RuntimeError("シーケンスカメラを特定できません")
                 nc = min(ncs)
                 # HV(雲)は near-clip を無視して写り込むため手前の雲はアクター単位で隠す
-                front_vols = core.volumetrics_nearer_than(nc, cs_cam)
+                front_vols = core.volumetrics_nearer_than(nc, cs_cam) if vdb else []
             except Exception as e:
                 self.status_var.set("Matteの奥: near-clip 計算失敗: %s" % e)
                 _final(False, od)
@@ -1858,6 +1890,7 @@ class CaptureWindow(object):
                 "beauty_fmt": self.beauty_fmt_var.get(),
                 "mrq_camasp": self.mrq_camasp_var.get(),
                 "fog_off": self.fog_off_var.get(),
+                "vdb_mode": self.vdb_var.get(),
                 "seq_range_mode": self.seq_range_mode.get(),
                 "seq_start": self.seq_start_var.get(),
                 "seq_end": self.seq_end_var.get(),
@@ -1951,6 +1984,11 @@ class CaptureWindow(object):
             self.beauty_fmt_var.set(st["beauty_fmt"])
         _setvar(self.mrq_camasp_var, "mrq_camasp")
         _setvar(self.fog_off_var, "fog_off")
+        _v = st.get("vdb_mode")
+        if _v in ("Auto", "ON", "OFF"):
+            self.vdb_var.set(_v)
+        elif _v is False:            # 旧チェックボックス形式の互換
+            self.vdb_var.set("OFF")
         if st.get("seq_range_mode") in ("auto", "custom"):
             self.seq_range_mode.set(st["seq_range_mode"])
         _setvar(self.seq_start_var, "seq_start")
