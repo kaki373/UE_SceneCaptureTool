@@ -216,7 +216,8 @@ def render_beauty(camera_actor, output_dir, width, height,
                   scene_sequence=None, scene_frame=None,
                   matte_material=None, matte_actors=None, depth_material=None,
                   light_pass=False, light_direct=False,
-                  cloud_matte_actors=None):
+                  cloud_matte_actors=None,
+                  backing_actors=None, backing_white=False):
     """対象カメラを MRQ で Beauty レンダリング（非同期）。executor を返す。
     cloud_matte_actors を渡すと CloudMatte ジョブになる: 対象 HV ボリューム(雲)を
     holdout・他プリミティブも holdout・大気/フォグ OFF で、PNG のαに可視雲
@@ -267,6 +268,9 @@ def render_beauty(camera_actor, output_dir, width, height,
         # 2026-07-24実測）ため分離モード固定。エンジン修正後に
         # use_holdout=cloud_matte_holdout_ready() へ戻す。
         saved_cloud = _set_cloud_matte_mode(cloud_matte_actors, use_holdout=False)
+    saved_backing = None
+    if backing_actors:
+        saved_backing = _set_backing_materials(backing_actors, backing_white)
     saved_players = _suppress_autoplay_players()
     saved_cam = [c for c in (_fill_aspect_comp(camera_actor, width, height),)
                  if c is not None]
@@ -283,6 +287,8 @@ def render_beauty(camera_actor, output_dir, width, height,
             _restore_matte_render_mode(saved_matte)
         if saved_cloud:
             _restore_cloud_matte_mode(saved_cloud)
+        if saved_backing:
+            _restore_backing_materials(saved_backing)
         _restore_autoplay_players(saved_players)
         _restore_cameras_aspect(saved_cam)
 
@@ -294,7 +300,8 @@ def render_beauty(camera_actor, output_dir, width, height,
                              fog_off, _restore_scene, scene_sequence, scene_frame,
                              matte_material, depth_material,
                              light_pass, light_direct,
-                             cloud_matte=bool(cloud_matte_actors))
+                             cloud_matte=bool(cloud_matte_actors),
+                             backing=bool(backing_actors))
     except Exception:
         # 起動に失敗したら状態を巻き戻す（次回レンダを塞がない）
         _restore_scene()
@@ -309,7 +316,8 @@ def _start_render(sub, camera_actor, output_dir, width, height,
                   file_basename, on_done, near_clip_cm, overscan,
                   fog_off, restore_scene, scene_sequence=None, scene_frame=None,
                   matte_material=None, depth_material=None,
-                  light_pass=False, light_direct=False, cloud_matte=False):
+                  light_pass=False, light_direct=False, cloud_matte=False,
+                  backing=False):
     seq, seq_path = _create_temp_sequence(camera_actor,
                                           scene_sequence=scene_sequence,
                                           scene_frame=scene_frame)
@@ -440,6 +448,13 @@ def _start_render(sub, camera_actor, output_dir, width, height,
                   ("ShowFlag.Atmosphere", 0), ("ShowFlag.Fog", 0),
                   ("ShowFlag.VolumetricFog", 0)]
         _log("cloud matte (alpha / atmosphere+fog off)")
+    if backing:
+        # バッキング差分は白/黒2レンダの露出一致が前提。露出適応は白板に反応して
+        # 全画面を沈める（-18%実測）ため、適応とローカル露出をジョブ内で無効化する。
+        pairs += [("r.EyeAdaptationQuality", 0),
+                  ("r.LocalExposure.HighlightContrastScale", 1.0),
+                  ("r.LocalExposure.ShadowContrastScale", 1.0)]
+        _log("backing render (exposure locked)")
     cv = cfg.find_or_add_setting_by_class(unreal.MoviePipelineConsoleVariableSetting)
     cv.set_editor_property("cvars", _cv_entries(pairs))   # レンダ後にエンジンが自動復元
     cmds = []
@@ -633,6 +648,37 @@ def _restore_cloud_matte_mode(saved):
             pass
 
 
+def _set_backing_materials(actors, white):
+    """バッキング差分レンダ用: マット板の全メッシュスロットを白(1.0)/黒板(0.18)の
+    アンリット材へ一時差替え（アクター単位の property でなく material のみ・
+    HV コンポーネントは対象外）。復元用 [(comp, slot, 元material)] を返す。"""
+    from capture_core import (get_or_create_backing_white_material,
+                              get_or_create_matteboard_material)
+    mat = (get_or_create_backing_white_material() if white
+           else get_or_create_matteboard_material())
+    saved = []
+    for a in actors or []:
+        try:
+            comps = a.get_components_by_class(unreal.MeshComponent)
+        except Exception:
+            continue
+        for comp in comps:
+            if _is_hv_comp(comp):
+                continue
+            for i in range(comp.get_num_materials()):
+                saved.append((comp, i, comp.get_material(i)))
+                comp.set_material(i, mat)
+    return saved
+
+
+def _restore_backing_materials(saved):
+    for comp, i, mat in saved or []:
+        try:
+            comp.set_material(i, mat)
+        except Exception:
+            pass
+
+
 def _set_objid_render_mode(actors):
     """ObjectID 対象に CustomDepth+ステンシル値（リスト順に 1..N）を付与する。
     main pass の表示はそのまま（オクルージョンはマテリアル側で深度一致判定）。
@@ -760,7 +806,8 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
                     fog_off=False, on_done=None,
                     light_pass=False, light_direct=False,
                     light_label="RawLightingFull",
-                    cloud_matte_actors=None):
+                    cloud_matte_actors=None,
+                    backing_actors=None, backing_white=False, use_exr=False):
     """開いている/指定の LevelSequence を MRQ でレンダリング（非同期）。
     一時シーケンスは作らず job.sequence に直接指定し、カメラはシーケンスの
     カメラカットトラックに従う。fps はシーケンスの Display Rate。
@@ -825,6 +872,9 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
     if cloud_matte_actors:
         # 分離モード固定（render_beauty 側の注記参照。holdout は UE5.7 で出力が壊れている）
         saved_cloud = _set_cloud_matte_mode(cloud_matte_actors, use_holdout=False)
+    saved_backing = None
+    if backing_actors:
+        saved_backing = _set_backing_materials(backing_actors, backing_white)
     # レンダ対象以外の auto-play プレイヤーが PIE で並走するとシーンが二重評価される
     saved_players = _suppress_autoplay_players()
     # 全ジョブで適用する。メイン/BehindPlate 間でビュー矩形が食い違うと
@@ -838,6 +888,8 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
             _restore_objid_render_mode(saved_objid)
         if saved_cloud:
             _restore_cloud_matte_mode(saved_cloud)
+        if saved_backing:
+            _restore_backing_materials(saved_backing)
         for a in hidden:
             try:
                 a.set_actor_hidden_in_game(False)
@@ -855,7 +907,8 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
                                       near_clip_cm, beauty_label, fog_off,
                                       _restore_scene, on_done,
                                       light_pass, light_direct, light_label,
-                                      cloud_matte=bool(cloud_matte_actors))
+                                      cloud_matte=bool(cloud_matte_actors),
+                                      backing=bool(backing_actors), use_exr=use_exr)
     except Exception:
         _restore_scene()
         _KEEP.clear()      # 起動失敗時に次回レンダを塞がない
@@ -869,7 +922,8 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
                            objid_material,
                            near_clip_cm, beauty_label, fog_off, restore_scene, on_done,
                            light_pass=False, light_direct=False,
-                           light_label="RawLightingFull", cloud_matte=False):
+                           light_label="RawLightingFull", cloud_matte=False,
+                           backing=False, use_exr=False):
     queue = sub.get_queue()
     for j in list(queue.get_jobs()):
         queue.delete_job(j)
@@ -904,11 +958,18 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
         cfg.find_or_add_setting_by_class(_lighting_only_class())
 
     if do_png:
-        png = cfg.find_or_add_setting_by_class(unreal.MoviePipelineImageSequenceOutput_PNG)
-        try:
-            png.set_editor_property("write_alpha", bool(cloud_matte))
-        except Exception:
-            pass
+        if use_exr:
+            # バッキング差分は線形色の減算が要るため EXR（PNG はトーンマップ後で非線形）
+            exr = cfg.find_or_add_setting_by_class(unreal.MoviePipelineImageSequenceOutput_EXR)
+            # multilayer だと {render_pass} トークンが空になり W/B ジョブが同名で
+            # 上書きし合う（実測）。分割出力で FinalImage 名を出しリネームに乗せる。
+            exr.set_editor_property("multilayer", False)
+        else:
+            png = cfg.find_or_add_setting_by_class(unreal.MoviePipelineImageSequenceOutput_PNG)
+            try:
+                png.set_editor_property("write_alpha", bool(cloud_matte))
+            except Exception:
+                pass
     if do_mp4:
         mp4 = cfg.find_or_add_setting_by_class(unreal.MoviePipelineMP4EncoderOutput)
         mp4.set_editor_property("constant_rate_factor", int(mp4_crf))
@@ -982,6 +1043,13 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
                   ("ShowFlag.Atmosphere", 0), ("ShowFlag.Fog", 0),
                   ("ShowFlag.VolumetricFog", 0)]
         _log("cloud matte (alpha / atmosphere+fog off)")
+    if backing:
+        # バッキング差分は白/黒2レンダの露出一致が前提。露出適応は白板に反応して
+        # 全画面を沈める（-18%実測）ため、適応とローカル露出をジョブ内で無効化する。
+        pairs += [("r.EyeAdaptationQuality", 0),
+                  ("r.LocalExposure.HighlightContrastScale", 1.0),
+                  ("r.LocalExposure.ShadowContrastScale", 1.0)]
+        _log("backing render (exposure locked)")
     cv = cfg.find_or_add_setting_by_class(unreal.MoviePipelineConsoleVariableSetting)
     cv.set_editor_property("cvars", _cv_entries(pairs))   # レンダ後にエンジンが自動復元
     cmds = []

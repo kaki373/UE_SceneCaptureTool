@@ -914,6 +914,55 @@ def get_or_create_matteboard_material():
     return mat
 
 
+_TMP_BACKINGWHITE_NAME = "M_UE5Cap_BackingWhite"
+
+
+def get_or_create_backing_white_material():
+    """バッキング差分レンダ用のアンリット白(1.0)マテリアル。
+    板を白/黒(0.18グレー=MatteBoardUnlit)で2回レンダした線形色の差分
+    (白−黒) は「板より手前にある内容の透過率T」に正確に比例する
+    （体積レンダは背景放射に対して線形なため）。その白側。"""
+    full = _TMP_MAT_PKG + "/" + _TMP_BACKINGWHITE_NAME
+    mat = None
+    if unreal.EditorAssetLibrary.does_asset_exist(full):
+        mat = unreal.EditorAssetLibrary.load_asset(full)
+    if mat is None:
+        at = unreal.AssetToolsHelpers.get_asset_tools()
+        mat = at.create_asset(_TMP_BACKINGWHITE_NAME, _TMP_MAT_PKG,
+                              unreal.Material, unreal.MaterialFactoryNew())
+    if mat is None:
+        raise RuntimeError("BackingWhite マテリアルの生成に失敗しました。")
+    MEL = unreal.MaterialEditingLibrary
+    mat.set_editor_property("shading_model", unreal.MaterialShadingModel.MSM_UNLIT)
+    mat.set_editor_property("two_sided", True)
+    try:
+        MEL.delete_all_material_expressions(mat)
+    except Exception:
+        pass
+    e = _mx_const(mat, 1.0, -300, 0)
+    MEL.connect_material_property(e, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+    MEL.recompile_material(mat)
+    try:
+        unreal.EditorAssetLibrary.save_loaded_asset(mat)
+    except Exception as ex:
+        _warn("BackingWhite マテリアルの保存に失敗（未保存のまま続行）: %s" % ex)
+    return mat
+
+
+def level_has_volumetrics():
+    """レベル内に HV(VDB雲) アクターがあるか（バッキング差分の自動トリガー用）。"""
+    if _HV_COMP_CLASS is None:
+        return False
+    sub = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    for a in sub.get_all_level_actors():
+        try:
+            if a.get_components_by_class(_HV_COMP_CLASS):
+                return True
+        except Exception:
+            pass
+    return False
+
+
 def set_matte_unlit(actors):
     """マット対象の全メッシュスロットをアンリット材へ差替える（受光・受影なし）。
     元マテリアルのパスはアクタータグ ue5cap_origmat|comp|slot|path に退避
@@ -1089,12 +1138,15 @@ def delete_pass_frames(output_dir, name_body, take_str, pass_names):
     return n
 
 
-def composite_mattefront_sequence(output_dir, name_body, take_str, use_cloud=False):
+def composite_mattefront_sequence(output_dir, name_body, take_str, use_cloud=False,
+                                  use_backing=False):
     """Beauty（クリーン）に Matte をアルファとして焼いた MatteBeauty 連番を書く
     （Matteの前＝マット部分が穴。選択=黒がアルファ0）。RGB はアルファ乗算済みなので
     MP4 化しても穴が黒になる。use_cloud=True なら CloudMatte 連番（PNG の α=
     雲の可視不透明度）も mask×(1-α) で統合する（板マスクが無い雲のみの場合は
-    白地から作る）。出力フレーム数を返す。"""
+    白地から作る）。use_backing=True なら BackingT 連番（16bit グレー = 板より
+    手前の透過率）を mask' = 255−(255−mask)×T で統合する（板の手前の雲・半透明が
+    遮蔽関係どおり穴を塞ぐ）。出力フレーム数を返す。"""
     if not (_HAS_NUMPY and _HAS_PIL):
         return 0
     pat = re.compile(re.escape("%s_Beauty_%s." % (name_body, take_str)) + r"(\d+)\.png$")
@@ -1118,6 +1170,15 @@ def composite_mattefront_sequence(output_dir, name_body, take_str, use_cloud=Fal
                 if matte is None:
                     matte = _np.full(ca.shape, 255.0, dtype=_np.float32)
                 matte = matte * (1.0 - ca)
+        if use_backing and matte is not None:
+            bt_p = os.path.join(output_dir,
+                                "%s_BackingT_%s.%s.png" % (name_body, take_str, fr))
+            if os.path.isfile(bt_p):
+                tim = _PILImage.open(bt_p)
+                t = _np.asarray(tim).astype(_np.float32) / (
+                    65535.0 if tim.mode in ("I;16", "I") else 255.0)
+                if t.shape == matte.shape:
+                    matte = 255.0 - (255.0 - matte) * t
         if matte is None:
             _warn("MatteBeauty 合成: フレーム %s の Matte/CloudMatte が無い" % fr)
             continue
@@ -1291,6 +1352,132 @@ def merge_cloud_alpha_into_matte(matte_path, cloud_png_path, out_path, size_wh=N
     merged = mask * (1.0 - ca)
     _write_png_u8(out_path, merged)
     _log("Matte マスクへ雲αを合成: %s" % out_path)
+    return out_path
+
+
+def _read_linear_gray(path, ffmpeg):
+    """レンダ出力を線形グレー float 配列 (0..1+) で読む。EXR は同梱 ffmpeg で
+    16bit グレー PNG に変換して読む（PIZ 圧縮対応・OpenEXR 依存を増やさない。
+    真値との相関 0.99999 を実測）。PNG(I;16/L) は直接読む。"""
+    if not (_HAS_NUMPY and _HAS_PIL):
+        return None
+    import subprocess as _subprocess
+    p = path
+    tmp = None
+    if path.lower().endswith(".exr"):
+        if not ffmpeg:
+            _warn("バッキング差分: ffmpeg が見つからず EXR を読めません")
+            return None
+        tmp = path + "._gray16.png"
+        r = _subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", path,
+                             "-pix_fmt", "gray16be", tmp],
+                            capture_output=True)
+        if r.returncode != 0 or not os.path.isfile(tmp):
+            _warn("バッキング差分: EXR 変換失敗 %s: %s" % (path, r.stderr.decode(errors="replace")[-200:]))
+            return None
+        p = tmp
+    im = _PILImage.open(p)
+    a = _np.asarray(im).astype(_np.float32)
+    a = a / (65535.0 if im.mode in ("I;16", "I") else 255.0)
+    if a.ndim == 3:
+        a = a.mean(axis=-1)
+    if tmp:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+    return a
+
+
+def _backing_t_from_arrays(w, b, scale=None):
+    """白/黒バッキングの輝度配列から透過率 T (0..1) と正規化スケールを返す。
+    scale = 素の板(遮蔽なし)の差分レベル。フレーム間で固定したい場合は指定する。"""
+    diff = w - b
+    if scale is None:
+        pos = diff[diff > max(float(diff.max()), 1e-6) * 0.05]
+        if pos.size == 0:
+            return None, None
+        scale = float(_np.percentile(pos, 99.5))
+    if scale <= 1e-6:
+        return None, None
+    return _np.clip(diff / scale, 0.0, 1.0), scale
+
+
+def backing_diff_t_png(white_path, black_path, out_path, ffmpeg=None, scale=None):
+    """白/黒バッキング2レンダの差分から「板より手前の透過率T」16bit グレー PNG を書く。
+    板の後ろの内容は不透明な板に遮られ両レンダとも写らないため、板の後ろの雲は
+    T に影響しない（=他オブジェクトと同じ前後関係の挙動）。
+    戻り値 (out_path, scale)。失敗時 (None, None)。"""
+    w = _read_linear_gray(white_path, ffmpeg)
+    b = _read_linear_gray(black_path, ffmpeg)
+    if w is None or b is None or w.shape != b.shape:
+        _warn("バッキング差分: 入力を読めません（%s / %s）" % (white_path, black_path))
+        return None, None
+    t, scale = _backing_t_from_arrays(w, b, scale)
+    if t is None:
+        _warn("バッキング差分: 素の板領域が見つからず正規化できません")
+        return None, None
+    _write_png_u16_gray(out_path, t)
+    _log("バッキング差分T: %s (scale=%.4f)" % (out_path, scale))
+    return out_path, scale
+
+
+def backing_diff_t_sequence(output_dir, name_body, take_str, start, end, ffmpeg):
+    """映像用: BackingW/BackingB の EXR 連番から %s_BackingT_%s.NNNN.png 連番を作る。
+    正規化スケールは最初のフレームで決めて全フレームに固定（フレーム間のチラつき防止）。
+    使用後の EXR は範囲外も含め全て削除する。書いたフレーム数を返す。"""
+    pat_w = re.compile(re.escape("%s_BackingW_%s." % (name_body, take_str)) + r"(\d+)\.exr$")
+    frames = {}
+    for f in os.listdir(output_dir):
+        m = pat_w.match(f)
+        if m:
+            frames[m.group(1)] = f
+    n = 0
+    scale = None
+    for fr in sorted(frames):
+        if not (int(start) <= int(fr) <= int(end)):
+            continue
+        wp = os.path.join(output_dir, frames[fr])
+        bp = os.path.join(output_dir, "%s_BackingB_%s.%s.exr" % (name_body, take_str, fr))
+        if not os.path.isfile(bp):
+            continue
+        op = os.path.join(output_dir, "%s_BackingT_%s.%s.png" % (name_body, take_str, fr))
+        r, scale = backing_diff_t_png(wp, bp, op, ffmpeg=ffmpeg, scale=scale)
+        if r:
+            n += 1
+    for f in os.listdir(output_dir):
+        if ("_BackingW_" in f or "_BackingB_" in f) and f.endswith(".exr") \
+                and f.startswith(name_body):
+            try:
+                os.remove(os.path.join(output_dir, f))
+            except Exception:
+                pass
+    _log("バッキング差分T: %d フレーム出力" % n)
+    return n
+
+
+def merge_backing_t_into_matte(matte_path, t_png, out_path):
+    """Matte マスク（選択=黒/周囲=白）へバッキング差分の透過率Tを統合する。
+    mask' = 255 − (255−mask) × T ＝「板の穴は、手前の内容(雲・半透明)の透過率の分
+    だけしか開かない」。板領域外は mask=255 なので T の値に関わらず不変
+    （領域判定が不要になるのがこの式の要点）。出力パスを返す。"""
+    if not (_HAS_NUMPY and _HAS_PIL):
+        return None
+    if not (matte_path and os.path.isfile(matte_path)):
+        _warn("merge_backing_t: 板の Matte マスクがありません: %s" % matte_path)
+        return None
+    if not (t_png and os.path.isfile(t_png)):
+        _warn("merge_backing_t: T 画像がありません: %s" % t_png)
+        return None
+    mask = _np.asarray(_PILImage.open(matte_path).convert("L"), dtype=_np.float32)
+    tim = _PILImage.open(t_png)
+    t = _np.asarray(tim).astype(_np.float32) / (65535.0 if tim.mode in ("I;16", "I") else 255.0)
+    if t.shape != mask.shape:
+        _warn("merge_backing_t: 解像度不一致 %s vs %s" % (t.shape, mask.shape))
+        return None
+    merged = 255.0 - (255.0 - mask) * t
+    _write_png_u8(out_path, merged)
+    _log("Matte マスクへバッキングTを合成: %s" % out_path)
     return out_path
 
 
