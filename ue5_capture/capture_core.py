@@ -920,10 +920,12 @@ _TMP_BACKINGWHITE_NAME = "M_UE5Cap_BackingWhite"
 
 
 def get_or_create_backing_white_material():
-    """バッキング差分レンダ用のアンリット白(1.0)マテリアル。
-    板を白/黒(MatteBoardUnlit)で2回レンダした線形色の差分
-    (白−黒) は「板より手前にある内容の透過率T」に正確に比例する
-    （体積レンダは背景放射に対して線形なため）。その白側。"""
+    """バッキングレンダ用のアンリット白(発光100)マテリアル。
+    板をこの材で1回レンダした線形色 W = 手前の内容の発光C + 透過率T×100 で、
+    C は通常のシーン輝度（〜1程度）なので C/100 ≤ 1% となり無視できる
+    → T ≈ W/素板レベル。黒板との2レンダ差分は不要（レンダ1本で済む）。
+    発光100はブルーム/スクリーントレースを撒くため、バッキングジョブは
+    それらをジョブ内 cvar で切る（capture_mrq 側）。"""
     full = _TMP_MAT_PKG + "/" + _TMP_BACKINGWHITE_NAME
     mat = None
     if unreal.EditorAssetLibrary.does_asset_exist(full):
@@ -942,7 +944,7 @@ def get_or_create_backing_white_material():
         MEL.delete_all_material_expressions(mat)
     except Exception:
         pass
-    e = _mx_const(mat, 1.0, -300, 0)
+    e = _mx_const(mat, 100.0, -300, 0)
     MEL.connect_material_property(e, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
     MEL.recompile_material(mat)
     try:
@@ -1429,9 +1431,10 @@ def merge_cloud_alpha_into_matte(matte_path, cloud_png_path, out_path, size_wh=N
 
 
 def _read_linear_gray(path, ffmpeg):
-    """レンダ出力を線形グレー float 配列 (0..1+) で読む。EXR は同梱 ffmpeg で
-    16bit グレー PNG に変換して読む（PIZ 圧縮対応・OpenEXR 依存を増やさない。
-    真値との相関 0.99999 を実測）。PNG(I;16/L) は直接読む。"""
+    """レンダ出力を線形 float 配列で読む。EXR は同梱 ffmpeg で G チャンネルを
+    そのまま PFM(float32) に抜いて読む（extractplanes＝色変換なし・クリップなしの
+    ビット一致を実測。PIZ 圧縮対応・OpenEXR 依存を増やさない）。
+    PNG(I;16/L) は直接読む。"""
     if not (_HAS_NUMPY and _HAS_PIL):
         return None
     import subprocess as _subprocess
@@ -1439,21 +1442,24 @@ def _read_linear_gray(path, ffmpeg):
     tmp = None
     if path.lower().endswith(".exr"):
         if not ffmpeg:
-            _warn("バッキング差分: ffmpeg が見つからず EXR を読めません")
+            _warn("バッキング: ffmpeg が見つからず EXR を読めません")
             return None
-        tmp = path + "._gray16.png"
+        tmp = path + "._g.pfm"
         # creationflags: コンソールウインドウを出さない（フレーム毎の起動で
         # ウインドウが連続開閉してエディタの UI 操作を奪う・ユーザー報告）
         r = _subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", path,
-                             "-pix_fmt", "gray16be", tmp],
+                             "-vf", "format=gbrpf32le,extractplanes=g", tmp],
                             capture_output=True, creationflags=0x08000000)
         if r.returncode != 0 or not os.path.isfile(tmp):
-            _warn("バッキング差分: EXR 変換失敗 %s: %s" % (path, r.stderr.decode(errors="replace")[-200:]))
+            _warn("バッキング: EXR 変換失敗 %s: %s" % (path, r.stderr.decode(errors="replace")[-200:]))
             return None
         p = tmp
     im = _PILImage.open(p)
     a = _np.asarray(im).astype(_np.float32)
-    a = a / (65535.0 if im.mode in ("I;16", "I") else 255.0)
+    if im.mode in ("I;16", "I"):
+        a = a / 65535.0
+    elif im.mode != "F":
+        a = a / 255.0
     if a.ndim == 3:
         a = a.mean(axis=-1)
     if tmp:
@@ -1464,41 +1470,40 @@ def _read_linear_gray(path, ffmpeg):
     return a
 
 
-def _backing_t_from_arrays(w, b, scale=None):
-    """白/黒バッキングの輝度配列から透過率 T (0..1) と正規化スケールを返す。
-    scale = 素の板(遮蔽なし)の差分レベル。フレーム間で固定したい場合は指定する。"""
-    diff = w - b
+def _backing_t_from_array(w, scale=None):
+    """白バッキング1レンダの輝度配列から透過率 T (0..1) と正規化スケールを返す。
+    scale = 素の板(遮蔽なし)の輝度レベル。フレーム間で固定したい場合は指定する。"""
     if scale is None:
-        pos = diff[diff > max(float(diff.max()), 1e-6) * 0.05]
+        pos = w[w > max(float(w.max()), 1e-6) * 0.05]
         if pos.size == 0:
             return None, None
         scale = float(_np.percentile(pos, 99.5))
     if scale <= 1e-6:
         return None, None
-    return _np.clip(diff / scale, 0.0, 1.0), scale
+    return _np.clip(w / scale, 0.0, 1.0), scale
 
 
-def backing_diff_t_png(white_path, black_path, out_path, ffmpeg=None, scale=None):
-    """白/黒バッキング2レンダの差分から「板より手前の透過率T」16bit グレー PNG を書く。
-    板の後ろの内容は不透明な板に遮られ両レンダとも写らないため、板の後ろの雲は
-    T に影響しない（=他オブジェクトと同じ前後関係の挙動）。
+def backing_t_png(white_path, out_path, ffmpeg=None, scale=None):
+    """白(発光100)バッキング1レンダから「板より手前の透過率T」16bit グレー PNG を書く。
+    W = 手前の発光C + T×100×露出 で C/100 は無視できるため T ≈ W/素板レベル。
+    板の後ろの内容は不透明な板に遮られて写らないため、板の後ろの雲は T に
+    影響しない（=他オブジェクトと同じ前後関係の挙動）。
     戻り値 (out_path, scale)。失敗時 (None, None)。"""
     w = _read_linear_gray(white_path, ffmpeg)
-    b = _read_linear_gray(black_path, ffmpeg)
-    if w is None or b is None or w.shape != b.shape:
-        _warn("バッキング差分: 入力を読めません（%s / %s）" % (white_path, black_path))
+    if w is None:
+        _warn("バッキング: 入力を読めません（%s）" % white_path)
         return None, None
-    t, scale = _backing_t_from_arrays(w, b, scale)
+    t, scale = _backing_t_from_array(w, scale)
     if t is None:
-        _warn("バッキング差分: 素の板領域が見つからず正規化できません")
+        _warn("バッキング: 素の板領域が見つからず正規化できません")
         return None, None
     _write_png_u16_gray(out_path, t)
-    _log("バッキング差分T: %s (scale=%.4f)" % (out_path, scale))
+    _log("バッキングT: %s (scale=%.4f)" % (out_path, scale))
     return out_path, scale
 
 
-def backing_diff_t_sequence(output_dir, name_body, take_str, start, end, ffmpeg):
-    """映像用: BackingW/BackingB の EXR 連番から %s_BackingT_%s.NNNN.png 連番を作る。
+def backing_t_sequence(output_dir, name_body, take_str, start, end, ffmpeg):
+    """映像用: BackingW の EXR 連番から %s_BackingT_%s.NNNN.png 連番を作る。
     正規化スケールは最初のフレームで決めて全フレームに固定（フレーム間のチラつき防止）。
     使用後の EXR は範囲外も含め全て削除する。書いたフレーム数を返す。"""
     pat_w = re.compile(re.escape("%s_BackingW_%s." % (name_body, take_str)) + r"(\d+)\.exr$")
@@ -1513,21 +1518,17 @@ def backing_diff_t_sequence(output_dir, name_body, take_str, start, end, ffmpeg)
         if not (int(start) <= int(fr) <= int(end)):
             continue
         wp = os.path.join(output_dir, frames[fr])
-        bp = os.path.join(output_dir, "%s_BackingB_%s.%s.exr" % (name_body, take_str, fr))
-        if not os.path.isfile(bp):
-            continue
         op = os.path.join(output_dir, "%s_BackingT_%s.%s.png" % (name_body, take_str, fr))
-        r, scale = backing_diff_t_png(wp, bp, op, ffmpeg=ffmpeg, scale=scale)
+        r, scale = backing_t_png(wp, op, ffmpeg=ffmpeg, scale=scale)
         if r:
             n += 1
     for f in os.listdir(output_dir):
-        if ("_BackingW_" in f or "_BackingB_" in f) and f.endswith(".exr") \
-                and f.startswith(name_body):
+        if "_BackingW_" in f and f.endswith(".exr") and f.startswith(name_body):
             try:
                 os.remove(os.path.join(output_dir, f))
             except Exception:
                 pass
-    _log("バッキング差分T: %d フレーム出力" % n)
+    _log("バッキングT: %d フレーム出力" % n)
     return n
 
 

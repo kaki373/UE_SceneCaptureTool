@@ -449,12 +449,23 @@ def _start_render(sub, camera_actor, output_dir, width, height,
                   ("ShowFlag.VolumetricFog", 0)]
         _log("cloud matte (alpha / atmosphere+fog off)")
     if backing:
-        # バッキング差分は白/黒2レンダの露出一致が前提。露出適応は白板に反応して
-        # 全画面を沈める（-18%実測）ため、適応とローカル露出をジョブ内で無効化する。
+        # 露出適応は白板に反応して画面全体を沈める（-18%実測）ため、適応と
+        # ローカル露出をジョブ内で無効化。白板は発光100なのでブルームと
+        # Lumen スクリーントレースの撒き散らしも切る（×100で無視できなくなる）。
         pairs += [("r.EyeAdaptationQuality", 0),
                   ("r.LocalExposure.HighlightContrastScale", 1.0),
-                  ("r.LocalExposure.ShadowContrastScale", 1.0)]
-        _log("backing render (exposure locked)")
+                  ("r.LocalExposure.ShadowContrastScale", 1.0),
+                  ("r.BloomQuality", 0),
+                  ("r.Lumen.ScreenProbeGather.ScreenTraces", 0),
+                  ("r.Lumen.Reflections.ScreenTraces", 0)]
+        # 既定の EXR はトーンカーブ適用済み（発光100が~1.0に圧縮される実測）。
+        # T=W/素板レベル の線形性が前提なのでトーンカーブを切ってシーンリニアで書く。
+        try:
+            col = cfg.find_or_add_setting_by_class(unreal.MoviePipelineColorSetting)
+            col.set_editor_property("disable_tone_curve", True)
+        except Exception as e:
+            _warn("backing: トーンカーブ無効化に失敗（Tが非線形になる）: %s" % e)
+        _log("backing render (exposure locked / bloom+screen traces off / linear)")
     cv = cfg.find_or_add_setting_by_class(unreal.MoviePipelineConsoleVariableSetting)
     cv.set_editor_property("cvars", _cv_entries(pairs))   # レンダ後にエンジンが自動復元
     cmds = []
@@ -1049,12 +1060,23 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
                   ("ShowFlag.VolumetricFog", 0)]
         _log("cloud matte (alpha / atmosphere+fog off)")
     if backing:
-        # バッキング差分は白/黒2レンダの露出一致が前提。露出適応は白板に反応して
-        # 全画面を沈める（-18%実測）ため、適応とローカル露出をジョブ内で無効化する。
+        # 露出適応は白板に反応して画面全体を沈める（-18%実測）ため、適応と
+        # ローカル露出をジョブ内で無効化。白板は発光100なのでブルームと
+        # Lumen スクリーントレースの撒き散らしも切る（×100で無視できなくなる）。
         pairs += [("r.EyeAdaptationQuality", 0),
                   ("r.LocalExposure.HighlightContrastScale", 1.0),
-                  ("r.LocalExposure.ShadowContrastScale", 1.0)]
-        _log("backing render (exposure locked)")
+                  ("r.LocalExposure.ShadowContrastScale", 1.0),
+                  ("r.BloomQuality", 0),
+                  ("r.Lumen.ScreenProbeGather.ScreenTraces", 0),
+                  ("r.Lumen.Reflections.ScreenTraces", 0)]
+        # 既定の EXR はトーンカーブ適用済み（発光100が~1.0に圧縮される実測）。
+        # T=W/素板レベル の線形性が前提なのでトーンカーブを切ってシーンリニアで書く。
+        try:
+            col = cfg.find_or_add_setting_by_class(unreal.MoviePipelineColorSetting)
+            col.set_editor_property("disable_tone_curve", True)
+        except Exception as e:
+            _warn("backing: トーンカーブ無効化に失敗（Tが非線形になる）: %s" % e)
+        _log("backing render (exposure locked / bloom+screen traces off / linear)")
     cv = cfg.find_or_add_setting_by_class(unreal.MoviePipelineConsoleVariableSetting)
     cv.set_editor_property("cvars", _cv_entries(pairs))   # レンダ後にエンジンが自動復元
     cmds = []

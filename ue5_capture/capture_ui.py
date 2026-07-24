@@ -760,8 +760,6 @@ class CaptureWindow(object):
         if use_backing:
             jobs.append(dict(base=_name("BackingW"), backing=matte_prims,
                              backing_white=True, fmt="exr", cloud_kind="backing_w"))
-            jobs.append(dict(base=_name("BackingB"), backing=matte_prims,
-                             backing_white=False, fmt="exr", cloud_kind="backing_b"))
             if matte_vols:
                 skip_notes.append("雲マット: 板の手前の雲は自動反映（雲の対象指定は不要）")
         elif want_mfront and matte_vols:
@@ -845,7 +843,6 @@ class CaptureWindow(object):
                         (os.path.join(out, _name("Beauty") + "_Matte.png"), False),
                         (os.path.join(out, _name("CloudMatte") + ".png"), False),
                         (os.path.join(out, _name("BackingW") + ".exr"), False),
-                        (os.path.join(out, _name("BackingB") + ".exr"), False),
                         (os.path.join(out, _name("Beauty") + "_BackingT.png"), False),
                         (beauty_path, keep_beauty)]
             removals += [(cp, False) for _lbl, cp in objid_cloud_entries]
@@ -870,17 +867,14 @@ class CaptureWindow(object):
 
             def _jdone(ok, od, _j=j):
                 nonlocal cloud_matte_path
-                # バッキング差分ジョブ: 白/黒が揃ったら T を計算して合成へ
-                if _j.get("cloud_kind") in ("backing_w", "backing_b"):
+                # バッキングジョブ: 白1レンダから T を計算して合成へ
+                if _j.get("cloud_kind") == "backing_w":
                     bp = os.path.join(out, _j["base"] + ".exr")
-                    if ok and os.path.isfile(bp):
-                        backing["w" if _j["cloud_kind"] == "backing_w" else "b"] = bp
-                    else:
+                    if not ok or not os.path.isfile(bp):
                         skip_notes.append("雲マット: バッキングレンダ失敗 (%s)" % _j["base"])
-                    if "w" in backing and "b" in backing:
-                        t_png, _sc = core.backing_diff_t_png(
-                            backing["w"], backing["b"],
-                            os.path.join(out, _name("Beauty") + "_BackingT.png"),
+                    else:
+                        t_png, _sc = core.backing_t_png(
+                            bp, os.path.join(out, _name("Beauty") + "_BackingT.png"),
                             ffmpeg=core.find_ffmpeg(getattr(self, "_ffmpeg_hint", None)))
                         if t_png:
                             backing["t"] = t_png
@@ -890,7 +884,7 @@ class CaptureWindow(object):
                                 except Exception as e:
                                     self.status_var.set("雲マット合成エラー: %s" % e)
                         else:
-                            skip_notes.append("雲マット: バッキング差分の計算に失敗")
+                            skip_notes.append("雲マット: バッキングTの計算に失敗")
                 # CloudMatte / 雲ObjectID ジョブ: αを回収して合成へ
                 elif _j.get("cloud_kind"):
                     cp = os.path.join(out, _j["base"] + ".png")
@@ -1336,12 +1330,12 @@ class CaptureWindow(object):
                 core.trim_sequence_frames(out, name_body, take_str,
                                           trim_list, cs_eff, ce_eff)
                 if backing_seq["run"]:
-                    nb = core.backing_diff_t_sequence(
+                    nb = core.backing_t_sequence(
                         out, name_body, take_str, cs_eff, ce_eff,
                         core.find_ffmpeg(getattr(self, "_ffmpeg_hint", None)))
                     backing_seq["run"] = nb > 0
                     if nb <= 0:
-                        seq_notes.append("雲マット: バッキング差分の計算に失敗")
+                        seq_notes.append("雲マット: バッキングTの計算に失敗")
                 if _need("mfront"):
                     core.composite_mattefront_sequence(out, name_body, take_str,
                                                        use_cloud=cloud_seq["run"],
@@ -1437,8 +1431,8 @@ class CaptureWindow(object):
                 _run_backing_w(True, od)
 
         def _run_backing_w(ok, od):
-            """バッキング差分の白レンダ（板=白・露出固定・EXR・TS=1・何も隠さない）。
-            白/黒の線形色差分が「板より手前の内容の透過率T」になる。"""
+            """バッキングレンダ（板=白発光100・露出固定・EXR・TS=1・何も隠さない）。
+            線形色 W ≈ 透過率T×素板レベル（手前の発光は 1/100 で無視できる）。"""
             if not (ok and backing_seq["run"]):
                 _finish_outputs(ok, od)
                 return
@@ -1446,12 +1440,10 @@ class CaptureWindow(object):
             def _bw_done(bok, bod):
                 if not bok:
                     backing_seq["run"] = False
-                    seq_notes.append("雲マット: バッキング(白)レンダ失敗")
-                    _finish_outputs(True, od)
-                else:
-                    _run_backing_b(od)
+                    seq_notes.append("雲マット: バッキングレンダ失敗")
+                _finish_outputs(True, od)
 
-            self.status_var.set("バッキング差分(白)をレンダ中…")
+            self.status_var.set("バッキング(白)をレンダ中…")
             self.root.update()
             try:
                 capture_mrq.render_sequence(
@@ -1464,31 +1456,7 @@ class CaptureWindow(object):
                     fog_off=self.seq_fog_var.get(), on_done=_bw_done)
             except Exception as e:
                 backing_seq["run"] = False
-                seq_notes.append("雲マット: バッキング(白)起動失敗")
-                self.status_var.set("バッキング起動失敗: %s" % e)
-                _finish_outputs(True, od)
-
-        def _run_backing_b(od):
-            def _bb_done(bok, bod):
-                if not bok:
-                    backing_seq["run"] = False
-                    seq_notes.append("雲マット: バッキング(黒)レンダ失敗")
-                _finish_outputs(True, od)
-
-            self.status_var.set("バッキング差分(黒)をレンダ中…")
-            self.root.update()
-            try:
-                capture_mrq.render_sequence(
-                    seq, out, W, H, name_body, take_str,
-                    do_png=True, do_mp4=False,
-                    temporal_samples=1, warmup=warm,
-                    custom_start=cs, custom_end=ce,
-                    backing_actors=matte_prims, backing_white=False,
-                    use_exr=True, beauty_label="BackingB",
-                    fog_off=self.seq_fog_var.get(), on_done=_bb_done)
-            except Exception as e:
-                backing_seq["run"] = False
-                seq_notes.append("雲マット: バッキング(黒)起動失敗")
+                seq_notes.append("雲マット: バッキング起動失敗")
                 self.status_var.set("バッキング起動失敗: %s" % e)
                 _finish_outputs(True, od)
                 _finish_outputs(True, od)
