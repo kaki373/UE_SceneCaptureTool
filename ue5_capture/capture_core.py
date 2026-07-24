@@ -886,8 +886,10 @@ _MATTE_ORIGMAT_TAG = "ue5cap_origmat"
 
 
 def get_or_create_matteboard_material():
-    """マット板用のアンリット単色マテリアル（ライティング・影を一切受けない）。
-    板の見た目を撮影素材に使わない前提のニュートラル表示用。"""
+    """マット板用のアンリット純黒マテリアル（ライティング・影を一切受けない）。
+    黒＝放射ゼロなので Lumen スクリーントレース/反射経由で周囲のオブジェクトに
+    色が被らない（旧 0.18 グレーはビューポートで茶色く見え色被りも起きた）。
+    バッキング差分の黒側も 0 になり数学が単純化する。"""
     full = _TMP_MAT_PKG + "/" + _TMP_MATTEBOARD_NAME
     mat = None
     if unreal.EditorAssetLibrary.does_asset_exist(full):
@@ -904,7 +906,7 @@ def get_or_create_matteboard_material():
         MEL.delete_all_material_expressions(mat)
     except Exception:
         pass
-    e = _mx_const(mat, 0.18, -300, 0)   # 50%グレー相当（リニア）
+    e = _mx_const(mat, 0.0, -300, 0)    # 純黒（放射ゼロ）
     MEL.connect_material_property(e, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
     MEL.recompile_material(mat)
     try:
@@ -919,13 +921,14 @@ _TMP_BACKINGWHITE_NAME = "M_UE5Cap_BackingWhite"
 
 def get_or_create_backing_white_material():
     """バッキング差分レンダ用のアンリット白(1.0)マテリアル。
-    板を白/黒(0.18グレー=MatteBoardUnlit)で2回レンダした線形色の差分
+    板を白/黒(MatteBoardUnlit)で2回レンダした線形色の差分
     (白−黒) は「板より手前にある内容の透過率T」に正確に比例する
     （体積レンダは背景放射に対して線形なため）。その白側。"""
     full = _TMP_MAT_PKG + "/" + _TMP_BACKINGWHITE_NAME
     mat = None
     if unreal.EditorAssetLibrary.does_asset_exist(full):
         mat = unreal.EditorAssetLibrary.load_asset(full)
+    # 白側は板と違い常設表示されない（バッキングレンダ中のみ差し替え）ため発光1.0のまま
     if mat is None:
         at = unreal.AssetToolsHelpers.get_asset_tools()
         mat = at.create_asset(_TMP_BACKINGWHITE_NAME, _TMP_MAT_PKG,
@@ -1246,6 +1249,30 @@ def matte_near_clip_cm(actors, cam):
     to = unreal.Vector(base.x - cam_loc.x, base.y - cam_loc.y, base.z - cam_loc.z)
     dist = to.x * fwd.x + to.y * fwd.y + to.z * fwd.z
     return max(1.0, float(dist))
+
+
+def volumetrics_nearer_than(dist_cm, cam):
+    """カメラ視線方向の深度が dist_cm より手前にある HV(VDB雲) アクターを返す。
+    HV は r.SetNearClipPlane の描画クリップを無視して写り込む（実測 2026-07-24）
+    ため、Matteの奥のプレートでは手前の雲をアクター単位で隠す必要がある。"""
+    if _HV_COMP_CLASS is None:
+        return []
+    cam_loc = cam["transform"].translation
+    fwd = cam["transform"].rotation.rotator().get_forward_vector()
+    sub = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    out = []
+    for a in sub.get_all_level_actors():
+        try:
+            if not a.get_components_by_class(_HV_COMP_CLASS):
+                continue
+        except Exception:
+            continue
+        loc = a.get_actor_location()
+        d = ((loc.x - cam_loc.x) * fwd.x + (loc.y - cam_loc.y) * fwd.y
+             + (loc.z - cam_loc.z) * fwd.z)
+        if d < float(dist_cm):
+            out.append(a)
+    return out
 
 
 def capture_behind_matte(world, settings, cam, w, h, ts, spawned):

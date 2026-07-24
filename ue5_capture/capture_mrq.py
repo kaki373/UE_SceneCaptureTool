@@ -649,8 +649,8 @@ def _restore_cloud_matte_mode(saved):
 
 
 def _set_backing_materials(actors, white):
-    """バッキング差分レンダ用: マット板の全メッシュスロットを白(1.0)/黒板(0.18)の
-    アンリット材へ一時差替え（アクター単位の property でなく material のみ・
+    """バッキング差分レンダ用: マット板の全メッシュスロットを白(1.0)/黒(板の常用
+    アンリット材)へ一時差替え（アクター単位の property でなく material のみ・
     HV コンポーネントは対象外）。復元用 [(comp, slot, 元material)] を返す。"""
     from capture_core import (get_or_create_backing_white_material,
                               get_or_create_matteboard_material)

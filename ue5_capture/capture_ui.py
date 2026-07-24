@@ -771,8 +771,13 @@ class CaptureWindow(object):
             mt = core._resolve_target_actors(None, self._pick_targets_resolved(self.matte_pick) or None)
             mt_p, mt_v = core.split_volumetric_targets(mt)
             if mt_p:
-                nc = core.matte_near_clip_cm(mt_p, core.get_camera_settings(cam))
-                jobs.append(dict(hidden=mt_p, base=_name("BehindPlate"),
+                cs_cam = core.get_camera_settings(cam)
+                nc = core.matte_near_clip_cm(mt_p, cs_cam)
+                # HV(雲)は near-clip の描画クリップを無視して写り込むため、
+                # 板より手前の雲はアクター単位で隠す（板の後ろの雲は窓の中身として残す）
+                front_vols = core.volumetrics_nearer_than(nc, cs_cam)
+                jobs.append(dict(hidden=list(mt_p) + front_vols,
+                                 base=_name("BehindPlate"),
                                  near_clip=nc, composite=True, matte=mt_p))
                 if mt_v:
                     skip_notes.append("Matteの奥: 雲対象はシルエット非対応（板のみで合成）")
@@ -1522,8 +1527,10 @@ class CaptureWindow(object):
                 cam_actor = self._sequence_camera_at(seq, cs_eff)
                 if cam_actor is None:
                     raise RuntimeError("シーケンスカメラを特定できません")
-                nc = core.matte_near_clip_cm(
-                    matte_prims, {"transform": cam_actor.get_actor_transform()})
+                cs_cam = {"transform": cam_actor.get_actor_transform()}
+                nc = core.matte_near_clip_cm(matte_prims, cs_cam)
+                # HV(雲)は near-clip を無視して写り込むため手前の雲はアクター単位で隠す
+                front_vols = core.volumetrics_nearer_than(nc, cs_cam)
             except Exception as e:
                 self.status_var.set("Matteの奥: near-clip 計算失敗: %s" % e)
                 _final(False, od)
@@ -1536,7 +1543,7 @@ class CaptureWindow(object):
                     do_png=True, do_mp4=False,
                     temporal_samples=ts, warmup=warm,
                     custom_start=cs, custom_end=ce,
-                    hidden_actors=matte_actors, near_clip_cm=nc,
+                    hidden_actors=list(matte_actors) + front_vols, near_clip_cm=nc,
                     beauty_label="BehindPlate",
                     fog_off=self.seq_fog_var.get(), on_done=_run_direct)
             except Exception as e:
