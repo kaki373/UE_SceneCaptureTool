@@ -738,8 +738,9 @@ def _restore_objid_render_mode(saved):
 
 def _camera_cut_camera_actors(level_sequence, world):
     """カメラカットに束縛されたカメラアクターを全セクションから解決して返す
-    （CineCameraActor / 素の CameraActor の両方。スポーナブルはエディタワールドに
-    実体が無く解決できない＝既知の限界）。"""
+    （CineCameraActor / 素の CameraActor の両方。スポーナブルは Sequencer が
+    プレビュー用にスポーンした実体がワールドに居ても locate_bound_objects では
+    解決できない＝既知の限界。呼び出し側でワールド走査にフォールバックする）。"""
     ext = unreal.MovieSceneSequenceExtensions
     actors = []
     guids = []

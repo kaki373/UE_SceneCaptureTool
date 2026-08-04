@@ -147,12 +147,22 @@ def _actor_subsystem():
 
 
 def list_cameras():
-    """シーン内の CameraActor / CineCameraActor を返す。"""
-    actors = _actor_subsystem().get_all_level_actors()
+    """シーン内の CameraActor / CineCameraActor を返す。
+    get_all_level_actors() はトランジェント／アウトライナ非表示のアクターを除外するため、
+    Sequencer がプレビュー用にスポーンしたスポーナブルカメラが漏れる。ワールドを直接
+    走査する GameplayStatics の結果をマージして拾う（CineCameraActor は CameraActor の
+    派生なので CameraActor だけで両方取れる）。"""
     cams = []
-    for a in actors:
+    seen = set()
+    for a in _actor_subsystem().get_all_level_actors():
         if isinstance(a, (unreal.CameraActor, unreal.CineCameraActor)):
             cams.append(a)
+            seen.add(a.get_path_name())
+    for a in unreal.GameplayStatics.get_all_actors_of_class(
+            _get_editor_world(), unreal.CameraActor):
+        if a.get_path_name() not in seen:
+            cams.append(a)
+            seen.add(a.get_path_name())
     return cams
 
 

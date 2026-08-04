@@ -1126,6 +1126,10 @@ class CaptureWindow(object):
         try:
             import capture_mrq
             cams = capture_mrq._camera_cut_camera_actors(seq, core._get_editor_world())
+            if not cams:
+                # スポーナブルはカメラカットから解決できないので、ワールド上の
+                # カメラ（list_cameras 側でスポーナブルも拾っている）で代替する。
+                cams = core.list_cameras()
             if cams:
                 return core.get_camera_settings(cams[0]).get("aspect_ratio", 0.0)
         except Exception:
