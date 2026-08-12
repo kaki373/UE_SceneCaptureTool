@@ -54,7 +54,7 @@ PNG / EXR で書き出す。映像タブは Sequencer で開いている LevelSe
 | tkinter (tcl/tk) | GUI を使う場合。無ければ CUI へ自動フォールバック | 任意 |
 | **ffmpeg** | 映像タブの MP4 エンコード | MP4 を使う場合（imageio_ffmpeg 同梱バイナリ / PATH を自動検出。設定 JSON の `ffmpeg_path` で明示可） |
 
-UE 同梱 Python へのインストール例:
+これらは `Install.bat` が自動で入れる（[インストール](#インストール)）。手で入れる場合の例:
 
 ```bat
 "<UE_5.7>/Engine/Binaries/ThirdParty/Python3/Win64/python.exe" -m pip install numpy pillow
@@ -80,16 +80,73 @@ subprocess.check_call([sys.executable, "-m", "pip", "install", "numpy", "pillow"
 
 ---
 
+## インストール
+
+UE 5.7 が入っていれば、**`Install.bat` をダブルクリックするだけ**でよい。
+リポジトリを置いた場所（ローカルでも共有ドライブでも可）で実行する。
+
+```
+Install.bat                          # 対話（プロジェクトは一覧から選ぶ）
+Install.bat "X:\Path\Foo.uproject"   # .uproject をドラッグ＆ドロップしてもよい
+Install.bat --yes --no-pause         # 無人実行（プロジェクト設定はスキップ）
+Install.bat "D:\Unreal\UE_5.7"       # エンジンを明示指定
+```
+
+Install.bat が行うこと:
+
+1. **UE 5.7 を検出**（レジストリ / Epic ランチャーの `LauncherInstalled.dat` /
+   よくあるインストール先を順に探す。見つからなければ手入力）
+2. **同梱 Python にライブラリを導入** — numpy / Pillow（必須）、
+   imageio（Depth の EXR 出力）、imageio-ffmpeg（MP4 用 ffmpeg）。
+   すでに入っているものは飛ばす。エンジンフォルダに書き込めない場合は
+   `Documents\UnrealEngine\Python\ue5_capture_libs` に入れて `sys.path` に追加する
+3. **起動スクリプトを設置** — `Documents\UnrealEngine\Python\` に
+   `ue5_capture_bootstrap.py` を置き、`init_unreal.py` に import 行を追記する。
+   このフォルダは UE が全プロジェクトで自動実行するので、**プロジェクト毎の
+   Startup Scripts 登録は不要**になる（既存の `init_unreal.py` があれば
+   マーカーで囲んだ自分のブロックだけを差し替えるので、他ツールの記述は残る）
+4. **プロジェクトのプラグインを有効化** — `.uproject` に
+   `PythonScriptPlugin` と `MovieRenderPipeline` を追記する（どちらも
+   既定では無効。SequencerScripting / LevelSequenceEditor は
+   MovieRenderPipeline の依存として自動で有効になるため追記しない）。
+   書き換え前に `<名前>.uproject.bak` を作る
+
+途中の工程が失敗しても残りは続行し、最後に工程ごとの結果表と終了コードを表示する。
+**終了コードがどの工程で止まったかを表す**（バッチはこの値をそのまま返すので、
+配布スクリプトから呼んだときも判定できる）:
+
+| コード | 意味 |
+|---|---|
+| 0 | 成功 |
+| 10 | `ue5_capture` フォルダが Install.bat の隣に無い（展開ミス） |
+| 20 | Unreal Engine を特定できない（引数でエンジンのパスを渡す） |
+| 30 | 必須 Python ライブラリの導入に失敗（ネットワーク / プロキシ） |
+| 40 | 起動スクリプトを書けない（Documents への書き込み権限） |
+| 50 | 選んだ `.uproject` を更新できない（読み取り専用 / SVN ロック） |
+| 90 | 想定外のエラー |
+| 130 | Ctrl-C で中断 |
+
+実行後、**エディタを再起動**すればメニューバーの **SceneCapture** と
+ツールバー右端の **SceneCapture** ボタンが出る。ツール本体はコピーせず
+このリポジトリを直接読むので、`git pull` した内容がそのまま反映される。
+
+アンインストールは `Documents\UnrealEngine\Python\ue5_capture_bootstrap.py` の削除と、
+`init_unreal.py` 内の `# >>> UE Scene Capture Tool ... <<<` ブロックの削除だけ。
+
+---
+
 ## 使い方
 
 ### メニュー / ツールバーから起動（推奨）
 
-導入は ue2max と同じ方式（プロジェクト毎に1回）:
+`Install.bat` を実行済みならエディタ再起動だけでメニューバーに **SceneCapture**
+メニューと、ツールバー右端に **SceneCapture** ボタンが出る。
+
+インストーラを使わず手動で入れる場合（ue2max と同じ方式・プロジェクト毎に1回）:
 
 1. `Project Settings > Plugins > Python > Startup Scripts` の「+Add」に
    `D:/webui/ClaudeCode/UE_capture/ue5_capture/capture_menu.py` を追加
-2. エディタを再起動 → メニューバーに **SceneCapture** メニューと、
-   ツールバー右端に **SceneCapture** ボタンが出る
+2. エディタを再起動
 
 メニューは `Panel...`（ツールを開く）/ `Open Output Folder` / `Settings...` の3項目。
 起動時にモジュールを reload するので、コード修正後もメニュー/ボタンから開くだけで
@@ -116,6 +173,7 @@ GUI が開く。画像タブでカメラ / 解像度 / AA / 出力先 / 各パ�
 
 ```
 UE_SceneCaptureTool/
+├── Install.bat                  # インストーラ（エンジン検出・pip・起動スクリプト・プラグイン有効化）
 ├── README.md                    # 本ファイル
 ├── ue5_capture_tool_prompt.md   # 設計プロンプト / 仕様（画像キャプチャ）
 ├── ue5_capture_sequence_spec.md # シーケンスレンダ（映像タブ）仕様
