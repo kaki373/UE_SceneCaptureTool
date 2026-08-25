@@ -1817,6 +1817,39 @@ def _mx_get_or_create_pp_material(name):
     return mat
 
 
+_TMP_NORMAL_NAME = "M_UE5Cap_Normal"
+
+
+def delete_temp_normal_material():
+    _delete_temp_material(_TMP_NORMAL_NAME, "Normal")
+
+
+def create_temp_normal_material():
+    """ワールド法線を RGB に出す PostProcess マテリアルを用意して返す。
+    GBuffer の WorldNormal(-1..1) を *0.5+0.5 で 0..1 に詰める（法線マップ規約）。
+    注意: MRQ 経由の PNG/MP4 は表示用エンコード（sRGB）で書かれるため、
+    データとして使う場合はリニア化してから -1..1 へ戻すこと（8bit Depth と同じ制約）。"""
+    mat = _mx_get_or_create_pp_material(_TMP_NORMAL_NAME)
+    st = _mx_expr(mat, unreal.MaterialExpressionSceneTexture, -700, 0)
+    st.set_editor_property("scene_texture_id", unreal.SceneTextureId.PPI_WORLD_NORMAL)
+    c_half = _mx_const(mat, 0.5, -700, 220)
+    mul = _mx_expr(mat, unreal.MaterialExpressionMultiply, -450, 0)
+    _mx_conn(st, "Color", mul, "A")
+    _mx_conn(c_half, "", mul, "B")
+    add = _mx_expr(mat, unreal.MaterialExpressionAdd, -250, 0)
+    _mx_conn(mul, "", add, "A")
+    _mx_conn(c_half, "", add, "B")
+    unreal.MaterialEditingLibrary.connect_material_property(
+        add, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+    unreal.MaterialEditingLibrary.recompile_material(mat)
+    try:
+        unreal.EditorAssetLibrary.save_loaded_asset(mat)
+    except Exception as e:
+        _warn("一時法線マテリアルの保存に失敗（未保存のまま続行）: %s" % e)
+    _log("一時法線マテリアル生成 (WorldNormal*0.5+0.5)")
+    return mat
+
+
 _TMP_MATTE_NAME = "M_UE5Cap_Matte"
 
 

@@ -40,6 +40,7 @@ except Exception:
 _SEQ_OUTPUTS = [
     ("beauty", "Beauty", "Beauty"),
     ("depth", "Z-Depth", "Depth"),
+    ("normal", "Normal（ワールド法線）", "Normal"),
     ("mfront", "Matteの前（Beauty+Matte）", "MatteBeauty"),
     ("behind", "Matteの奥", "Behind"),
     ("objid", "ObjectID", "ObjectID"),
@@ -297,6 +298,13 @@ class CaptureWindow(object):
         tk.Entry(depth_frm, textvariable=self.far_var, width=7).pack(side="left", padx=2)
         ttk.Label(depth_frm, text="cm（1m=100cm）").pack(side="left")
         depth_frm.grid(row=row, column=0, columnspan=3, sticky="w", padx=24)
+        row += 1
+
+        # Normal（ワールド法線 → RGB。-1..1 を *0.5+0.5 で 0..1 に詰める）
+        self.normal_var = tk.BooleanVar(master=self.root, value=False)
+        ttk.Checkbutton(frm, text="Normal（ワールド法線 RGB = XYZ*0.5+0.5）",
+                        variable=self.normal_var).grid(
+            row=row, column=0, columnspan=3, sticky="w", padx=8)
         row += 1
 
         # Matte 系（Beauty+Matte / Matteの奥。対象は Matte targets）
@@ -685,6 +693,14 @@ class CaptureWindow(object):
             except Exception as e:
                 skip_notes.append("Z-Depth: 一時マテリアル生成失敗でスキップ")
                 self.status_var.set("Z-Depth: 一時マテリアル生成失敗: %s" % e)
+        normal_pp_mat = None
+        if self.normal_var.get():
+            # 法線も Beauty と同一 MRQ ジョブの PP パスで撮る（WPO/風の位相一致）
+            try:
+                normal_pp_mat = core.create_temp_normal_material()
+            except Exception as e:
+                skip_notes.append("Normal: 一時マテリアル生成失敗でスキップ")
+                self.status_var.set("Normal: 一時マテリアル生成失敗: %s" % e)
         try:
             if s.do_matte or s.do_object_id or s.do_depth:
                 self.status_var.set("同フレームの ObjectID/Depth を出力中…")
@@ -712,14 +728,16 @@ class CaptureWindow(object):
         # Matte 系合成は PIL で読める画像が必要。EXR のときは PNG も内部出力して使う
         # （Depth PP パスの PNG 出力にも必要）。
         need_comp = want_mfront or want_behind
-        aux_png = (img_fmt == "exr") and (need_comp or depth_pp_mat is not None)
+        aux_png = (img_fmt == "exr") and (need_comp or depth_pp_mat is not None
+                                          or normal_pp_mat is not None)
         comp_beauty = (os.path.join(out, _name("Beauty") + ".png")
                        if img_fmt == "exr" else beauty_path)
 
         # Beauty（MRQ）は Beauty 指定時・Matte 系合成・同一ジョブ深度・Raw Lighting Full
         # が要るときにレンダする（Raw Lighting Direct はメイン無しでも専用ジョブで出せる）
         beauty_needed = (self.beauty_var.get() or want_mfront or want_behind
-                         or depth_pp_mat is not None or want_rlfull)
+                         or depth_pp_mat is not None or normal_pp_mat is not None
+                         or want_rlfull)
         if not beauty_needed and not want_rldir and not objid_cloud_vols:
             _restore_fb()
             self.status_var.set("完了（データパスのみ出力）" if (s.do_depth or s.do_object_id)
@@ -854,10 +872,12 @@ class CaptureWindow(object):
             keep_beauty = self.beauty_var.get() or bool(skip_notes)
             matte_exr = os.path.join(out, _name("Beauty") + "_Matte.exr")
             depth_exr = os.path.join(out, _name("Beauty") + "_Depth.exr")
+            normal_exr = os.path.join(out, _name("Beauty") + "_Normal.exr")
             removals = [(matte_path, False),
                         (aux, False),
                         (matte_exr, False),
                         (depth_exr, False),
+                        (normal_exr, False),
                         (os.path.join(out, _name("Beauty") + "_Matte.png"), False),
                         (os.path.join(out, _name("CloudMatte") + ".png"), False),
                         (os.path.join(out, _name("BackingW") + ".exr"), False),
@@ -993,6 +1013,8 @@ class CaptureWindow(object):
                 core.delete_temp_matte_material()
             if depth_pp_mat is not None:
                 core.delete_temp_depth_material()
+            if normal_pp_mat is not None:
+                core.delete_temp_normal_material()
             if ok:
                 try:
                     if want_mfront and (matte_mat_still is not None or matte_vols):
@@ -1005,6 +1027,12 @@ class CaptureWindow(object):
                             os.replace(dp, os.path.join(out, _name("Depth") + ".png"))
                         else:
                             skip_notes.append("Z-Depth: PP パス出力が見つかりません")
+                    if normal_pp_mat is not None:
+                        npf = os.path.join(out, _name("Beauty") + "_Normal.png")
+                        if os.path.isfile(npf):
+                            os.replace(npf, os.path.join(out, _name("Normal") + ".png"))
+                        else:
+                            skip_notes.append("Normal: PP パス出力が見つかりません")
                     if want_rlfull:
                         # LightingOnly パスを最終名へ（<base>_LightingOnly.* → RawLightingFull）
                         ext = _FMT_EXT[img_fmt]
@@ -1037,9 +1065,10 @@ class CaptureWindow(object):
         # sRGB(0.5)=187 になる実測）。凍結静止画はサブフレーム内容が同一で
         # TS>1 に画質上の意味も無いため、PP パスがあるときは TS=1 に強制する。
         ts_main = ts
-        if ts > 1 and (matte_mat_still is not None or depth_pp_mat is not None):
+        if ts > 1 and (matte_mat_still is not None or depth_pp_mat is not None
+                       or normal_pp_mat is not None):
             ts_main = 1
-            skip_notes.append("Matte/Depth 同一ジョブパスのため TS=1 で実行")
+            skip_notes.append("Matte/Depth/Normal 同一ジョブパスのため TS=1 で実行")
 
         self.status_var.set("MRQ Beauty レンダ中… (PIEに入ります / 完了まで待機)")
         self.root.update()
@@ -1055,6 +1084,7 @@ class CaptureWindow(object):
                                       matte_actors=(matte_prims if matte_mat_still is not None
                                                     else None),
                                       depth_material=depth_pp_mat,
+                                      normal_material=normal_pp_mat,
                                       fog_off=self.fog_off_var.get(),
                                       scene_sequence=scene_seq,
                                       scene_frame=scene_frame, on_done=_after_beauty)
@@ -1063,6 +1093,8 @@ class CaptureWindow(object):
                 core.delete_temp_matte_material()
             if depth_pp_mat is not None:
                 core.delete_temp_depth_material()
+            if normal_pp_mat is not None:
+                core.delete_temp_normal_material()
             _restore_fb()
             self.status_var.set("MRQ 起動失敗: %s" % e)
 
@@ -1226,13 +1258,14 @@ class CaptureWindow(object):
 
         matte_needed = _need("mfront") or _need("behind")
         depth_needed = _need("depth")
+        normal_needed = _need("normal")
         objid_needed = _need("objid")
         rlfull_needed = _need("rlfull")
         rldir_needed = _need("rldir")
         # Direct だけならメインジョブ自体を直射レンダにする（全編2回レンダの回避）
         only_direct = rldir_needed and not (
-            _need("beauty") or depth_needed or matte_needed or objid_needed
-            or rlfull_needed)
+            _need("beauty") or depth_needed or normal_needed or matte_needed
+            or objid_needed or rlfull_needed)
 
         seq_notes = []
         vdb = self._vdb_enabled()
@@ -1282,7 +1315,7 @@ class CaptureWindow(object):
             out = os.path.join(base_out, "%s_%s" % (name_body, take_str))
         self._save_ui_state()
 
-        depth_mat = matte_mat = matte_sil_mat = objid_mat = None
+        depth_mat = matte_mat = matte_sil_mat = objid_mat = normal_mat = None
         hide_actors = None
         try:
             if depth_needed:
@@ -1290,6 +1323,8 @@ class CaptureWindow(object):
                     self._float_var(self.seq_near_var, 0.0),
                     self._float_var(self.seq_far_var, 10000.0),
                     invert=True)   # 手前=白 / 奥=黒 固定
+            if normal_needed:
+                normal_mat = core.create_temp_normal_material()
             if _need("mfront") and matte_prims:
                 matte_mat = core.create_temp_matte_material()
             if _need("behind"):
@@ -1313,6 +1348,8 @@ class CaptureWindow(object):
         def _cleanup_materials():
             if depth_mat is not None:
                 core.delete_temp_depth_material()
+            if normal_mat is not None:
+                core.delete_temp_normal_material()
             if matte_mat is not None:
                 core.delete_temp_matte_material()
             if matte_sil_mat is not None:
@@ -1344,6 +1381,8 @@ class CaptureWindow(object):
         pass_files_main = [] if only_direct else ["Beauty"]
         if depth_needed:
             pass_files_main.append("Depth")
+        if normal_needed:
+            pass_files_main.append("Normal")
         if matte_mat is not None:
             pass_files_main.append("Matte")
         if matte_sil_mat is not None:
@@ -1594,7 +1633,7 @@ class CaptureWindow(object):
                 do_png=True, do_mp4=False,
                 temporal_samples=ts, warmup=warm,
                 custom_start=cs, custom_end=ce,
-                depth_material=depth_mat,
+                depth_material=depth_mat, normal_material=normal_mat,
                 matte_material=matte_mat, matte_actors=matte_prims,
                 objid_material=objid_mat, objid_actors=objid_actors,
                 # Matteの奥のみ（Matteの前なし）のとき: MatteSil はプレートジョブ側に
@@ -1886,6 +1925,7 @@ class CaptureWindow(object):
                 "name_custom": self.name_custom_var.get(),
                 "name_usecam": self.name_usecam_var.get(),
                 "depth": self.depth_var.get(),
+                "normal": self.normal_var.get(),
                 "beauty": self.beauty_var.get(),
                 "mfront": self.mfront_var.get(),
                 "behind": self.behind_var.get(),
@@ -1960,6 +2000,7 @@ class CaptureWindow(object):
         _setvar(self.name_custom_var, "name_custom")
         _setvar(self.name_usecam_var, "name_usecam")
         _setvar(self.depth_var, "depth")
+        _setvar(self.normal_var, "normal")
         _setvar(self.beauty_var, "beauty")
         _setvar(self.mfront_var, "mfront")
         _setvar(self.behind_var, "behind")

@@ -215,6 +215,7 @@ def render_beauty(camera_actor, output_dir, width, height,
                   near_clip_cm=None, overscan=0.0, fog_off=False,
                   scene_sequence=None, scene_frame=None,
                   matte_material=None, matte_actors=None, depth_material=None,
+                  normal_material=None,
                   light_pass=False, light_direct=False,
                   cloud_matte_actors=None,
                   backing_actors=None, backing_white=False):
@@ -233,7 +234,9 @@ def render_beauty(camera_actor, output_dir, width, height,
     matte_material / matte_actors を渡すと、対象をマットレンダモード（Beauty 非表示 +
     CustomDepth ステンシル）にして同一ジョブの追加 PP パスで Matte マスクも出力する
     （出力: file_basename_Matte.png）。depth_material を渡すと正規化深度も同一ジョブの
-    PP パスで出力する（出力: file_basename_Depth.png）。SceneCapture 別撮りだと
+    PP パスで出力する（出力: file_basename_Depth.png）。normal_material も同様に
+    同一ジョブの PP パスでワールド法線を出力する（出力: file_basename_Normal.png）。
+    SceneCapture 別撮りだと
     WPO/風で揺れる前景のシルエット位相が Beauty とズレるため、同一ジョブで撮って
     画素整合を保証する。
     出力は output_dir 直下に file_basename.png (or .exr)。完了時 on_done(success, out_dir) を呼ぶ。"""
@@ -298,7 +301,7 @@ def render_beauty(camera_actor, output_dir, width, height,
                              spatial_samples, temporal_samples, warmup,
                              file_basename, on_done, near_clip_cm, overscan,
                              fog_off, _restore_scene, scene_sequence, scene_frame,
-                             matte_material, depth_material,
+                             matte_material, depth_material, normal_material,
                              light_pass, light_direct,
                              cloud_matte=bool(cloud_matte_actors),
                              backing=bool(backing_actors))
@@ -322,7 +325,7 @@ def _start_render(sub, camera_actor, output_dir, width, height,
                   spatial_samples, temporal_samples, warmup,
                   file_basename, on_done, near_clip_cm, overscan,
                   fog_off, restore_scene, scene_sequence=None, scene_frame=None,
-                  matte_material=None, depth_material=None,
+                  matte_material=None, depth_material=None, normal_material=None,
                   light_pass=False, light_direct=False, cloud_matte=False,
                   backing=False):
     seq, seq_path = _create_temp_sequence(camera_actor,
@@ -339,7 +342,8 @@ def _start_render(sub, camera_actor, output_dir, width, height,
 
     cfg = job.get_configuration()
     extra_passes = []
-    for pass_name, pass_mat in (("Matte", matte_material), ("Depth", depth_material)):
+    for pass_name, pass_mat in (("Matte", matte_material), ("Depth", depth_material),
+                                ("Normal", normal_material)):
         if pass_mat is None:
             continue
         ppp = unreal.MoviePipelinePostProcessPass()
@@ -502,6 +506,7 @@ def _start_render(sub, camera_actor, output_dir, width, height,
                         continue
                     nf = (f.replace("_FinalImageMatte", "_Matte")
                            .replace("_FinalImageDepth", "_Depth")
+                           .replace("_FinalImageNormal", "_Normal")
                            .replace("_FinalImage", ""))
                     os.replace(os.path.join(output_dir, f), os.path.join(output_dir, nf))
             except Exception as e:
@@ -824,7 +829,7 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
                     temporal_samples=8, warmup=32,
                     custom_start=None, custom_end=None,
                     depth_material=None, matte_material=None, matte_actors=None,
-                    matte_sil_material=None,
+                    matte_sil_material=None, normal_material=None,
                     objid_material=None, objid_actors=None,
                     hidden_actors=None, near_clip_cm=None, beauty_label="Beauty",
                     fog_off=False, on_done=None,
@@ -837,8 +842,8 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
     カメラカットトラックに従う。fps はシーケンスの Display Rate。
     静止画と違いモーションブラーは殺さない（切ると動きがストロボ状になる）。
     do_png=PNG連番 / do_mp4=内蔵 H.264 MP4（CRF 指定・音声なし）。両方同時可。
-    depth_material / matte_material を渡すと additional_post_process_materials で
-    パスが増え、パス毎に別ファイルで出力される。matte_material / matte_sil_material
+    depth_material / matte_material / normal_material を渡すと
+    additional_post_process_materials でパスが増え、パス毎に別ファイルで出力される。matte_material / matte_sil_material
     には matte_actors も必須（対象を main pass 非表示 + CustomDepth 書き込みに切替え、
     完了時に復元）。matte_sil_material は遮蔽非依存の全投影シルエット（Behind 合成用）。
     hidden_actors は単純な非表示（クリーンプレートのみ。matte とは排他で使う）。
@@ -927,7 +932,7 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
                                       name_body, take_str, do_png, do_mp4, mp4_crf,
                                       temporal_samples, warmup, custom_start, custom_end,
                                       depth_material, matte_material, matte_sil_material,
-                                      objid_material,
+                                      objid_material, normal_material,
                                       near_clip_cm, beauty_label, fog_off,
                                       _restore_scene, on_done,
                                       light_pass, light_direct, light_label,
@@ -950,7 +955,7 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
                            name_body, take_str, do_png, do_mp4, mp4_crf,
                            temporal_samples, warmup, custom_start, custom_end,
                            depth_material, matte_material, matte_sil_material,
-                           objid_material,
+                           objid_material, normal_material,
                            near_clip_cm, beauty_label, fog_off, restore_scene, on_done,
                            light_pass=False, light_direct=False,
                            light_label="RawLightingFull", cloud_matte=False,
@@ -967,7 +972,8 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
     extra_passes = []
     for pass_name, pass_mat in (("Depth", depth_material), ("Matte", matte_material),
                                 ("MatteSil", matte_sil_material),
-                                ("ObjectID", objid_material)):
+                                ("ObjectID", objid_material),
+                                ("Normal", normal_material)):
         if pass_mat is None:
             continue
         ppp = unreal.MoviePipelinePostProcessPass()
@@ -1149,7 +1155,7 @@ def _rename_final_image(output_dir, beauty_label="Beauty", light_label=None):
                 continue
             nf = f
             # MatteSil は Matte より先（長い識別子から置換しないと _MatteSil が壊れる）
-            for pass_name in ("Depth", "MatteSil", "Matte", "ObjectID"):
+            for pass_name in ("Depth", "MatteSil", "Matte", "ObjectID", "Normal"):
                 nf = nf.replace("_FinalImage" + pass_name, "_" + pass_name)
             nf = nf.replace("_FinalImage", "_" + beauty_label)
             if light_label:
