@@ -1493,42 +1493,49 @@ def cloudmatte_frames_to_mask(output_dir, name_body, take_str, invert=True):
     return n
 
 
-def apply_cloud_black_to_normal(normal_path, cloud_path):
-    """Normal PNG の雲領域を黒に落とす: normal' = normal × (1 − 雲α)。
-    cloud_path は α のままの CloudMatte（白黒変換前）であること。"""
+def apply_cloud_black(path, cloud_path):
+    """画像の雲領域を黒に落とす: img' = img × (1 − 雲α)。Normal(RGB) と
+    Depth(8bit RGB / 16bit I;16 グレー) に対応（EXR 生cm は 0=カメラ位置になり
+    意味が壊れるため呼ばないこと）。cloud_path は α のままの CloudMatte
+    （白黒変換前）であること。"""
     if not (_HAS_NUMPY and _HAS_PIL):
-        raise RuntimeError("numpy/Pillow がありません（Normal の雲抜きに必要）")
+        raise RuntimeError("numpy/Pillow がありません（雲抜きに必要）")
     cm = _PILImage.open(cloud_path)
     if cm.mode != "RGBA":
         raise RuntimeError("CloudMatte にαがありません（mode=%s）" % cm.mode)
-    nm_im = _PILImage.open(normal_path).convert("RGB")
-    if cm.size != nm_im.size:
-        cm = cm.resize(nm_im.size)
+    im = _PILImage.open(path)
+    if cm.size != im.size:
+        cm = cm.resize(im.size)
     ca = _np.asarray(cm)[:, :, 3].astype(_np.float32) / 255.0
-    nm = _np.asarray(nm_im).astype(_np.float32)
-    out = (nm * (1.0 - ca)[:, :, None]).clip(0, 255).astype(_np.uint8)
-    _PILImage.fromarray(out, "RGB").save(normal_path)
+    if im.mode in ("I;16", "I"):
+        arr = _np.asarray(im).astype(_np.float32) / 65535.0
+        _write_png_u16_gray(path, arr * (1.0 - ca))
+    else:
+        arr = _np.asarray(im.convert("RGB")).astype(_np.float32)
+        out = (arr * (1.0 - ca)[:, :, None]).clip(0, 255).astype(_np.uint8)
+        _PILImage.fromarray(out, "RGB").save(path)
 
 
-def apply_cloud_black_to_normal_frames(output_dir, name_body, take_str):
-    """Normal 連番の各フレームへ同フレームの CloudMatte α を乗算して雲領域を黒にする。
-    処理したフレーム数を返す（CloudMatte 側が α のままの状態で呼ぶこと）。"""
-    np_prefix = "%s_Normal_%s." % (name_body, take_str)
+def apply_cloud_black_to_pass_frames(output_dir, name_body, take_str, pass_name):
+    """<pass_name> 連番の各フレームへ同フレームの CloudMatte α を乗算して
+    雲領域を黒にする。処理したフレーム数を返す（CloudMatte 側が α のままの
+    状態で呼ぶこと）。"""
+    prefix = "%s_%s_%s." % (name_body, pass_name, take_str)
     n = 0
     for f in sorted(os.listdir(output_dir)):
-        if not (f.startswith(np_prefix) and f.endswith(".png")):
+        if not (f.startswith(prefix) and f.endswith(".png")):
             continue
-        frame = f[len(np_prefix):-4]
+        frame = f[len(prefix):-4]
         cf = os.path.join(output_dir,
                           "%s_CloudMatte_%s.%s.png" % (name_body, take_str, frame))
         if not os.path.isfile(cf):
             continue
         try:
-            apply_cloud_black_to_normal(os.path.join(output_dir, f), cf)
+            apply_cloud_black(os.path.join(output_dir, f), cf)
             n += 1
         except Exception as e:
-            _warn("Normal の雲抜きに失敗 %s: %s" % (f, e))
-    _log("Normal の雲抜き: %d フレーム" % n)
+            _warn("%s の雲抜きに失敗 %s: %s" % (pass_name, f, e))
+    _log("%s の雲抜き: %d フレーム" % (pass_name, n))
     return n
 
 

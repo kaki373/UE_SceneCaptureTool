@@ -816,25 +816,33 @@ class CaptureWindow(object):
             if not matte_vols:
                 skip_notes.append("Matteの前: Matte 対象が見つからずスキップ")
 
-        # 雲マット独立出力: 対象はレベル内の全 VDB雲（分離モード＝遮蔽なし全投影）。
-        # Normal 選択時も雲αを自動レンダして Normal の雲領域を黒に落とす（雲は
-        # GBuffer 法線を持たず、放置すると雲の奥のジオメトリの法線が写るため）。
+        # 雲マット独立出力: 対象はレベル内の全 VDB雲。
+        # Normal / Depth 選択時も雲αを自動レンダして雲領域を黒に落とす（雲は
+        # GBuffer に法線/深度を持たず、放置すると雲の奥のジオメトリが写るため。
+        # Depth の EXR float は生cmで 0=カメラ位置になるため対象外）。
         want_cloudmatte = self.cloudmatte_var.get()
-        need_cloud_for_normal = normal_pp_mat is not None
+        depth_black_ok = (self.depth_var.get()
+                          and self.depth_bit_var.get() != "EXR float")
+        need_cloud_black = (normal_pp_mat is not None) or depth_black_ok
         cloudmatte_vols = []
-        if want_cloudmatte or need_cloud_for_normal:
+        if want_cloudmatte or need_cloud_black:
             if not vdb:
                 if want_cloudmatte:
                     skip_notes.append("雲マット: VDB雲モード OFF のためスキップ")
                 want_cloudmatte = False
-                need_cloud_for_normal = False
+                need_cloud_black = False
+                depth_black_ok = False
             else:
                 cloudmatte_vols = core.level_volumetrics()
                 if not cloudmatte_vols:
                     if want_cloudmatte:
                         skip_notes.append("雲マット: レベルに VDB雲が見つからずスキップ")
                     want_cloudmatte = False
-                    need_cloud_for_normal = False
+                    need_cloud_black = False
+                    depth_black_ok = False
+                elif (self.depth_var.get()
+                      and self.depth_bit_var.get() == "EXR float"):
+                    skip_notes.append("Depth(EXR float): 生cmのため雲抜き対象外")
 
         # 後続 MRQ ジョブのキュー（CloudMatte / Matteの奥のプレート / 直射 / 雲ID）
         jobs = []
@@ -859,7 +867,7 @@ class CaptureWindow(object):
                 skip_notes.append("雲マット: 板の手前の雲は自動反映（雲の対象指定は不要）")
         # Matteの前用の雲αジョブ（分離モード）と、雲マット/Normal雲抜き用の
         # 可視雲ジョブ（白バッキング化＝深度順序どおり）。意味論が違うため共用しない。
-        cloud_alpha_needed = want_cloudmatte or need_cloud_for_normal
+        cloud_alpha_needed = want_cloudmatte or need_cloud_black
         geomask_mat = None
         if (not use_backing) and want_mfront and matte_vols and vdb:
             base = (_name("CloudMatteMF") if cloud_alpha_needed
@@ -943,16 +951,23 @@ class CaptureWindow(object):
             # 合成がスキップされたときは唯一の成果物になるため残す。
             aux = comp_beauty if comp_beauty != beauty_path else None
             keep_beauty = self.beauty_var.get() or bool(skip_notes)
-            # Normal の雲領域を黒に落とす（α のままの CloudMatte を乗算。変換前に行う）
+            # Normal / Depth の雲領域を黒に落とす（α のままの CloudMatte を乗算。
+            # 白黒変換前に行う）
             cm_png = os.path.join(out, _name("CloudMatte") + ".png")
-            if need_cloud_for_normal and os.path.isfile(cm_png):
-                npng = os.path.join(out, _name("Normal") + ".png")
-                if os.path.isfile(npng):
+            if os.path.isfile(cm_png):
+                targets = []
+                if normal_pp_mat is not None:
+                    targets.append(("Normal", os.path.join(out, _name("Normal") + ".png")))
+                if depth_black_ok:
+                    targets.append(("Depth", os.path.join(out, _name("Depth") + ".png")))
+                for _lbl, _p in targets:
+                    if not os.path.isfile(_p):
+                        continue
                     try:
-                        core.apply_cloud_black_to_normal(npng, cm_png)
+                        core.apply_cloud_black(_p, cm_png)
                     except Exception as e:
-                        skip_notes.append("Normal: 雲抜き失敗")
-                        self.status_var.set("Normal 雲抜き失敗: %s" % e)
+                        skip_notes.append("%s: 雲抜き失敗" % _lbl)
+                        self.status_var.set("%s 雲抜き失敗: %s" % (_lbl, e))
             # 雲マット独立出力: α のまま残っている CloudMatte を白黒マスク（雲=黒）へ
             # 変換して残す
             if want_cloudmatte and os.path.isfile(cm_png):
@@ -1492,10 +1507,10 @@ class CaptureWindow(object):
                         and _need("mfront"))
         # 雲マット独立出力: 対象はレベル内の全VDB雲。Matteの前の雲ジョブと重なる場合は
         # 1本で共用（対象は Matte 対象の雲のまま＝Matteの前の合成の意味を変えない）。
-        # Normal 選択時も雲αを自動レンダして Normal 連番の雲領域を黒に落とす。
+        # Normal / Depth 選択時も雲αを自動レンダして連番の雲領域を黒に落とす。
         cm_vols = []
-        cloud_for_normal = False
-        if cloudmatte_needed or normal_needed:
+        cloud_for_black = False
+        if cloudmatte_needed or normal_needed or depth_needed:
             if not vdb:
                 if cloudmatte_needed:
                     seq_notes.append("雲マット: VDB雲モード OFF のためスキップ")
@@ -1509,13 +1524,13 @@ class CaptureWindow(object):
                         wants["cloudmatte"] = (False, False)
                         cloudmatte_needed = False
                 else:
-                    cloud_for_normal = normal_needed
+                    cloud_for_black = normal_needed or depth_needed
         cloud_vols_job = matte_vols if mfront_cloud else cm_vols
-        if ((cloudmatte_needed or cloud_for_normal) and mfront_cloud
+        if ((cloudmatte_needed or cloud_for_black) and mfront_cloud
                 and {a.get_path_name() for a in matte_vols}
                 != {a.get_path_name() for a in cm_vols}):
             seq_notes.append("雲マット: Matte対象の雲のみ（Matteの前と共用）")
-        cloud_seq = {"run": mfront_cloud or cloudmatte_needed or cloud_for_normal,
+        cloud_seq = {"run": mfront_cloud or cloudmatte_needed or cloud_for_black,
                      "mfront": mfront_cloud}
         pa0 = (unreal.SystemLibrary.get_console_variable_bool_value(
             "r.PostProcessing.PropagateAlpha") if cloud_seq["run"] else None)
@@ -1572,9 +1587,14 @@ class CaptureWindow(object):
                         core.composite_behind_sequence(out, name_body, take_str)
                     else:
                         seq_notes.append("Matteの奥: シルエット生成に失敗")
-                if cloud_for_normal and cloud_seq["run"]:
-                    # Normal 連番の雲領域を黒に（CloudMatte が α のままのうちに乗算）
-                    core.apply_cloud_black_to_normal_frames(out, name_body, take_str)
+                if cloud_for_black and cloud_seq["run"]:
+                    # Normal / Depth 連番の雲領域を黒に（CloudMatte が α のままのうちに乗算）
+                    if normal_needed:
+                        core.apply_cloud_black_to_pass_frames(
+                            out, name_body, take_str, "Normal")
+                    if depth_needed:
+                        core.apply_cloud_black_to_pass_frames(
+                            out, name_body, take_str, "Depth")
                 if cloudmatte_needed and cloud_seq["run"]:
                     # 雲マット独立出力: α連番を白黒マスク連番（雲=黒）へ変換
                     # （MP4 エンコード可能に）。Matteの前の合成が α を使い終わってから。
