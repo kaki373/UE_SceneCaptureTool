@@ -1628,6 +1628,11 @@ def _read_linear_alpha(path, ffmpeg):
             pass
 
 
+# 可視雲のジオメトリ画素に掛ける飽和ゲイン（1−e^(−G·x) 正規化）。上げるほど
+# 雲の中身が早く不透明になる（輪郭・貫通の筋は輝度≈0のため影響が小さい）
+_VIS_CLOUD_GAIN = 6.0
+
+
 def compose_visible_cloud(w_exr, geomask_exr, out_rgba_png, ffmpeg=None, scale=None):
     """可視雲マット合成（黒バッキング方式）: 全ジオメトリを黒アンリット材で
     レンダした EXR（RGB=雲の散乱輝度 L・α=全投影雲α）と GeoMask（ジオメトリ有=白）
@@ -1664,7 +1669,13 @@ def compose_visible_cloud(w_exr, geomask_exr, out_rgba_png, ffmpeg=None, scale=N
                 scale = (1.0 / max(float(_np.percentile(lv, 99)), 1e-6)
                          if lv.size else 1.0)
                 _warn("可視雲: 空の雲画素が少なく scale=%.4f を輝度から推定" % scale)
-        vis = _np.where(g > 0.5, _np.clip(L * scale, 0.0, 1.0), a)
+        # ジオメトリ画素: 雲の消衰で内部ほど輝度が落ち「輪郭は合うが中身が薄い」
+        # マットになる（フレーム84実測）。飽和カーブ 1−e^(−G·x) で中身を不透明側へ
+        # 押し上げる（柱の筋など輝度≈0はカーブ後もほぼ0のままで貫通表現は保たれる）
+        G = _VIS_CLOUD_GAIN
+        x = _np.clip(L * scale, 0.0, None)
+        vis_geo = (1.0 - _np.exp(-G * x)) / (1.0 - _np.exp(-G))
+        vis = _np.where(g > 0.5, _np.clip(vis_geo, 0.0, 1.0), a)
     vis8 = (_np.clip(vis, 0.0, 1.0) * 255.0 + 0.5).astype(_np.uint8)
     z = _np.zeros_like(vis8)
     _PILImage.merge("RGBA", tuple(_PILImage.fromarray(c) for c in (z, z, z, vis8))
