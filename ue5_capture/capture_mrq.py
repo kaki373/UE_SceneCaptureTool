@@ -453,8 +453,11 @@ def _start_render(sub, camera_actor, output_dir, width, height,
     if cloud_matte:
         # α伝播（MRQ 既定でも ON になるが明示）+ αを埋める大気/フォグを OFF。
         # ⚠️ ShowFlag.Cloud 0 は VolumetricCloud だけでなく HV(VDB雲)も消す（実測）
-        # ため使用禁止。雲海は _set_cloud_matte_mode が VolumetricCloudComponent を
-        # visible=False で個別に切る。
+        # ため使用禁止。
+        # ⚠️ UDS の雲レイヤー（VolumetricCloud=大気雲）は α マットに乗せられない:
+        # Atmosphere ON だと大気自体が全画素 α=1 で埋め、SkyAtmosphere の holdout +
+        # SupportPrimitiveAlphaHoldout も UE5.7 では無効（全て 2026-08-26 実測）。
+        # マスク対象は HV(VDB) 雲のみ。
         pairs += [("r.PostProcessing.PropagateAlpha", 1),
                   ("ShowFlag.Atmosphere", 0), ("ShowFlag.Fog", 0),
                   ("ShowFlag.VolumetricFog", 0)]
@@ -662,9 +665,36 @@ def _set_cloud_matte_mode(vol_targets, use_holdout=False):
          % ("holdout" if use_holdout else "分離", len(holdout_comps),
             len(hidden_actors), len(hidden_comps)))
     pie_state = None
+    fill_lights = []
     if not use_holdout:
         pie_state = _start_pie_cloud_hider(vol_targets)
-    return holdout_comps, hidden_actors, hidden_comps, pie_state
+        fill_lights = _spawn_cloud_fill_lights()
+    return holdout_comps, hidden_actors, hidden_comps, pie_state, fill_lights
+
+
+def _spawn_cloud_fill_lights():
+    """CloudMatte 分離レンダ用の無影フィルライトを一時スポーンする。
+    HV(VDB雲) の α は照明依存（無照明で α0・照明の弱い遠景雲が α から消える実測）
+    なので、シーン照明に依らず全方位からフラットに照らして α を安定させる。
+    RGB は捨てるので過露光は問題ない。返り値: レンダ後に破棄するアクターリスト。"""
+    eas = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    out = []
+    for i, (pitch, yaw) in enumerate(((-90.0, 0.0), (30.0, 45.0), (30.0, 225.0))):
+        try:
+            a = eas.spawn_actor_from_class(
+                unreal.DirectionalLight, unreal.Vector(0.0, 0.0, 200000.0),
+                unreal.Rotator(roll=0.0, pitch=pitch, yaw=yaw))
+            a.set_actor_label("UE5Cap_CloudFill_%d" % i)
+            lc = a.get_editor_property("light_component")
+            lc.set_editor_property("intensity", 20.0)
+            lc.set_editor_property("cast_shadows", False)
+            lc.set_editor_property("atmosphere_sun_light", False)
+            out.append(a)
+        except Exception as e:
+            _warn("CloudMatte: フィルライト生成に失敗: %s" % e)
+    if out:
+        _log("CloudMatte: 無影フィルライト %d 灯を一時スポーン" % len(out))
+    return out
 
 
 def _start_pie_cloud_hider(vol_targets):
@@ -739,14 +769,21 @@ def _start_pie_cloud_hider(vol_targets):
 
 
 def _restore_cloud_matte_mode(saved):
-    if not saved:
-        saved = ([], [], [], None)
+    saved = tuple(saved or ([], [], []))
     if len(saved) == 3:               # 旧形式互換
-        saved = tuple(saved) + (None,)
-    holdout_comps, hidden_actors, hidden_comps, pie_state = saved
+        saved += (None,)
+    if len(saved) == 4:
+        saved += ([],)
+    holdout_comps, hidden_actors, hidden_comps, pie_state, fill_lights = saved
     if pie_state and pie_state.get("stop"):
         try:
             pie_state["stop"]()
+        except Exception:
+            pass
+    eas = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    for a in fill_lights or []:
+        try:
+            eas.destroy_actor(a)
         except Exception:
             pass
     for c in holdout_comps:

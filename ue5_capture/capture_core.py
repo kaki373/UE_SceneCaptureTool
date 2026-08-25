@@ -1462,19 +1462,21 @@ def merge_cloud_alpha_into_matte(matte_path, cloud_png_path, out_path, size_wh=N
     return out_path
 
 
-def cloudmatte_alpha_to_mask(path):
+def cloudmatte_alpha_to_mask(path, invert=True):
     """CloudMatte PNG（RGB≒黒 + α=可視雲不透明度）を白黒マスク RGB PNG に変換する
-    （in place。雲=白/なし=黒。Matte 素材と同じ見た目・MP4 エンコード可能になる）。"""
+    （in place・MP4 エンコード可能になる）。invert=True（既定）で 雲=黒/なし=白。"""
     if not _HAS_PIL:
         raise RuntimeError("Pillow がありません（雲マットの白黒変換に必要）")
     im = _PILImage.open(path)
     if im.mode != "RGBA":
         raise RuntimeError("CloudMatte にαがありません（mode=%s）" % im.mode)
     a = im.getchannel("A")
+    if invert:
+        a = a.point(lambda v: 255 - v)
     _PILImage.merge("RGB", (a, a, a)).save(path)
 
 
-def cloudmatte_frames_to_mask(output_dir, name_body, take_str):
+def cloudmatte_frames_to_mask(output_dir, name_body, take_str, invert=True):
     """CloudMatte 連番（%s_CloudMatte_%s.NNNN.png）を全フレーム白黒マスク化する。
     変換したフレーム数を返す。"""
     prefix = "%s_CloudMatte_%s." % (name_body, take_str)
@@ -1483,11 +1485,50 @@ def cloudmatte_frames_to_mask(output_dir, name_body, take_str):
         if not (f.startswith(prefix) and f.endswith(".png")):
             continue
         try:
-            cloudmatte_alpha_to_mask(os.path.join(output_dir, f))
+            cloudmatte_alpha_to_mask(os.path.join(output_dir, f), invert=invert)
             n += 1
         except Exception as e:
             _warn("雲マット白黒変換に失敗 %s: %s" % (f, e))
     _log("雲マット白黒変換: %d フレーム" % n)
+    return n
+
+
+def apply_cloud_black_to_normal(normal_path, cloud_path):
+    """Normal PNG の雲領域を黒に落とす: normal' = normal × (1 − 雲α)。
+    cloud_path は α のままの CloudMatte（白黒変換前）であること。"""
+    if not (_HAS_NUMPY and _HAS_PIL):
+        raise RuntimeError("numpy/Pillow がありません（Normal の雲抜きに必要）")
+    cm = _PILImage.open(cloud_path)
+    if cm.mode != "RGBA":
+        raise RuntimeError("CloudMatte にαがありません（mode=%s）" % cm.mode)
+    nm_im = _PILImage.open(normal_path).convert("RGB")
+    if cm.size != nm_im.size:
+        cm = cm.resize(nm_im.size)
+    ca = _np.asarray(cm)[:, :, 3].astype(_np.float32) / 255.0
+    nm = _np.asarray(nm_im).astype(_np.float32)
+    out = (nm * (1.0 - ca)[:, :, None]).clip(0, 255).astype(_np.uint8)
+    _PILImage.fromarray(out, "RGB").save(normal_path)
+
+
+def apply_cloud_black_to_normal_frames(output_dir, name_body, take_str):
+    """Normal 連番の各フレームへ同フレームの CloudMatte α を乗算して雲領域を黒にする。
+    処理したフレーム数を返す（CloudMatte 側が α のままの状態で呼ぶこと）。"""
+    np_prefix = "%s_Normal_%s." % (name_body, take_str)
+    n = 0
+    for f in sorted(os.listdir(output_dir)):
+        if not (f.startswith(np_prefix) and f.endswith(".png")):
+            continue
+        frame = f[len(np_prefix):-4]
+        cf = os.path.join(output_dir,
+                          "%s_CloudMatte_%s.%s.png" % (name_body, take_str, frame))
+        if not os.path.isfile(cf):
+            continue
+        try:
+            apply_cloud_black_to_normal(os.path.join(output_dir, f), cf)
+            n += 1
+        except Exception as e:
+            _warn("Normal の雲抜きに失敗 %s: %s" % (f, e))
+    _log("Normal の雲抜き: %d フレーム" % n)
     return n
 
 

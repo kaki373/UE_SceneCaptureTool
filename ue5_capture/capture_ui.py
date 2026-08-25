@@ -43,7 +43,7 @@ _SEQ_OUTPUTS = [
     ("normal", "Normal（法線）", "Normal"),
     ("mfront", "Matteの前（Beauty+Matte）", "MatteBeauty"),
     ("behind", "Matteの奥", "Behind"),
-    ("cloudmatte", "雲マット（VDB雲のみ 白黒）", "CloudMatte"),
+    ("cloudmatte", "雲マット（VDB雲=黒）", "CloudMatte"),
     ("objid", "ObjectID", "ObjectID"),
     ("rlfull", "Raw Lighting Full(Sun+GI+Sky)", "RawLightingFull"),
     ("rldir", "Raw Lighting Direct", "RawLightingDirect"),
@@ -318,7 +318,7 @@ class CaptureWindow(object):
         self.normal_space_var = tk.StringVar(master=self.root, value="カメラ")
         ttk.Combobox(normal_frm, textvariable=self.normal_space_var, state="readonly",
                      width=7, values=["カメラ", "ワールド"]).pack(side="left", padx=4)
-        ttk.Label(normal_frm, text="（カメラ=正対面が青 / ワールド=上向きが青）",
+        ttk.Label(normal_frm, text="（カメラ=正対面が青 / ワールド=上向きが青・VDB雲領域は黒）",
                   foreground="#888").pack(side="left")
         normal_frm.grid(row=row, column=0, columnspan=3, sticky="w", padx=24)
         row += 1
@@ -355,7 +355,7 @@ class CaptureWindow(object):
 
         # 雲マット（VDB雲のみの白黒マスク。I2I 用のマスク素材）
         self.cloudmatte_var = tk.BooleanVar(master=self.root, value=False)
-        ttk.Checkbutton(matf, text="雲マット（VDB雲のみ 白黒マスク）",
+        ttk.Checkbutton(matf, text="雲マット（VDB雲=黒 / 背景=白）",
                         variable=self.cloudmatte_var).grid(
             row=row, column=0, columnspan=3, sticky="w", padx=8)
         row += 1
@@ -816,18 +816,25 @@ class CaptureWindow(object):
             if not matte_vols:
                 skip_notes.append("Matteの前: Matte 対象が見つからずスキップ")
 
-        # 雲マット独立出力: 対象はレベル内の全 VDB雲（分離モード＝遮蔽なし全投影）
+        # 雲マット独立出力: 対象はレベル内の全 VDB雲（分離モード＝遮蔽なし全投影）。
+        # Normal 選択時も雲αを自動レンダして Normal の雲領域を黒に落とす（雲は
+        # GBuffer 法線を持たず、放置すると雲の奥のジオメトリの法線が写るため）。
         want_cloudmatte = self.cloudmatte_var.get()
+        need_cloud_for_normal = normal_pp_mat is not None
         cloudmatte_vols = []
-        if want_cloudmatte:
+        if want_cloudmatte or need_cloud_for_normal:
             if not vdb:
-                skip_notes.append("雲マット: VDB雲モード OFF のためスキップ")
+                if want_cloudmatte:
+                    skip_notes.append("雲マット: VDB雲モード OFF のためスキップ")
                 want_cloudmatte = False
+                need_cloud_for_normal = False
             else:
                 cloudmatte_vols = core.level_volumetrics()
                 if not cloudmatte_vols:
-                    skip_notes.append("雲マット: レベルに VDB雲が見つからずスキップ")
+                    if want_cloudmatte:
+                        skip_notes.append("雲マット: レベルに VDB雲が見つからずスキップ")
                     want_cloudmatte = False
+                    need_cloud_for_normal = False
 
         # 後続 MRQ ジョブのキュー（CloudMatte / Matteの奥のプレート / 直射 / 雲ID）
         jobs = []
@@ -850,15 +857,16 @@ class CaptureWindow(object):
                              backing_white=True, fmt="exr", cloud_kind="backing_w"))
             if matte_vols:
                 skip_notes.append("雲マット: 板の手前の雲は自動反映（雲の対象指定は不要）")
-        # Matteの前用の雲αジョブと雲マット独立出力ジョブ。対象集合が同じなら1本で共用、
-        # 違うなら Matteの前用を内部名（CloudMatteMF）へ退けて2本にする。
-        cloudmatte_job = want_cloudmatte
+        # Matteの前用の雲αジョブと雲マット/Normal雲抜き用ジョブ。対象集合が同じなら
+        # 1本で共用、違うなら Matteの前用を内部名（CloudMatteMF）へ退けて2本にする。
+        cloud_alpha_needed = want_cloudmatte or need_cloud_for_normal
+        cloudmatte_job = cloud_alpha_needed
         if (not use_backing) and want_mfront and matte_vols and vdb:
-            share = (want_cloudmatte and
+            share = (cloud_alpha_needed and
                      {a.get_path_name() for a in matte_vols}
                      == {a.get_path_name() for a in cloudmatte_vols})
             base = (_name("CloudMatteMF")
-                    if (want_cloudmatte and not share) else _name("CloudMatte"))
+                    if (cloud_alpha_needed and not share) else _name("CloudMatte"))
             jobs.append(dict(base=base, cloud=matte_vols, cloud_kind="matte"))
             if share:
                 cloudmatte_job = False        # Matteの前と1本で共用
@@ -934,8 +942,18 @@ class CaptureWindow(object):
             # 合成がスキップされたときは唯一の成果物になるため残す。
             aux = comp_beauty if comp_beauty != beauty_path else None
             keep_beauty = self.beauty_var.get() or bool(skip_notes)
-            # 雲マット独立出力: α のまま残っている CloudMatte を白黒マスクへ変換して残す
+            # Normal の雲領域を黒に落とす（α のままの CloudMatte を乗算。変換前に行う）
             cm_png = os.path.join(out, _name("CloudMatte") + ".png")
+            if need_cloud_for_normal and os.path.isfile(cm_png):
+                npng = os.path.join(out, _name("Normal") + ".png")
+                if os.path.isfile(npng):
+                    try:
+                        core.apply_cloud_black_to_normal(npng, cm_png)
+                    except Exception as e:
+                        skip_notes.append("Normal: 雲抜き失敗")
+                        self.status_var.set("Normal 雲抜き失敗: %s" % e)
+            # 雲マット独立出力: α のまま残っている CloudMatte を白黒マスク（雲=黒）へ
+            # 変換して残す
             if want_cloudmatte and os.path.isfile(cm_png):
                 try:
                     core.cloudmatte_alpha_to_mask(cm_png)
@@ -1453,24 +1471,30 @@ class CaptureWindow(object):
                         and _need("mfront"))
         # 雲マット独立出力: 対象はレベル内の全VDB雲。Matteの前の雲ジョブと重なる場合は
         # 1本で共用（対象は Matte 対象の雲のまま＝Matteの前の合成の意味を変えない）。
+        # Normal 選択時も雲αを自動レンダして Normal 連番の雲領域を黒に落とす。
         cm_vols = []
-        if cloudmatte_needed:
+        cloud_for_normal = False
+        if cloudmatte_needed or normal_needed:
             if not vdb:
-                seq_notes.append("雲マット: VDB雲モード OFF のためスキップ")
-                wants["cloudmatte"] = (False, False)
-                cloudmatte_needed = False
+                if cloudmatte_needed:
+                    seq_notes.append("雲マット: VDB雲モード OFF のためスキップ")
+                    wants["cloudmatte"] = (False, False)
+                    cloudmatte_needed = False
             else:
                 cm_vols = core.level_volumetrics()
                 if not cm_vols:
-                    seq_notes.append("雲マット: レベルに VDB雲が見つからずスキップ")
-                    wants["cloudmatte"] = (False, False)
-                    cloudmatte_needed = False
+                    if cloudmatte_needed:
+                        seq_notes.append("雲マット: レベルに VDB雲が見つからずスキップ")
+                        wants["cloudmatte"] = (False, False)
+                        cloudmatte_needed = False
+                else:
+                    cloud_for_normal = normal_needed
         cloud_vols_job = matte_vols if mfront_cloud else cm_vols
-        if (cloudmatte_needed and mfront_cloud
+        if ((cloudmatte_needed or cloud_for_normal) and mfront_cloud
                 and {a.get_path_name() for a in matte_vols}
                 != {a.get_path_name() for a in cm_vols}):
             seq_notes.append("雲マット: Matte対象の雲のみ（Matteの前と共用）")
-        cloud_seq = {"run": mfront_cloud or cloudmatte_needed,
+        cloud_seq = {"run": mfront_cloud or cloudmatte_needed or cloud_for_normal,
                      "mfront": mfront_cloud}
         pa0 = (unreal.SystemLibrary.get_console_variable_bool_value(
             "r.PostProcessing.PropagateAlpha") if cloud_seq["run"] else None)
@@ -1527,9 +1551,12 @@ class CaptureWindow(object):
                         core.composite_behind_sequence(out, name_body, take_str)
                     else:
                         seq_notes.append("Matteの奥: シルエット生成に失敗")
+                if cloud_for_normal and cloud_seq["run"]:
+                    # Normal 連番の雲領域を黒に（CloudMatte が α のままのうちに乗算）
+                    core.apply_cloud_black_to_normal_frames(out, name_body, take_str)
                 if cloudmatte_needed and cloud_seq["run"]:
-                    # 雲マット独立出力: α連番を白黒マスク連番へ変換（MP4 エンコード可能に）。
-                    # Matteの前の合成が α を使い終わってから行う。
+                    # 雲マット独立出力: α連番を白黒マスク連番（雲=黒）へ変換
+                    # （MP4 エンコード可能に）。Matteの前の合成が α を使い終わってから。
                     if core.cloudmatte_frames_to_mask(out, name_body, take_str) <= 0:
                         seq_notes.append("雲マット: 白黒変換で対象フレームなし")
                 if objid_needed and objid_actors:
