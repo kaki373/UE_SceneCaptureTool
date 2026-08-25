@@ -1904,18 +1904,33 @@ class CaptureWindow(object):
             self._aspect_guard = False
 
     def _update_cam_res(self):
-        """選択カメラのアスペクトと、現在の幅から算出した解像度を表示する。"""
+        """選択カメラのアスペクトと、現在の幅から算出した解像度を表示する。
+        失敗時は空欄にせず理由を出す（「たまに機能しない」の診断性確保）。"""
         try:
             cam = self._current_camera()
             if cam is None:
                 self.cam_res_var.set("(no camera)")
                 return
+            # 選択ラベルのカメラが消えて先頭カメラへフォールバックした場合は明示する
+            # （Sequencer スポーナブルはシーケンスを閉じるとレベルから消える）
+            note = ""
+            try:
+                if cam.get_actor_label() != self.cam_var.get():
+                    note = "  ※選択カメラ不在→%s" % cam.get_actor_label()
+            except Exception:
+                pass
             asp = core.get_camera_settings(cam).get("aspect_ratio", 0.0)
-            W = int(self.w_var.get())
-            H = int(round(W / asp)) if asp > 0.1 else 0
-            self.cam_res_var.set("→ %d×%d  (%.3f:1)" % (W, H, asp))
-        except Exception:
-            self.cam_res_var.set("")
+            W = self._int_var(self.w_var, 0)
+            if asp > 0.1 and W > 0:
+                self.cam_res_var.set("→ %d×%d  (%.3f:1)%s"
+                                     % (W, int(round(W / asp)), asp, note))
+            elif asp > 0.1:
+                self.cam_res_var.set("(%.3f:1)%s" % (asp, note))
+            else:
+                self.cam_res_var.set("(アスペクト未取得)%s" % note)
+        except Exception as e:
+            self.cam_res_var.set("(取得失敗)")
+            unreal.log_warning("[SceneCapture] カメラ解像度表示の更新に失敗: %s" % e)
 
     def _refresh_cameras(self):
         """現在のレベルのカメラを取得し直してプルダウンを更新する。"""
