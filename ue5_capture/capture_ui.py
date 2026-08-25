@@ -43,6 +43,7 @@ _SEQ_OUTPUTS = [
     ("normal", "Normal（法線）", "Normal"),
     ("mfront", "Matteの前（Beauty+Matte）", "MatteBeauty"),
     ("behind", "Matteの奥", "Behind"),
+    ("cloudmatte", "雲マット（VDB雲のみ 白黒）", "CloudMatte"),
     ("objid", "ObjectID", "ObjectID"),
     ("rlfull", "Raw Lighting Full(Sun+GI+Sky)", "RawLightingFull"),
     ("rldir", "Raw Lighting Direct", "RawLightingDirect"),
@@ -351,6 +352,16 @@ class CaptureWindow(object):
             row=row, column=0, columnspan=3, sticky="w", padx=8)
         row += 1
         self.objid_pick, row = self._make_picker(matf, row, "Object ID targets")
+
+        # 雲マット（VDB雲のみの白黒マスク。I2I 用のマスク素材）
+        self.cloudmatte_var = tk.BooleanVar(master=self.root, value=False)
+        ttk.Checkbutton(matf, text="雲マット（VDB雲のみ 白黒マスク）",
+                        variable=self.cloudmatte_var).grid(
+            row=row, column=0, columnspan=3, sticky="w", padx=8)
+        row += 1
+        ttk.Label(matf, text="  （対象はレベル内の全VDB雲。分離モード＝手前ジオメトリの遮蔽は反映されない）",
+                  foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", padx=8)
+        row += 1
         matf.columnconfigure(1, weight=1)
         matf.grid(row=2, column=0, sticky="we", padx=6, pady=2)
 
@@ -765,7 +776,8 @@ class CaptureWindow(object):
         beauty_needed = (self.beauty_var.get() or want_mfront or want_behind
                          or depth_pp_mat is not None or normal_pp_mat is not None
                          or want_rlfull)
-        if not beauty_needed and not want_rldir and not objid_cloud_vols:
+        if (not beauty_needed and not want_rldir and not objid_cloud_vols
+                and not self.cloudmatte_var.get()):
             _restore_fb()
             self.status_var.set("完了（データパスのみ出力）" if (s.do_depth or s.do_object_id)
                                 else "出力が選ばれていません")
@@ -804,6 +816,19 @@ class CaptureWindow(object):
             if not matte_vols:
                 skip_notes.append("Matteの前: Matte 対象が見つからずスキップ")
 
+        # 雲マット独立出力: 対象はレベル内の全 VDB雲（分離モード＝遮蔽なし全投影）
+        want_cloudmatte = self.cloudmatte_var.get()
+        cloudmatte_vols = []
+        if want_cloudmatte:
+            if not vdb:
+                skip_notes.append("雲マット: VDB雲モード OFF のためスキップ")
+                want_cloudmatte = False
+            else:
+                cloudmatte_vols = core.level_volumetrics()
+                if not cloudmatte_vols:
+                    skip_notes.append("雲マット: レベルに VDB雲が見つからずスキップ")
+                    want_cloudmatte = False
+
         # 後続 MRQ ジョブのキュー（CloudMatte / Matteの奥のプレート / 直射 / 雲ID）
         jobs = []
         cloud_matte_path = None
@@ -812,7 +837,7 @@ class CaptureWindow(object):
         # AlphaOutputOverride 復元と順序が衝突し、レンダ後も 1 が残る（実測）。
         # チェーン完了時に元値へ戻すため開始前の値を控える。
         pa0 = None
-        if matte_vols or objid_cloud_vols:
+        if matte_vols or objid_cloud_vols or cloudmatte_vols:
             pa0 = unreal.SystemLibrary.get_console_variable_bool_value(
                 "r.PostProcessing.PropagateAlpha")
         # 板あり: 白/黒バッキング差分で「板より手前の透過率T」を取り、板マスクの穴を
@@ -825,9 +850,21 @@ class CaptureWindow(object):
                              backing_white=True, fmt="exr", cloud_kind="backing_w"))
             if matte_vols:
                 skip_notes.append("雲マット: 板の手前の雲は自動反映（雲の対象指定は不要）")
-        elif want_mfront and matte_vols and vdb:
-            jobs.append(dict(base=_name("CloudMatte"), cloud=matte_vols,
-                             cloud_kind="matte"))
+        # Matteの前用の雲αジョブと雲マット独立出力ジョブ。対象集合が同じなら1本で共用、
+        # 違うなら Matteの前用を内部名（CloudMatteMF）へ退けて2本にする。
+        cloudmatte_job = want_cloudmatte
+        if (not use_backing) and want_mfront and matte_vols and vdb:
+            share = (want_cloudmatte and
+                     {a.get_path_name() for a in matte_vols}
+                     == {a.get_path_name() for a in cloudmatte_vols})
+            base = (_name("CloudMatteMF")
+                    if (want_cloudmatte and not share) else _name("CloudMatte"))
+            jobs.append(dict(base=base, cloud=matte_vols, cloud_kind="matte"))
+            if share:
+                cloudmatte_job = False        # Matteの前と1本で共用
+        if cloudmatte_job:
+            jobs.append(dict(base=_name("CloudMatte"), cloud=cloudmatte_vols,
+                             cloud_kind="matte_out"))
         if want_behind:
             mt = core._resolve_target_actors(None, self._pick_targets_resolved(self.matte_pick) or None)
             mt_p, mt_v = core.split_volumetric_targets(mt)
@@ -897,6 +934,14 @@ class CaptureWindow(object):
             # 合成がスキップされたときは唯一の成果物になるため残す。
             aux = comp_beauty if comp_beauty != beauty_path else None
             keep_beauty = self.beauty_var.get() or bool(skip_notes)
+            # 雲マット独立出力: α のまま残っている CloudMatte を白黒マスクへ変換して残す
+            cm_png = os.path.join(out, _name("CloudMatte") + ".png")
+            if want_cloudmatte and os.path.isfile(cm_png):
+                try:
+                    core.cloudmatte_alpha_to_mask(cm_png)
+                except Exception as e:
+                    skip_notes.append("雲マット: 白黒変換失敗")
+                    self.status_var.set("雲マット白黒変換失敗: %s" % e)
             matte_exr = os.path.join(out, _name("Beauty") + "_Matte.exr")
             depth_exr = os.path.join(out, _name("Beauty") + "_Depth.exr")
             normal_exr = os.path.join(out, _name("Beauty") + "_Normal.exr")
@@ -906,7 +951,8 @@ class CaptureWindow(object):
                         (depth_exr, False),
                         (normal_exr, False),
                         (os.path.join(out, _name("Beauty") + "_Matte.png"), False),
-                        (os.path.join(out, _name("CloudMatte") + ".png"), False),
+                        (cm_png, want_cloudmatte),
+                        (os.path.join(out, _name("CloudMatteMF") + ".png"), False),
                         (os.path.join(out, _name("BackingW") + ".exr"), False),
                         (os.path.join(out, _name("Beauty") + "_BackingT.png"), False),
                         (beauty_path, keep_beauty)]
@@ -957,7 +1003,7 @@ class CaptureWindow(object):
                     cp = os.path.join(out, _j["base"] + ".png")
                     if not ok or not os.path.isfile(cp):
                         skip_notes.append("%s: レンダ失敗" %
-                                          ("雲マット" if _j["cloud_kind"] == "matte"
+                                          ("雲マット" if _j["cloud_kind"] in ("matte", "matte_out")
                                            else "雲ObjectID(%s)" % _j.get("cloud_label", "?")))
                     elif _j["cloud_kind"] == "matte":
                         cloud_matte_path = cp
@@ -966,6 +1012,8 @@ class CaptureWindow(object):
                                 _compose_mfront()
                             except Exception as e:
                                 self.status_var.set("雲マット合成エラー: %s" % e)
+                    elif _j["cloud_kind"] == "matte_out":
+                        pass          # 雲マット独立出力（白黒化は _finalize で行う）
                     else:
                         objid_cloud_entries.append(
                             (_j.get("cloud_label", _j["base"]), cp))
@@ -1289,6 +1337,7 @@ class CaptureWindow(object):
         objid_needed = _need("objid")
         rlfull_needed = _need("rlfull")
         rldir_needed = _need("rldir")
+        cloudmatte_needed = _need("cloudmatte")
         # Direct だけならメインジョブ自体を直射レンダにする（全編2回レンダの回避）
         only_direct = rldir_needed and not (
             _need("beauty") or depth_needed or normal_needed or matte_needed
@@ -1400,8 +1449,29 @@ class CaptureWindow(object):
         # 雲マット: 板あり＝バッキング差分（何も隠さない・遮蔽正確）/
         # 板なし（雲のみ対象）＝従来の分離モード（CloudMatte ジョブ）
         backing_seq = {"run": vdb and bool(matte_prims) and _need("mfront")}
-        cloud_seq = {"run": vdb and bool(matte_vols) and not matte_prims
-                     and _need("mfront")}
+        mfront_cloud = (vdb and bool(matte_vols) and not matte_prims
+                        and _need("mfront"))
+        # 雲マット独立出力: 対象はレベル内の全VDB雲。Matteの前の雲ジョブと重なる場合は
+        # 1本で共用（対象は Matte 対象の雲のまま＝Matteの前の合成の意味を変えない）。
+        cm_vols = []
+        if cloudmatte_needed:
+            if not vdb:
+                seq_notes.append("雲マット: VDB雲モード OFF のためスキップ")
+                wants["cloudmatte"] = (False, False)
+                cloudmatte_needed = False
+            else:
+                cm_vols = core.level_volumetrics()
+                if not cm_vols:
+                    seq_notes.append("雲マット: レベルに VDB雲が見つからずスキップ")
+                    wants["cloudmatte"] = (False, False)
+                    cloudmatte_needed = False
+        cloud_vols_job = matte_vols if mfront_cloud else cm_vols
+        if (cloudmatte_needed and mfront_cloud
+                and {a.get_path_name() for a in matte_vols}
+                != {a.get_path_name() for a in cm_vols}):
+            seq_notes.append("雲マット: Matte対象の雲のみ（Matteの前と共用）")
+        cloud_seq = {"run": mfront_cloud or cloudmatte_needed,
+                     "mfront": mfront_cloud}
         pa0 = (unreal.SystemLibrary.get_console_variable_bool_value(
             "r.PostProcessing.PropagateAlpha") if cloud_seq["run"] else None)
         if backing_seq["run"]:
@@ -1446,7 +1516,8 @@ class CaptureWindow(object):
                         seq_notes.append("雲マット: バッキングTの計算に失敗")
                 if _need("mfront"):
                     core.composite_mattefront_sequence(out, name_body, take_str,
-                                                       use_cloud=cloud_seq["run"],
+                                                       use_cloud=(cloud_seq["run"]
+                                                                  and cloud_seq["mfront"]),
                                                        use_backing=backing_seq["run"])
                 if _need("behind"):
                     ns = core.render_matte_sil_sequence(
@@ -1456,6 +1527,11 @@ class CaptureWindow(object):
                         core.composite_behind_sequence(out, name_body, take_str)
                     else:
                         seq_notes.append("Matteの奥: シルエット生成に失敗")
+                if cloudmatte_needed and cloud_seq["run"]:
+                    # 雲マット独立出力: α連番を白黒マスク連番へ変換（MP4 エンコード可能に）。
+                    # Matteの前の合成が α を使い終わってから行う。
+                    if core.cloudmatte_frames_to_mask(out, name_body, take_str) <= 0:
+                        seq_notes.append("雲マット: 白黒変換で対象フレームなし")
                 if objid_needed and objid_actors:
                     man = {}
                     # ステンシルは 1..MATTE_STENCIL-1（MATTE_STENCIL はマット用予約）
@@ -1481,7 +1557,9 @@ class CaptureWindow(object):
                     cmds.append(cmd)
 
             def _after_encode(enc_ok):
-                drop = ["BehindPlate", "CloudMatte", "BackingT"]   # 中間素材は削除
+                drop = ["BehindPlate", "BackingT"]   # 中間素材は削除
+                # CloudMatte は _SEQ_OUTPUTS 行になったので下の汎用ループが
+                # 「PNG連番のチェックが無いときだけ」削除する
                 if matte_mat is not None:
                     drop.append("Matte")
                 if _need("behind"):
@@ -1529,7 +1607,7 @@ class CaptureWindow(object):
                     # 雲はソフトエッジなので Beauty とのエッジ差は許容範囲。
                     temporal_samples=1, warmup=warm,
                     custom_start=cs, custom_end=ce,
-                    cloud_matte_actors=matte_vols,
+                    cloud_matte_actors=cloud_vols_job,
                     beauty_label="CloudMatte",
                     fog_off=self.seq_fog_var.get(), on_done=_cloud_done)
             except Exception as e:
@@ -1651,6 +1729,15 @@ class CaptureWindow(object):
                 self.status_var.set("Matteの奥プレート起動失敗: %s" % e)
                 wants["behind"] = (False, False)
                 _run_direct(True, od)
+
+        if cloudmatte_needed and not (
+                _need("beauty") or depth_needed or normal_needed or matte_needed
+                or objid_needed or rlfull_needed or rldir_needed):
+            # 雲マットのみ: 全編の Beauty メインジョブを省いて雲ジョブから開始する
+            self.status_var.set("雲マット(CloudMatte)のみをレンダ中…")
+            self.root.update()
+            _run_cloud_matte(True, out)
+            return
 
         self.status_var.set("シーケンスレンダ中… (PIE / %d〜%dF @%gfps)"
                             % (cs_eff, ce_eff - 1, float(fps_num) / fps_den))
@@ -1969,6 +2056,7 @@ class CaptureWindow(object):
                 "name_usecam": self.name_usecam_var.get(),
                 "depth": self.depth_var.get(),
                 "normal": self.normal_var.get(),
+                "cloudmatte": self.cloudmatte_var.get(),
                 "beauty": self.beauty_var.get(),
                 "mfront": self.mfront_var.get(),
                 "behind": self.behind_var.get(),
@@ -2046,6 +2134,7 @@ class CaptureWindow(object):
         _setvar(self.name_usecam_var, "name_usecam")
         _setvar(self.depth_var, "depth")
         _setvar(self.normal_var, "normal")
+        _setvar(self.cloudmatte_var, "cloudmatte")
         _setvar(self.beauty_var, "beauty")
         _setvar(self.mfront_var, "mfront")
         _setvar(self.behind_var, "behind")

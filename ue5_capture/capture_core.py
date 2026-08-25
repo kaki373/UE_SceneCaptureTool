@@ -976,16 +976,22 @@ def get_or_create_backing_white_material():
 
 def level_has_volumetrics():
     """レベル内に HV(VDB雲) アクターがあるか（バッキング差分の自動トリガー用）。"""
+    return bool(level_volumetrics())
+
+
+def level_volumetrics():
+    """レベル内の HV(VDB雲) アクターを列挙する（雲マット独立出力の既定対象）。"""
     if _HV_COMP_CLASS is None:
-        return False
+        return []
     sub = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    out = []
     for a in sub.get_all_level_actors():
         try:
             if a.get_components_by_class(_HV_COMP_CLASS):
-                return True
+                out.append(a)
         except Exception:
             pass
-    return False
+    return out
 
 
 def set_matte_unlit(actors):
@@ -1454,6 +1460,35 @@ def merge_cloud_alpha_into_matte(matte_path, cloud_png_path, out_path, size_wh=N
     _write_png_u8(out_path, merged)
     _log("Matte マスクへ雲αを合成: %s" % out_path)
     return out_path
+
+
+def cloudmatte_alpha_to_mask(path):
+    """CloudMatte PNG（RGB≒黒 + α=可視雲不透明度）を白黒マスク RGB PNG に変換する
+    （in place。雲=白/なし=黒。Matte 素材と同じ見た目・MP4 エンコード可能になる）。"""
+    if not _HAS_PIL:
+        raise RuntimeError("Pillow がありません（雲マットの白黒変換に必要）")
+    im = _PILImage.open(path)
+    if im.mode != "RGBA":
+        raise RuntimeError("CloudMatte にαがありません（mode=%s）" % im.mode)
+    a = im.getchannel("A")
+    _PILImage.merge("RGB", (a, a, a)).save(path)
+
+
+def cloudmatte_frames_to_mask(output_dir, name_body, take_str):
+    """CloudMatte 連番（%s_CloudMatte_%s.NNNN.png）を全フレーム白黒マスク化する。
+    変換したフレーム数を返す。"""
+    prefix = "%s_CloudMatte_%s." % (name_body, take_str)
+    n = 0
+    for f in sorted(os.listdir(output_dir)):
+        if not (f.startswith(prefix) and f.endswith(".png")):
+            continue
+        try:
+            cloudmatte_alpha_to_mask(os.path.join(output_dir, f))
+            n += 1
+        except Exception as e:
+            _warn("雲マット白黒変換に失敗 %s: %s" % (f, e))
+    _log("雲マット白黒変換: %d フレーム" % n)
+    return n
 
 
 def _read_linear_gray(path, ffmpeg):
