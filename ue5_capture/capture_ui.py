@@ -40,7 +40,7 @@ except Exception:
 _SEQ_OUTPUTS = [
     ("beauty", "Beauty", "Beauty"),
     ("depth", "Z-Depth", "Depth"),
-    ("normal", "Normal（ワールド法線）", "Normal"),
+    ("normal", "Normal（法線）", "Normal"),
     ("mfront", "Matteの前（Beauty+Matte）", "MatteBeauty"),
     ("behind", "Matteの奥", "Behind"),
     ("objid", "ObjectID", "ObjectID"),
@@ -306,11 +306,20 @@ class CaptureWindow(object):
         depth_frm.grid(row=row, column=0, columnspan=3, sticky="w", padx=24)
         row += 1
 
-        # Normal（ワールド法線 → RGB。-1..1 を *0.5+0.5 で 0..1 に詰める）
+        # Normal（法線 → RGB。-1..1 を *0.5+0.5 で 0..1 に詰める）
         self.normal_var = tk.BooleanVar(master=self.root, value=False)
-        ttk.Checkbutton(matf, text="Normal（ワールド法線 RGB = XYZ*0.5+0.5）",
+        ttk.Checkbutton(matf, text="Normal（法線 RGB = XYZ*0.5+0.5）",
                         variable=self.normal_var).grid(
             row=row, column=0, columnspan=3, sticky="w", padx=8)
+        row += 1
+        normal_frm = ttk.Frame(matf)
+        ttk.Label(normal_frm, text="空間:").pack(side="left")
+        self.normal_space_var = tk.StringVar(master=self.root, value="カメラ")
+        ttk.Combobox(normal_frm, textvariable=self.normal_space_var, state="readonly",
+                     width=7, values=["カメラ", "ワールド"]).pack(side="left", padx=4)
+        ttk.Label(normal_frm, text="（カメラ=正対面が青 / ワールド=上向きが青）",
+                  foreground="#888").pack(side="left")
+        normal_frm.grid(row=row, column=0, columnspan=3, sticky="w", padx=24)
         row += 1
 
         # Matte 系（Beauty+Matte / Matteの奥。対象は Matte targets）
@@ -488,6 +497,14 @@ class CaptureWindow(object):
                 tk.Entry(depf, textvariable=self.seq_far_var, width=7).pack(side="left", padx=2)
                 ttk.Label(depf, text="cm（手前=白/奥=黒）").pack(side="left")
                 depf.grid(row=i + 1, column=3, sticky="w", padx=(12, 0))
+            elif key == "normal":
+                nrmf = ttk.Frame(mtx)
+                ttk.Label(nrmf, text="空間:").pack(side="left")
+                self.seq_normal_space_var = tk.StringVar(master=self.root, value="カメラ")
+                ttk.Combobox(nrmf, textvariable=self.seq_normal_space_var,
+                             state="readonly", width=7,
+                             values=["カメラ", "ワールド"]).pack(side="left", padx=2)
+                nrmf.grid(row=i + 1, column=3, sticky="w", padx=(12, 0))
         mtx.grid(row=row, column=0, columnspan=3, sticky="w", padx=24)
         row += 1
         self.seq_matte_hide_var = tk.BooleanVar(master=self.root, value=False)
@@ -523,6 +540,7 @@ class CaptureWindow(object):
         self.seq_ts_var.set(self.mrq_ts_var.get())
         self.seq_near_var.set(self.near_var.get())
         self.seq_far_var.set(self.far_var.get())
+        self.seq_normal_space_var.set(self.normal_space_var.get())
         self.seq_fog_var.set(self.fog_off_var.get())
         self.status_var.set("画像キャプチャの設定を映像タブへ転送しました")
 
@@ -705,7 +723,8 @@ class CaptureWindow(object):
         if self.normal_var.get():
             # 法線も Beauty と同一 MRQ ジョブの PP パスで撮る（WPO/風の位相一致）
             try:
-                normal_pp_mat = core.create_temp_normal_material()
+                normal_pp_mat = core.create_temp_normal_material(
+                    camera_space=(self.normal_space_var.get() != "ワールド"))
             except Exception as e:
                 skip_notes.append("Normal: 一時マテリアル生成失敗でスキップ")
                 self.status_var.set("Normal: 一時マテリアル生成失敗: %s" % e)
@@ -1332,7 +1351,8 @@ class CaptureWindow(object):
                     self._float_var(self.seq_far_var, 10000.0),
                     invert=True)   # 手前=白 / 奥=黒 固定
             if normal_needed:
-                normal_mat = core.create_temp_normal_material()
+                normal_mat = core.create_temp_normal_material(
+                    camera_space=(self.seq_normal_space_var.get() != "ワールド"))
             if _need("mfront") and matte_prims:
                 matte_mat = core.create_temp_matte_material()
             if _need("behind"):
@@ -1946,6 +1966,8 @@ class CaptureWindow(object):
                 "objid_labels": self.objid_pick.get("labels", {}),
                 "depth_bit": self.depth_bit_var.get(),
                 "near": self.near_var.get(), "far": self.far_var.get(),
+                "normal_space": self.normal_space_var.get(),
+                "seq_normal_space": self.seq_normal_space_var.get(),
                 "mrq_warmup": self.mrq_warmup_var.get(),
                 "mrq_ts": self.mrq_ts_var.get(),
                 "beauty_fmt": self.beauty_fmt_var.get(),
@@ -2040,6 +2062,10 @@ class CaptureWindow(object):
         if st.get("depth_bit") in ("8bit PNG", "16bit PNG", "EXR float"):
             self.depth_bit_var.set(st["depth_bit"])
         _setvar(self.near_var, "near"); _setvar(self.far_var, "far")
+        if st.get("normal_space") in ("カメラ", "ワールド"):
+            self.normal_space_var.set(st["normal_space"])
+        if st.get("seq_normal_space") in ("カメラ", "ワールド"):
+            self.seq_normal_space_var.set(st["seq_normal_space"])
         _setvar(self.mrq_warmup_var, "mrq_warmup")
         _setvar(self.mrq_ts_var, "mrq_ts")
         if st.get("beauty_fmt") in ("PNG 8bit", "JPG 8bit", "EXR 16bit (float)"):

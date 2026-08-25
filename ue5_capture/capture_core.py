@@ -1824,17 +1824,46 @@ def delete_temp_normal_material():
     _delete_temp_material(_TMP_NORMAL_NAME, "Normal")
 
 
-def create_temp_normal_material():
-    """ワールド法線を RGB に出す PostProcess マテリアルを用意して返す。
-    GBuffer の WorldNormal(-1..1) を *0.5+0.5 で 0..1 に詰める（法線マップ規約）。
+# カメラ法線の軸符号（ビュー空間 → 「正対=+Z青 / 右=+X赤 / 上=+Y緑」の規約合わせ）。
+# UE5.7 のビュー空間は X=右 / Y=上 / Z=奥（2026-08-25 実測）なので Z のみ反転する。
+_NORMAL_VIEW_FLIP = (1.0, 1.0, -1.0)
+
+
+def create_temp_normal_material(camera_space=True):
+    """法線を RGB に出す PostProcess マテリアルを用意して返す。
+    camera_space=True で GBuffer WorldNormal をビュー空間へ変換（カメラ法線。
+    正対面が青になる V-Ray SamplerInfo 等の規約）。False はワールド法線そのまま。
+    いずれも -1..1 を *0.5+0.5 で 0..1 に詰める（法線マップ規約）。
     注意: MRQ 経由の PNG/MP4 は表示用エンコード（sRGB）で書かれるため、
     データとして使う場合はリニア化してから -1..1 へ戻すこと（8bit Depth と同じ制約）。"""
     mat = _mx_get_or_create_pp_material(_TMP_NORMAL_NAME)
-    st = _mx_expr(mat, unreal.MaterialExpressionSceneTexture, -700, 0)
+    st = _mx_expr(mat, unreal.MaterialExpressionSceneTexture, -1050, 0)
     st.set_editor_property("scene_texture_id", unreal.SceneTextureId.PPI_WORLD_NORMAL)
-    c_half = _mx_const(mat, 0.5, -700, 220)
-    mul = _mx_expr(mat, unreal.MaterialExpressionMultiply, -450, 0)
-    _mx_conn(st, "Color", mul, "A")
+    m = _mx_expr(mat, unreal.MaterialExpressionComponentMask, -880, 0)
+    m.set_editor_property("r", True)
+    m.set_editor_property("g", True)
+    m.set_editor_property("b", True)
+    m.set_editor_property("a", False)
+    _mx_conn(st, "Color", m, "")
+    src = m
+    if camera_space:
+        tr = _mx_expr(mat, unreal.MaterialExpressionTransform, -730, 0)
+        tr.set_editor_property(
+            "transform_source_type",
+            unreal.MaterialVectorCoordTransformSource.TRANSFORMSOURCE_WORLD)
+        tr.set_editor_property(
+            "transform_type", unreal.MaterialVectorCoordTransform.TRANSFORM_VIEW)
+        _mx_conn(m, "", tr, "")
+        flip = _mx_expr(mat, unreal.MaterialExpressionConstant3Vector, -730, 220)
+        flip.set_editor_property("constant", unreal.LinearColor(
+            _NORMAL_VIEW_FLIP[0], _NORMAL_VIEW_FLIP[1], _NORMAL_VIEW_FLIP[2], 0.0))
+        mulf = _mx_expr(mat, unreal.MaterialExpressionMultiply, -560, 0)
+        _mx_conn(tr, "", mulf, "A")
+        _mx_conn(flip, "", mulf, "B")
+        src = mulf
+    c_half = _mx_const(mat, 0.5, -560, 220)
+    mul = _mx_expr(mat, unreal.MaterialExpressionMultiply, -400, 0)
+    _mx_conn(src, "", mul, "A")
     _mx_conn(c_half, "", mul, "B")
     add = _mx_expr(mat, unreal.MaterialExpressionAdd, -250, 0)
     _mx_conn(mul, "", add, "A")
@@ -1846,7 +1875,8 @@ def create_temp_normal_material():
         unreal.EditorAssetLibrary.save_loaded_asset(mat)
     except Exception as e:
         _warn("一時法線マテリアルの保存に失敗（未保存のまま続行）: %s" % e)
-    _log("一時法線マテリアル生成 (WorldNormal*0.5+0.5)")
+    _log("一時法線マテリアル生成 (%s*0.5+0.5)"
+         % ("ViewNormal" if camera_space else "WorldNormal"))
     return mat
 
 
