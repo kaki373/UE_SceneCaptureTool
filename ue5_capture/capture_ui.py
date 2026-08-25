@@ -105,25 +105,28 @@ class CaptureWindow(object):
         self._refresh_sequence()
 
     def _build_image_tab(self, frm, pad):
-        """従来の単発キャプチャ UI（レイアウトは従来のまま）。"""
+        """従来の単発キャプチャ UI。ウィジェット/変数/ロジックは従来のまま、
+        「カメラ / 解像度」「出力先 / ファイル名」「出力素材」の 3 枠に区分けのみ。"""
+        # ---- カメラ / 解像度 ----
+        camf = ttk.LabelFrame(frm, text="カメラ / 解像度")
         row = 0
 
         # Camera（Refresh で現在のレベルのカメラに更新）
-        ttk.Label(frm, text="Camera:").grid(row=row, column=0, sticky="w", **pad)
+        ttk.Label(camf, text="Camera:").grid(row=row, column=0, sticky="w", **pad)
         self.cam_var = tk.StringVar(master=self.root)
         cam_labels = [c.get_actor_label() for c in self._cameras] or ["(no camera)"]
-        self.cam_combo = ttk.Combobox(frm, textvariable=self.cam_var,
+        self.cam_combo = ttk.Combobox(camf, textvariable=self.cam_var,
                                       values=cam_labels, state="readonly", width=28)
         self.cam_combo.current(0)
         self.cam_combo.grid(row=row, column=1, sticky="we", **pad)
-        ttk.Button(frm, text="⟳", width=3, command=self._refresh_cameras).grid(
+        ttk.Button(camf, text="⟳", width=3, command=self._refresh_cameras).grid(
             row=row, column=2, sticky="w")
         self.cam_combo.bind("<<ComboboxSelected>>", lambda e: self._on_camera_change())
         row += 1
 
         # Resolution
-        ttk.Label(frm, text="Resolution:").grid(row=row, column=0, sticky="nw", **pad)
-        camrow = ttk.Frame(frm)
+        ttk.Label(camf, text="Resolution:").grid(row=row, column=0, sticky="nw", **pad)
+        camrow = ttk.Frame(camf)
         self.res_mode = tk.StringVar(master=self.root, value="camera")
         ttk.Radiobutton(camrow, text="Use Camera Setting", variable=self.res_mode,
                         value="camera").pack(side="left")
@@ -131,7 +134,7 @@ class CaptureWindow(object):
         ttk.Label(camrow, textvariable=self.cam_res_var, foreground="#0a7").pack(side="left", padx=(8, 0))
         camrow.grid(row=row, column=1, columnspan=2, sticky="w")
         row += 1
-        ovr = ttk.Frame(frm)
+        ovr = ttk.Frame(camf)
         ttk.Radiobutton(ovr, text="Override:", variable=self.res_mode,
                         value="override").pack(side="left")
         self.w_var = tk.StringVar(master=self.root, value="3840")
@@ -155,8 +158,8 @@ class CaptureWindow(object):
         self.res_mode.trace_add("write", lambda *a: self._on_res_mode_change())
 
         # Overscan（Override の下。ON のとき % か 直接ピクセルで余白を追加。元フレームは中央維持・全パス共通）
-        ttk.Label(frm, text="Overscan:").grid(row=row, column=0, sticky="w", **pad)
-        osf = ttk.Frame(frm)
+        ttk.Label(camf, text="Overscan:").grid(row=row, column=0, sticky="w", **pad)
+        osf = ttk.Frame(camf)
         self.overscan_on_var = tk.BooleanVar(master=self.root, value=False)
         ttk.Checkbutton(osf, text="ON", variable=self.overscan_on_var).pack(side="left")
         self.overscan_mode_var = tk.StringVar(master=self.root, value="percent")
@@ -176,48 +179,51 @@ class CaptureWindow(object):
         row += 1
 
         # anti-aliasing（旧 AA）
-        ttk.Label(frm, text="anti-aliasing:").grid(row=row, column=0, sticky="w", **pad)
+        ttk.Label(camf, text="anti-aliasing:").grid(row=row, column=0, sticky="w", **pad)
         self.aa_var = tk.StringVar(master=self.root, value="2x")
-        ttk.Combobox(frm, textvariable=self.aa_var, values=["1x", "2x", "4x"],
+        ttk.Combobox(camf, textvariable=self.aa_var, values=["1x", "2x", "4x"],
                      state="readonly", width=8).grid(row=row, column=1, sticky="w", **pad)
-        row += 1
+        camf.columnconfigure(1, weight=1)
+        camf.grid(row=0, column=0, sticky="we", padx=6, pady=(6, 2))
+
+        # ---- 出力先 / ファイル名 ----
+        outf = ttk.LabelFrame(frm, text="出力先 / ファイル名")
+        row = 0
 
         # Output dir
-        ttk.Label(frm, text="Output Dir:").grid(row=row, column=0, sticky="w", **pad)
+        ttk.Label(outf, text="Output Dir:").grid(row=row, column=0, sticky="w", **pad)
         default_dir = os.path.normpath(
             os.path.join(unreal.Paths.project_saved_dir(), "Captures"))
         self.out_var = tk.StringVar(master=self.root, value=default_dir)
-        tk.Entry(frm, textvariable=self.out_var, width=28).grid(
+        tk.Entry(outf, textvariable=self.out_var, width=28).grid(
             row=row, column=1, sticky="we", **pad)
-        ttk.Button(frm, text="...", width=3, command=self._browse).grid(
+        ttk.Button(outf, text="...", width=3, command=self._browse).grid(
             row=row, column=2, sticky="w")
         row += 1
 
         # ファイル名: [任意名]_[カメラ名]_素材名_001（任意名/カメラ名は下のチェックで含める）
         self.name_usecustom_var = tk.BooleanVar(master=self.root, value=False)
-        ttk.Checkbutton(frm, text="任意名を付ける:", variable=self.name_usecustom_var).grid(
+        ttk.Checkbutton(outf, text="任意名を付ける:", variable=self.name_usecustom_var).grid(
             row=row, column=0, sticky="w", **pad)
         self.name_custom_var = tk.StringVar(master=self.root, value="")
-        tk.Entry(frm, textvariable=self.name_custom_var, width=28).grid(
+        tk.Entry(outf, textvariable=self.name_custom_var, width=28).grid(
             row=row, column=1, sticky="we", **pad)
         row += 1
         self.name_usecam_var = tk.BooleanVar(master=self.root, value=True)
-        ttk.Checkbutton(frm, text="カメラ名を付ける", variable=self.name_usecam_var).grid(
+        ttk.Checkbutton(outf, text="カメラ名を付ける", variable=self.name_usecam_var).grid(
             row=row, column=0, columnspan=2, sticky="w", **pad)
         row += 1
-        ttk.Label(frm, text="  ファイル名: [任意名]_[カメラ名]_素材名_NNN",
+        ttk.Label(outf, text="  ファイル名: [任意名]_[カメラ名]_素材名_NNN",
                   foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", padx=8)
-        row += 1
+        outf.columnconfigure(1, weight=1)
+        outf.grid(row=1, column=0, sticky="we", padx=6, pady=2)
 
-        ttk.Separator(frm, orient="horizontal").grid(
-            row=row, column=0, columnspan=3, sticky="we", pady=8)
-        row += 1
-        ttk.Label(frm, text="出力:").grid(
-            row=row, column=0, columnspan=3, sticky="w", **pad)
-        row += 1
+        # ---- 出力素材 ----
+        matf = ttk.LabelFrame(frm, text="出力素材")
+        row = 0
 
         # 品質と出力形式（Beauty より上に置く）
-        mrqf = ttk.Frame(frm)
+        mrqf = ttk.Frame(matf)
         ttk.Label(mrqf, text="ウォームアップ:").pack(side="left")
         self.mrq_warmup_var = tk.StringVar(master=self.root, value="32")
         tk.Entry(mrqf, textvariable=self.mrq_warmup_var, width=5).pack(side="left", padx=2)
@@ -226,7 +232,7 @@ class CaptureWindow(object):
         tk.Entry(mrqf, textvariable=self.mrq_ts_var, width=5).pack(side="left", padx=2)
         mrqf.grid(row=row, column=0, columnspan=3, sticky="w", padx=8)
         row += 1
-        fmtf = ttk.Frame(frm)
+        fmtf = ttk.Frame(matf)
         ttk.Label(fmtf, text="出力形式:").pack(side="left")
         self.beauty_fmt_var = tk.StringVar(master=self.root, value="PNG 8bit")
         ttk.Combobox(fmtf, textvariable=self.beauty_fmt_var, state="readonly", width=14,
@@ -236,16 +242,16 @@ class CaptureWindow(object):
                   foreground="#888").pack(side="left")
         fmtf.grid(row=row, column=0, columnspan=3, sticky="w", padx=8)
         row += 1
-        ttk.Frame(frm, height=8).grid(row=row, column=0)   # 余白
+        ttk.Frame(matf, height=8).grid(row=row, column=0)   # 余白
         row += 1
 
         # Beauty（MRQ = ビューポート露出＋シーケンサ品質）
         self.beauty_var = tk.BooleanVar(master=self.root, value=True)
-        ttk.Checkbutton(frm, text="Beauty（MRQ = ビューポート露出＋シーケンサ品質）",
+        ttk.Checkbutton(matf, text="Beauty（MRQ = ビューポート露出＋シーケンサ品質）",
                         variable=self.beauty_var).grid(
             row=row, column=0, columnspan=3, sticky="w", padx=8)
         row += 1
-        mrqf2 = ttk.Frame(frm)
+        mrqf2 = ttk.Frame(matf)
         self.mrq_camasp_var = tk.BooleanVar(master=self.root, value=True)
         ttk.Checkbutton(mrqf2, text="カメラのアスペクト",
                         variable=self.mrq_camasp_var).pack(side="left")
@@ -264,26 +270,26 @@ class CaptureWindow(object):
 
         # Raw Lighting（MRQ LightingOnly パス = アルベド無視のライティングのみ素材）
         self.rlfull_var = tk.BooleanVar(master=self.root, value=False)
-        ttk.Checkbutton(frm, text="Raw Lighting Full(Sun+GI+Sky)",
+        ttk.Checkbutton(matf, text="Raw Lighting Full(Sun+GI+Sky)",
                         variable=self.rlfull_var).grid(
             row=row, column=0, columnspan=3, sticky="w", padx=8)
         row += 1
         self.rldir_var = tk.BooleanVar(master=self.root, value=False)
-        ttk.Checkbutton(frm, text="Raw Lighting Direct",
+        ttk.Checkbutton(matf, text="Raw Lighting Direct",
                         variable=self.rldir_var).grid(
             row=row, column=0, columnspan=3, sticky="w", padx=8)
         row += 1
-        ttk.Label(frm, text="  （ライティングのみ素材＝落ち影+シェーディング。Direct は"
-                            " GI/スカイライト/AO なしの直射のみ＝追加レンダ1回）",
+        ttk.Label(matf, text="  （ライティングのみ素材＝落ち影+シェーディング。Direct は"
+                             " GI/スカイライト/AO なしの直射のみ＝追加レンダ1回）",
                   foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", padx=8)
         row += 1
 
         # Z-Depth（手前=白/奥=黒 固定）
         self.depth_var = tk.BooleanVar(master=self.root, value=False)
-        ttk.Checkbutton(frm, text="Z-Depth（手前=白 / 奥=黒）", variable=self.depth_var).grid(
+        ttk.Checkbutton(matf, text="Z-Depth（手前=白 / 奥=黒）", variable=self.depth_var).grid(
             row=row, column=0, columnspan=3, sticky="w", padx=8)
         row += 1
-        depth_frm = ttk.Frame(frm)
+        depth_frm = ttk.Frame(matf)
         ttk.Label(depth_frm, text="Format:").pack(side="left")
         self.depth_bit_var = tk.StringVar(master=self.root, value="16bit PNG")
         ttk.Combobox(depth_frm, textvariable=self.depth_bit_var,
@@ -302,47 +308,49 @@ class CaptureWindow(object):
 
         # Normal（ワールド法線 → RGB。-1..1 を *0.5+0.5 で 0..1 に詰める）
         self.normal_var = tk.BooleanVar(master=self.root, value=False)
-        ttk.Checkbutton(frm, text="Normal（ワールド法線 RGB = XYZ*0.5+0.5）",
+        ttk.Checkbutton(matf, text="Normal（ワールド法線 RGB = XYZ*0.5+0.5）",
                         variable=self.normal_var).grid(
             row=row, column=0, columnspan=3, sticky="w", padx=8)
         row += 1
 
         # Matte 系（Beauty+Matte / Matteの奥。対象は Matte targets）
         self.mfront_var = tk.BooleanVar(master=self.root, value=False)
-        ttk.Checkbutton(frm, text="Matteの前（Beauty+Matte）",
+        ttk.Checkbutton(matf, text="Matteの前（Beauty+Matte）",
                         variable=self.mfront_var).grid(
             row=row, column=0, columnspan=3, sticky="w", padx=8)
         row += 1
         self.behind_var = tk.BooleanVar(master=self.root, value=False)
-        ttk.Checkbutton(frm, text="Matteの奥",
+        ttk.Checkbutton(matf, text="Matteの奥",
                         variable=self.behind_var).grid(
             row=row, column=0, columnspan=3, sticky="w", padx=8)
         row += 1
-        ttk.Label(frm, text="  （対象は下の Matte targets、空ならエディタ選択。出力時は Beauty から対象を自動で隠す）",
+        ttk.Label(matf, text="  （対象は下の Matte targets、空ならエディタ選択。出力時は Beauty から対象を自動で隠す）",
                   foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", padx=8)
         row += 1
-        self.matte_pick, row = self._make_picker(frm, row, "Matte targets")
+        self.matte_pick, row = self._make_picker(matf, row, "Matte targets")
         # マット対象はリストに入れた時点でライティングから分離、外したら復元する
         self.matte_pick["on_added"] = self._matte_paths_neutralize
         self.matte_pick["on_removed"] = self._matte_paths_restore
-        ttk.Label(frm, text="  （リストに入れた対象は自動で 影/AO/受光なし になり、外すと元に戻ります）",
+        ttk.Label(matf, text="  （リストに入れた対象は自動で 影/AO/受光なし になり、外すと元に戻ります）",
                   foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", padx=24)
         row += 1
 
         # ObjectID（対象を色分け・他は黒）
         self.objid_var = tk.BooleanVar(master=self.root, value=False)
-        ttk.Checkbutton(frm, text="ObjectID（対象を色分け・他は黒 + 色↔名前 JSON）",
+        ttk.Checkbutton(matf, text="ObjectID（対象を色分け・他は黒 + 色↔名前 JSON）",
                         variable=self.objid_var).grid(
             row=row, column=0, columnspan=3, sticky="w", padx=8)
         row += 1
-        self.objid_pick, row = self._make_picker(frm, row, "Object ID targets")
+        self.objid_pick, row = self._make_picker(matf, row, "Object ID targets")
+        matf.columnconfigure(1, weight=1)
+        matf.grid(row=2, column=0, sticky="we", padx=6, pady=2)
 
         self.capture_btn = ttk.Button(
             frm, text="Capture", style="Big.TButton", command=self._on_mrq)
-        self.capture_btn.grid(row=row, column=0, columnspan=3,
-                              pady=14, padx=24, ipady=6, sticky="we")
+        self.capture_btn.grid(row=3, column=0,
+                              pady=(10, 14), padx=24, ipady=6, sticky="we")
 
-        frm.columnconfigure(1, weight=1)
+        frm.columnconfigure(0, weight=1)
 
     def _build_seq_tab(self, frm, pad):
         """映像キャプチャ（シーケンスレンダ）タブ。設定は画像タブから独立していて、
