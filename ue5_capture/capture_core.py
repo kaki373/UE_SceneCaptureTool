@@ -1629,34 +1629,42 @@ def _read_linear_alpha(path, ffmpeg):
 
 
 def compose_visible_cloud(w_exr, geomask_exr, out_rgba_png, ffmpeg=None, scale=None):
-    """可視雲マット合成: 白バッキングレンダ（EXR RGB=W・α=全投影雲α）と GeoMask
-    （ジオメトリ有=白）から「見えている雲の不透明度」を α に持つ RGBA PNG を書く。
-    ジオメトリ画素: 1−T（T=W/素板レベル。深度順序どおり＝雲を貫く物体は乗らない）/
-    非ジオメトリ（空）画素: α（雲 vs 空は遮蔽が無いので全投影=可視）。
+    """可視雲マット合成（黒バッキング方式）: 全ジオメトリを黒アンリット材で
+    レンダした EXR（RGB=雲の散乱輝度 L・α=全投影雲α）と GeoMask（ジオメトリ有=白）
+    から「見えている雲量」を α に持つ RGBA PNG を書く。
+    L は遮蔽考慮（黒い物体が手前なら 0）の知覚的カバレッジ。空画素は α が正確な
+    ので、空の雲画素で scale=median(α/L) を自己較正してジオメトリ画素へ L×scale を
+    適用する（白バッキングの 1−T は物理透過率で Beauty の見た目より薄い実測
+    2026-08-26 → 知覚合わせの輝度方式へ変更）。
     戻り値 (out_path, scale)。失敗時 (None, None)。"""
     if not (_HAS_NUMPY and _HAS_PIL):
         return None, None
-    w = _read_linear_gray(w_exr, ffmpeg)
+    L = _read_linear_gray(w_exr, ffmpeg)
     a = _read_linear_alpha(w_exr, ffmpeg)
     g = _read_linear_gray(geomask_exr, ffmpeg) if geomask_exr else None
-    if w is None or a is None:
-        _warn("可視雲: 入力を読めません (W=%s α=%s)"
-              % (w is not None, a is not None))
+    if L is None or a is None:
+        _warn("可視雲: 入力を読めません (L=%s α=%s)"
+              % (L is not None, a is not None))
         return None, None
     # UE のシーンリニア EXR は α を「1−カバレッジ」で格納する（空=1・不透明=0。
     # AV024 実測 2026-08-26。PNG 出力は MRQ が標準向きへ反転して書く）
     a = 1.0 - _np.clip(a, 0.0, 1.0)
     if g is None:
-        # GeoMask なしはαのみ（遮蔽なし全投影の劣化モード）
         _warn("可視雲: GeoMask なし＝空画素αのみで合成（遮蔽は反映されない）")
-        vis = _np.clip(a, 0.0, 1.0)
+        vis = a
         scale = scale or 1.0
     else:
-        t, scale = _backing_t_from_array(w, scale)
-        if t is None:
-            _warn("可視雲: 素のジオメトリ領域が見つからず正規化できません")
-            return None, None
-        vis = _np.where(g > 0.5, 1.0 - t, _np.clip(a, 0.0, 1.0))
+        if scale is None:
+            sel = (g < 0.5) & (a > 0.15) & (L > 1e-6)
+            if sel.sum() >= 100:
+                scale = float(_np.median(a[sel] / L[sel]))
+            else:
+                # 空に雲が無い構図: 輝度の高位パーセンタイルで代用
+                lv = L[L > 1e-6]
+                scale = (1.0 / max(float(_np.percentile(lv, 99)), 1e-6)
+                         if lv.size else 1.0)
+                _warn("可視雲: 空の雲画素が少なく scale=%.4f を輝度から推定" % scale)
+        vis = _np.where(g > 0.5, _np.clip(L * scale, 0.0, 1.0), a)
     vis8 = (_np.clip(vis, 0.0, 1.0) * 255.0 + 0.5).astype(_np.uint8)
     z = _np.zeros_like(vis8)
     _PILImage.merge("RGBA", tuple(_PILImage.fromarray(c) for c in (z, z, z, vis8))
