@@ -628,8 +628,15 @@ def _set_cloud_matte_mode(vol_targets, use_holdout=False):
             continue
         if not use_holdout:
             try:
-                if a.get_components_by_class(unreal.LightComponentBase):
-                    continue   # ライト持ちは残す（隠すと HV が無照明でα全黒）
+                # 太陽/スカイライト持ちだけ残す（隠すと HV が無照明でα全黒・2026-07-24実測）。
+                # ローカルライト（Point/Spot/Rect）しか持たないアクターは隠す — 雲の照明は
+                # 太陽/スカイ支配で、残すと不透明ジオメトリがα=1でマスクを汚す
+                # （AV024 でライト内蔵の街BPが雲マットに白く混入した実測 2026-08-25）。
+                lights = a.get_components_by_class(unreal.LightComponentBase)
+                if lights and any(isinstance(c, (unreal.DirectionalLightComponent,
+                                                 unreal.SkyLightComponent))
+                                  for c in lights):
+                    continue
                 if not a.get_editor_property("hidden"):
                     a.set_actor_hidden_in_game(True)
                     hidden_actors.append(a)
@@ -654,11 +661,94 @@ def _set_cloud_matte_mode(vol_targets, use_holdout=False):
     _log("CloudMatte(%s): holdout %d comps / 非表示 %d actors / %d comps"
          % ("holdout" if use_holdout else "分離", len(holdout_comps),
             len(hidden_actors), len(hidden_comps)))
-    return holdout_comps, hidden_actors, hidden_comps
+    pie_state = None
+    if not use_holdout:
+        pie_state = _start_pie_cloud_hider(vol_targets)
+    return holdout_comps, hidden_actors, hidden_comps, pie_state
+
+
+def _start_pie_cloud_hider(vol_targets):
+    """PIE ワールド側で雲以外の描画アクターを隠すウォッチャを開始する。
+    LevelInstance 内包アクターは PIE で資産から再生成されるため、エディタ側の
+    hidden が伝搬しない（AV024 の街 LevelInstance の StaticMeshActor 184台が
+    隠れずαを汚した実測 2026-08-25）。Sequencer スポーナブルも同様。
+    PIE 出現を slate tick で待ち、毎 tick 冪等に隠す（ストリーミングの遅延流入や
+    スポーナブルも拾う）。PIE は終了時に破棄されるので復元不要。"""
+    tnames = set()
+    for a in vol_targets or []:
+        try:
+            tnames.add(a.get_name())
+            tnames.add(a.get_actor_label())
+        except Exception:
+            pass
+    state = {"h": None, "n": 0, "logged": False}
+
+    def _stop():
+        h = state.pop("h", None)
+        if h is not None:
+            try:
+                unreal.unregister_slate_post_tick_callback(h)
+            except Exception:
+                pass
+
+    def _tick(dt):
+        pie = None
+        try:
+            pie = unreal.get_editor_subsystem(
+                unreal.UnrealEditorSubsystem).get_game_world()
+        except Exception:
+            try:
+                pie = unreal.EditorLevelLibrary.get_game_world()
+            except Exception:
+                pie = None
+        if pie is None:
+            if state["logged"]:
+                _stop()        # PIE が終わった → 監視終了
+            return
+        n = 0
+        try:
+            for a in unreal.GameplayStatics.get_all_actors_of_class(pie, unreal.Actor):
+                try:
+                    if a.get_name() in tnames or a.get_actor_label() in tnames:
+                        continue
+                    if isinstance(a, unreal.CameraActor):
+                        continue      # レンダ視点（スポーナブルカメラ含む）は触らない
+                    if not a.get_components_by_class(unreal.PrimitiveComponent):
+                        continue
+                    if a.get_editor_property("hidden"):
+                        continue      # エディタ側で隠した分の複製・処理済み分
+                    lights = a.get_components_by_class(unreal.LightComponentBase)
+                    if lights and any(isinstance(c, (unreal.DirectionalLightComponent,
+                                                     unreal.SkyLightComponent))
+                                      for c in lights):
+                        continue      # 太陽/スカイライト持ちは残す（雲の照明）
+                    a.set_actor_hidden_in_game(True)
+                    n += 1
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        state["n"] += n
+        if not state["logged"]:
+            state["logged"] = True
+            _log("CloudMatte: PIE 側で %d アクターを追加で隠しました" % n)
+
+    state["h"] = unreal.register_slate_post_tick_callback(_tick)
+    state["stop"] = _stop
+    return state
 
 
 def _restore_cloud_matte_mode(saved):
-    holdout_comps, hidden_actors, hidden_comps = saved or ([], [], [])
+    if not saved:
+        saved = ([], [], [], None)
+    if len(saved) == 3:               # 旧形式互換
+        saved = tuple(saved) + (None,)
+    holdout_comps, hidden_actors, hidden_comps, pie_state = saved
+    if pie_state and pie_state.get("stop"):
+        try:
+            pie_state["stop"]()
+        except Exception:
+            pass
     for c in holdout_comps:
         try:
             c.set_editor_property("holdout", False)
