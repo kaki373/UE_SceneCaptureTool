@@ -857,22 +857,23 @@ class CaptureWindow(object):
                              backing_white=True, fmt="exr", cloud_kind="backing_w"))
             if matte_vols:
                 skip_notes.append("雲マット: 板の手前の雲は自動反映（雲の対象指定は不要）")
-        # Matteの前用の雲αジョブと雲マット/Normal雲抜き用ジョブ。対象集合が同じなら
-        # 1本で共用、違うなら Matteの前用を内部名（CloudMatteMF）へ退けて2本にする。
+        # Matteの前用の雲αジョブ（分離モード）と、雲マット/Normal雲抜き用の
+        # 可視雲ジョブ（白バッキング化＝深度順序どおり）。意味論が違うため共用しない。
         cloud_alpha_needed = want_cloudmatte or need_cloud_for_normal
-        cloudmatte_job = cloud_alpha_needed
+        geomask_mat = None
         if (not use_backing) and want_mfront and matte_vols and vdb:
-            share = (cloud_alpha_needed and
-                     {a.get_path_name() for a in matte_vols}
-                     == {a.get_path_name() for a in cloudmatte_vols})
-            base = (_name("CloudMatteMF")
-                    if (cloud_alpha_needed and not share) else _name("CloudMatte"))
+            base = (_name("CloudMatteMF") if cloud_alpha_needed
+                    else _name("CloudMatte"))
             jobs.append(dict(base=base, cloud=matte_vols, cloud_kind="matte"))
-            if share:
-                cloudmatte_job = False        # Matteの前と1本で共用
-        if cloudmatte_job:
+        if cloud_alpha_needed:
+            try:
+                geomask_mat = core.create_temp_geomask_material()
+            except Exception as e:
+                skip_notes.append("雲マット: GeoMask 生成失敗（空画素はα劣化）")
+                self.status_var.set("GeoMask 生成失敗: %s" % e)
             jobs.append(dict(base=_name("CloudMatte"), cloud=cloudmatte_vols,
-                             cloud_kind="matte_out"))
+                             cloud_kind="cloudvis", fmt="exr",
+                             geomask=geomask_mat))
         if want_behind:
             mt = core._resolve_target_actors(None, self._pick_targets_resolved(self.matte_pick) or None)
             mt_p, mt_v = core.split_volumetric_targets(mt)
@@ -970,10 +971,14 @@ class CaptureWindow(object):
                         (normal_exr, False),
                         (os.path.join(out, _name("Beauty") + "_Matte.png"), False),
                         (cm_png, want_cloudmatte),
+                        (os.path.join(out, _name("CloudMatte") + ".exr"), False),
+                        (os.path.join(out, _name("CloudMatte") + "_GeoMask.exr"), False),
                         (os.path.join(out, _name("CloudMatteMF") + ".png"), False),
                         (os.path.join(out, _name("BackingW") + ".exr"), False),
                         (os.path.join(out, _name("Beauty") + "_BackingT.png"), False),
                         (beauty_path, keep_beauty)]
+            if geomask_mat is not None:
+                core.delete_temp_geomask_material()
             removals += [(cp, False) for _lbl, cp in objid_cloud_entries]
             for p, keep in removals:
                 if p and not keep and os.path.isfile(p):
@@ -1017,11 +1022,24 @@ class CaptureWindow(object):
                         except Exception as e:
                             self.status_var.set("雲マット合成エラー: %s" % e)
                 # CloudMatte / 雲ObjectID ジョブ: αを回収して合成へ
+                elif _j.get("cloud_kind") == "cloudvis":
+                    # 可視雲: EXR(W+α) + GeoMask から深度順序どおりの可視雲αを合成
+                    wexr = os.path.join(out, _j["base"] + ".exr")
+                    if not ok or not os.path.isfile(wexr):
+                        skip_notes.append("雲マット: 可視雲レンダ失敗")
+                    else:
+                        gexr = os.path.join(out, _j["base"] + "_GeoMask.exr")
+                        cp2, _sc = core.compose_visible_cloud(
+                            wexr, gexr if os.path.isfile(gexr) else None,
+                            os.path.join(out, _j["base"] + ".png"),
+                            ffmpeg=core.find_ffmpeg(getattr(self, "_ffmpeg_hint", None)))
+                        if not cp2:
+                            skip_notes.append("雲マット: 可視雲合成失敗")
                 elif _j.get("cloud_kind"):
                     cp = os.path.join(out, _j["base"] + ".png")
                     if not ok or not os.path.isfile(cp):
                         skip_notes.append("%s: レンダ失敗" %
-                                          ("雲マット" if _j["cloud_kind"] in ("matte", "matte_out")
+                                          ("雲マット" if _j["cloud_kind"] == "matte"
                                            else "雲ObjectID(%s)" % _j.get("cloud_label", "?")))
                     elif _j["cloud_kind"] == "matte":
                         cloud_matte_path = cp
@@ -1030,8 +1048,6 @@ class CaptureWindow(object):
                                 _compose_mfront()
                             except Exception as e:
                                 self.status_var.set("雲マット合成エラー: %s" % e)
-                    elif _j["cloud_kind"] == "matte_out":
-                        pass          # 雲マット独立出力（白黒化は _finalize で行う）
                     else:
                         objid_cloud_entries.append(
                             (_j.get("cloud_label", _j["base"]), cp))
@@ -1088,6 +1104,9 @@ class CaptureWindow(object):
                                           light_pass=j.get("raw_light", False),
                                           light_direct=j.get("raw_light", False),
                                           cloud_matte_actors=j.get("cloud"),
+                                          cloud_visible=(j.get("cloud_kind")
+                                                         == "cloudvis"),
+                                          geomask_material=j.get("geomask"),
                                           backing_actors=j.get("backing"),
                                           backing_white=j.get("backing_white", False),
                                           fog_off=self.fog_off_var.get(),
@@ -1188,6 +1207,8 @@ class CaptureWindow(object):
                 core.delete_temp_depth_material()
             if normal_pp_mat is not None:
                 core.delete_temp_normal_material()
+            if geomask_mat is not None:
+                core.delete_temp_geomask_material()
             _restore_fb()
             self.status_var.set("MRQ 起動失敗: %s" % e)
 
@@ -1610,20 +1631,38 @@ class CaptureWindow(object):
                 _after_encode(True)
 
         def _run_cloud_matte(ok, od):
-            """雲(HV)マットの専用ジョブ: CloudMatte 連番（PNGのα=可視雲不透明度）を
-            レンダし、後処理で Matte マスクへ合成する。失敗してもメイン素材の
-            後処理は完走する（注記のみ）。"""
+            """雲(HV)マットの専用ジョブ。Matteの前と共用のときは従来の分離モードα
+            （遮蔽なし全投影）、雲マット/Normal 用の単独ジョブなら可視雲モード
+            （白バッキング化＝深度順序どおり。雲を貫く物体はマットに乗らない）。
+            失敗してもメイン素材の後処理は完走する（注記のみ）。"""
             if not (ok and cloud_seq["run"]):
                 _run_backing_w(ok, od)
                 return
+            vis_mode = not cloud_seq["mfront"]
+            geo_mat = None
+            if vis_mode:
+                try:
+                    geo_mat = core.create_temp_geomask_material()
+                except Exception:
+                    seq_notes.append("雲マット: GeoMask 生成失敗（遮蔽反映なしで続行）")
 
             def _cloud_done(cok, cod):
                 if not cok:
                     cloud_seq["run"] = False
                     seq_notes.append("雲マット: レンダ失敗")
+                elif vis_mode:
+                    n = core.compose_visible_cloud_sequence(
+                        out, name_body, take_str,
+                        ffmpeg=core.find_ffmpeg(getattr(self, "_ffmpeg_hint", None)))
+                    if n <= 0:
+                        cloud_seq["run"] = False
+                        seq_notes.append("雲マット: 可視雲合成失敗")
+                if geo_mat is not None:
+                    core.delete_temp_geomask_material()
                 _run_backing_w(True, od)
 
-            self.status_var.set("雲マット(CloudMatte)をレンダ中… (分離モードα)")
+            self.status_var.set("雲マット(CloudMatte)をレンダ中… (%s)"
+                                % ("可視雲=白バッキング" if vis_mode else "分離モードα"))
             self.root.update()
             try:
                 capture_mrq.render_sequence(
@@ -1635,12 +1674,16 @@ class CaptureWindow(object):
                     temporal_samples=1, warmup=warm,
                     custom_start=cs, custom_end=ce,
                     cloud_matte_actors=cloud_vols_job,
+                    cloud_visible=vis_mode, geomask_material=geo_mat,
+                    use_exr=vis_mode,
                     beauty_label="CloudMatte",
                     fog_off=self.seq_fog_var.get(), on_done=_cloud_done)
             except Exception as e:
                 cloud_seq["run"] = False
                 seq_notes.append("雲マット: 起動失敗")
                 self.status_var.set("雲マット起動失敗: %s" % e)
+                if geo_mat is not None:
+                    core.delete_temp_geomask_material()
                 _run_backing_w(True, od)
 
         def _run_backing_w(ok, od):

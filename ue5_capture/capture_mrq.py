@@ -217,9 +217,14 @@ def render_beauty(camera_actor, output_dir, width, height,
                   matte_material=None, matte_actors=None, depth_material=None,
                   normal_material=None,
                   light_pass=False, light_direct=False,
-                  cloud_matte_actors=None,
+                  cloud_matte_actors=None, cloud_visible=False,
+                  geomask_material=None,
                   backing_actors=None, backing_white=False):
     """対象カメラを MRQ で Beauty レンダリング（非同期）。executor を返す。
+    cloud_visible=True（要 cloud_matte_actors）は可視雲モード: 何も隠さず PIE 側で
+    全ジオメトリを白発光材へ差し替え、EXR の RGB=W(=T×素板レベル)・α=全投影雲αを
+    1ジョブで出す（geomask_material を渡すと GeoMask PP パスも同乗）。
+    後段の core.compose_visible_cloud で深度順序どおりの可視雲αに合成する。
     cloud_matte_actors を渡すと CloudMatte ジョブになる: 対象 HV ボリューム(雲)を
     holdout・他プリミティブも holdout・大気/フォグ OFF で、PNG のαに可視雲
     不透明度が入る（RGB はほぼ黒＝マット専用）。要 cloud_matte_ready()。
@@ -266,7 +271,12 @@ def render_beauty(camera_actor, output_dir, width, height,
     if matte_material is not None:
         saved_matte = _set_matte_render_mode(matte_actors)
     saved_cloud = None
-    if cloud_matte_actors:
+    saved_vis = None
+    if cloud_matte_actors and cloud_visible:
+        # 可視雲モード: 何も隠さず PIE 側で白バッキング化（深度順序が保たれる）
+        saved_vis = {"pie": _start_pie_backing_white(cloud_matte_actors),
+                     "fills": _spawn_cloud_fill_lights(5.0)}
+    elif cloud_matte_actors:
         # UE5.7 は holdout 方式のα出力が実質壊れている（cvarペア有効でも最大2/255・
         # 2026-07-24実測）ため分離モード固定。エンジン修正後に
         # use_holdout=cloud_matte_holdout_ready() へ戻す。
@@ -290,6 +300,8 @@ def render_beauty(camera_actor, output_dir, width, height,
             _restore_matte_render_mode(saved_matte)
         if saved_cloud:
             _restore_cloud_matte_mode(saved_cloud)
+        if saved_vis:
+            _restore_visible_cloud_mode(saved_vis)
         if saved_backing:
             _restore_backing_materials(saved_backing)
         _restore_autoplay_players(saved_players)
@@ -304,6 +316,8 @@ def render_beauty(camera_actor, output_dir, width, height,
                              matte_material, depth_material, normal_material,
                              light_pass, light_direct,
                              cloud_matte=bool(cloud_matte_actors),
+                             cloud_visible=cloud_visible,
+                             geomask_material=geomask_material,
                              backing=bool(backing_actors))
     except Exception:
         # 起動に失敗したら状態を巻き戻す（次回レンダを塞がない）
@@ -327,6 +341,7 @@ def _start_render(sub, camera_actor, output_dir, width, height,
                   fog_off, restore_scene, scene_sequence=None, scene_frame=None,
                   matte_material=None, depth_material=None, normal_material=None,
                   light_pass=False, light_direct=False, cloud_matte=False,
+                  cloud_visible=False, geomask_material=None,
                   backing=False):
     seq, seq_path = _create_temp_sequence(camera_actor,
                                           scene_sequence=scene_sequence,
@@ -343,7 +358,8 @@ def _start_render(sub, camera_actor, output_dir, width, height,
     cfg = job.get_configuration()
     extra_passes = []
     for pass_name, pass_mat in (("Matte", matte_material), ("Depth", depth_material),
-                                ("Normal", normal_material)):
+                                ("Normal", normal_material),
+                                ("GeoMask", geomask_material)):
         if pass_mat is None:
             continue
         ppp = unreal.MoviePipelinePostProcessPass()
@@ -370,8 +386,8 @@ def _start_render(sub, camera_actor, output_dir, width, height,
     fmt = (image_format or ("exr" if use_exr else "png")).lower()
     if fmt == "exr":
         exr_out = cfg.find_or_add_setting_by_class(unreal.MoviePipelineImageSequenceOutput_EXR)
-        if light_pass:
-            # マルチレイヤ EXR だと LightingOnly が別ファイルにならないため分割する
+        if light_pass or cloud_visible:
+            # マルチレイヤ EXR だと LightingOnly/追加PPパスが別ファイルにならないため分割
             exr_out.set_editor_property("multilayer", False)
         if also_png:
             png_fmt = cfg.find_or_add_setting_by_class(unreal.MoviePipelineImageSequenceOutput_PNG)
@@ -462,7 +478,7 @@ def _start_render(sub, camera_actor, output_dir, width, height,
                   ("ShowFlag.Atmosphere", 0), ("ShowFlag.Fog", 0),
                   ("ShowFlag.VolumetricFog", 0)]
         _log("cloud matte (alpha / atmosphere+fog off)")
-    if backing:
+    if backing or cloud_visible:
         # 露出適応は白板に反応して画面全体を沈める（-18%実測）ため、適応と
         # ローカル露出をジョブ内で無効化。白板は発光100なのでブルームと
         # Lumen スクリーントレースの撒き散らしも切る（×100で無視できなくなる）。
@@ -510,6 +526,7 @@ def _start_render(sub, camera_actor, output_dir, width, height,
                     nf = (f.replace("_FinalImageMatte", "_Matte")
                            .replace("_FinalImageDepth", "_Depth")
                            .replace("_FinalImageNormal", "_Normal")
+                           .replace("_FinalImageGeoMask", "_GeoMask")
                            .replace("_FinalImage", ""))
                     os.replace(os.path.join(output_dir, f), os.path.join(output_dir, nf))
             except Exception as e:
@@ -672,11 +689,12 @@ def _set_cloud_matte_mode(vol_targets, use_holdout=False):
     return holdout_comps, hidden_actors, hidden_comps, pie_state, fill_lights
 
 
-def _spawn_cloud_fill_lights():
+def _spawn_cloud_fill_lights(intensity=20.0):
     """CloudMatte 分離レンダ用の無影フィルライトを一時スポーンする。
     HV(VDB雲) の α は照明依存（無照明で α0・照明の弱い遠景雲が α から消える実測）
     なので、シーン照明に依らず全方位からフラットに照らして α を安定させる。
-    RGB は捨てるので過露光は問題ない。返り値: レンダ後に破棄するアクターリスト。"""
+    RGB は捨てるので過露光は問題ない（可視雲モードでは W=T×素板 の誤差 ≈
+    雲散乱/素板レベルになるため低強度を渡す）。返り値: レンダ後に破棄するリスト。"""
     eas = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
     out = []
     for i, (pitch, yaw) in enumerate(((-90.0, 0.0), (30.0, 45.0), (30.0, 225.0))):
@@ -686,15 +704,92 @@ def _spawn_cloud_fill_lights():
                 unreal.Rotator(roll=0.0, pitch=pitch, yaw=yaw))
             a.set_actor_label("UE5Cap_CloudFill_%d" % i)
             lc = a.get_editor_property("light_component")
-            lc.set_editor_property("intensity", 20.0)
+            lc.set_editor_property("intensity", float(intensity))
             lc.set_editor_property("cast_shadows", False)
             lc.set_editor_property("atmosphere_sun_light", False)
             out.append(a)
         except Exception as e:
             _warn("CloudMatte: フィルライト生成に失敗: %s" % e)
     if out:
-        _log("CloudMatte: 無影フィルライト %d 灯を一時スポーン" % len(out))
+        _log("CloudMatte: 無影フィルライト %d 灯を一時スポーン (%.1f lux)"
+             % (len(out), intensity))
     return out
+
+
+def _start_pie_backing_white(vol_targets):
+    """可視雲マット用: PIE ワールド側で全メッシュ材を白発光アンリット材へ差し替える
+    ウォッチャ（バッキング差分の一般化）。何も隠さないので深度順序が保たれ、
+    線形色 W = T×素板レベル から「雲より手前/奥」を画素毎に正しく分離できる。
+    LevelInstance 内包・スポーナブルにも効かせるため PIE 側で毎 tick 冪等に行う
+    （PIE は破棄されるので復元不要）。"""
+    from capture_core import get_or_create_backing_white_material, _is_hv_comp
+    mat = get_or_create_backing_white_material()
+    tnames = set()
+    for a in vol_targets or []:
+        try:
+            tnames.add(a.get_name())
+            tnames.add(a.get_actor_label())
+        except Exception:
+            pass
+    state = {"h": None, "done": set(), "logged": False}
+
+    def _stop():
+        h = state.pop("h", None)
+        if h is not None:
+            try:
+                unreal.unregister_slate_post_tick_callback(h)
+            except Exception:
+                pass
+
+    def _tick(dt):
+        pie = None
+        try:
+            pie = unreal.get_editor_subsystem(
+                unreal.UnrealEditorSubsystem).get_game_world()
+        except Exception:
+            try:
+                pie = unreal.EditorLevelLibrary.get_game_world()
+            except Exception:
+                pie = None
+        if pie is None:
+            if state["logged"]:
+                _stop()
+            return
+        n = 0
+        try:
+            for a in unreal.GameplayStatics.get_all_actors_of_class(pie, unreal.Actor):
+                try:
+                    key = a.get_path_name()
+                    if key in state["done"]:
+                        continue
+                    if a.get_name() in tnames or a.get_actor_label() in tnames:
+                        continue
+                    if isinstance(a, unreal.CameraActor):
+                        continue
+                    comps = a.get_components_by_class(unreal.MeshComponent)
+                    if not comps:
+                        continue
+                    for comp in comps:
+                        if _is_hv_comp(comp):
+                            continue      # 雲(HV)は差し替え不可・対象そのもの
+                        try:
+                            for i in range(comp.get_num_materials()):
+                                comp.set_material(i, mat)
+                        except Exception:
+                            pass
+                    state["done"].add(key)
+                    n += 1
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        if not state["logged"]:
+            state["logged"] = True
+            _log("可視雲: PIE 側で %d アクターを白バッキング材へ差替" % n)
+
+    state["h"] = unreal.register_slate_post_tick_callback(_tick)
+    state["stop"] = _stop
+    return state
 
 
 def _start_pie_cloud_hider(vol_targets):
@@ -766,6 +861,23 @@ def _start_pie_cloud_hider(vol_targets):
     state["h"] = unreal.register_slate_post_tick_callback(_tick)
     state["stop"] = _stop
     return state
+
+
+def _restore_visible_cloud_mode(saved):
+    """可視雲モードの後始末: PIE 白差替ウォッチャ停止 + フィルライト破棄。
+    PIE ワールド側の材差替は PIE 破棄で消えるので復元不要。"""
+    pie_state = (saved or {}).get("pie")
+    if pie_state and pie_state.get("stop"):
+        try:
+            pie_state["stop"]()
+        except Exception:
+            pass
+    eas = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    for a in (saved or {}).get("fills") or []:
+        try:
+            eas.destroy_actor(a)
+        except Exception:
+            pass
 
 
 def _restore_cloud_matte_mode(saved):
@@ -962,7 +1074,8 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
                     fog_off=False, on_done=None,
                     light_pass=False, light_direct=False,
                     light_label="RawLightingFull",
-                    cloud_matte_actors=None,
+                    cloud_matte_actors=None, cloud_visible=False,
+                    geomask_material=None,
                     backing_actors=None, backing_white=False, use_exr=False):
     """開いている/指定の LevelSequence を MRQ でレンダリング（非同期）。
     一時シーケンスは作らず job.sequence に直接指定し、カメラはシーケンスの
@@ -1025,7 +1138,12 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
                 pass
     if objid_material is not None:
         saved_objid = _set_objid_render_mode(objid_actors)
-    if cloud_matte_actors:
+    saved_vis = None
+    if cloud_matte_actors and cloud_visible:
+        # 可視雲モード: 何も隠さず PIE 側で白バッキング化（深度順序が保たれる）
+        saved_vis = {"pie": _start_pie_backing_white(cloud_matte_actors),
+                     "fills": _spawn_cloud_fill_lights(5.0)}
+    elif cloud_matte_actors:
         # 分離モード固定（render_beauty 側の注記参照。holdout は UE5.7 で出力が壊れている）
         saved_cloud = _set_cloud_matte_mode(cloud_matte_actors, use_holdout=False)
     saved_backing = None
@@ -1044,6 +1162,8 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
             _restore_objid_render_mode(saved_objid)
         if saved_cloud:
             _restore_cloud_matte_mode(saved_cloud)
+        if saved_vis:
+            _restore_visible_cloud_mode(saved_vis)
         if saved_backing:
             _restore_backing_materials(saved_backing)
         for a in hidden:
@@ -1064,6 +1184,8 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
                                       _restore_scene, on_done,
                                       light_pass, light_direct, light_label,
                                       cloud_matte=bool(cloud_matte_actors),
+                                      cloud_visible=cloud_visible,
+                                      geomask_material=geomask_material,
                                       backing=bool(backing_actors), use_exr=use_exr)
     except Exception:
         _restore_scene()
@@ -1086,6 +1208,7 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
                            near_clip_cm, beauty_label, fog_off, restore_scene, on_done,
                            light_pass=False, light_direct=False,
                            light_label="RawLightingFull", cloud_matte=False,
+                           cloud_visible=False, geomask_material=None,
                            backing=False, use_exr=False):
     queue = sub.get_queue()
     for j in list(queue.get_jobs()):
@@ -1100,7 +1223,8 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
     for pass_name, pass_mat in (("Depth", depth_material), ("Matte", matte_material),
                                 ("MatteSil", matte_sil_material),
                                 ("ObjectID", objid_material),
-                                ("Normal", normal_material)):
+                                ("Normal", normal_material),
+                                ("GeoMask", geomask_material)):
         if pass_mat is None:
             continue
         ppp = unreal.MoviePipelinePostProcessPass()
@@ -1207,7 +1331,7 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
                   ("ShowFlag.Atmosphere", 0), ("ShowFlag.Fog", 0),
                   ("ShowFlag.VolumetricFog", 0)]
         _log("cloud matte (alpha / atmosphere+fog off)")
-    if backing:
+    if backing or cloud_visible:
         # 露出適応は白板に反応して画面全体を沈める（-18%実測）ため、適応と
         # ローカル露出をジョブ内で無効化。白板は発光100なのでブルームと
         # Lumen スクリーントレースの撒き散らしも切る（×100で無視できなくなる）。
@@ -1282,7 +1406,8 @@ def _rename_final_image(output_dir, beauty_label="Beauty", light_label=None):
                 continue
             nf = f
             # MatteSil は Matte より先（長い識別子から置換しないと _MatteSil が壊れる）
-            for pass_name in ("Depth", "MatteSil", "Matte", "ObjectID", "Normal"):
+            for pass_name in ("Depth", "MatteSil", "Matte", "ObjectID", "Normal",
+                              "GeoMask"):
                 nf = nf.replace("_FinalImage" + pass_name, "_" + pass_name)
             nf = nf.replace("_FinalImage", "_" + beauty_label)
             if light_label:

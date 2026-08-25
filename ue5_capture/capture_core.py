@@ -1592,6 +1592,116 @@ def _backing_t_from_array(w, scale=None):
     return _np.clip(w / scale, 0.0, 1.0), scale
 
 
+def _read_linear_alpha(path, ffmpeg):
+    """EXR の α チャンネルを線形 float 配列で読む（_read_linear_gray の α 版）。"""
+    if not (_HAS_NUMPY and _HAS_PIL):
+        return None
+    import subprocess as _subprocess
+    if not path.lower().endswith(".exr"):
+        try:
+            im = _PILImage.open(path)
+            if im.mode == "RGBA":
+                return _np.asarray(im)[:, :, 3].astype(_np.float32) / 255.0
+        except Exception:
+            pass
+        return None
+    if not ffmpeg:
+        _warn("可視雲: ffmpeg が見つからず EXR αを読めません")
+        return None
+    tmp = path + "._a.pfm"
+    r = _subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", path,
+                         "-vf", "format=gbrapf32le,extractplanes=a", tmp],
+                        capture_output=True, creationflags=0x08000000)
+    if r.returncode != 0 or not os.path.isfile(tmp):
+        _warn("可視雲: EXR α抽出失敗 %s: %s"
+              % (path, r.stderr.decode(errors="replace")[-200:]))
+        return None
+    try:
+        return _np.asarray(_PILImage.open(tmp)).astype(_np.float32)
+    except Exception as e:
+        _warn("可視雲: α読み込み失敗 %s: %s" % (tmp, e))
+        return None
+    finally:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+
+
+def compose_visible_cloud(w_exr, geomask_exr, out_rgba_png, ffmpeg=None, scale=None):
+    """可視雲マット合成: 白バッキングレンダ（EXR RGB=W・α=全投影雲α）と GeoMask
+    （ジオメトリ有=白）から「見えている雲の不透明度」を α に持つ RGBA PNG を書く。
+    ジオメトリ画素: 1−T（T=W/素板レベル。深度順序どおり＝雲を貫く物体は乗らない）/
+    非ジオメトリ（空）画素: α（雲 vs 空は遮蔽が無いので全投影=可視）。
+    戻り値 (out_path, scale)。失敗時 (None, None)。"""
+    if not (_HAS_NUMPY and _HAS_PIL):
+        return None, None
+    w = _read_linear_gray(w_exr, ffmpeg)
+    a = _read_linear_alpha(w_exr, ffmpeg)
+    g = _read_linear_gray(geomask_exr, ffmpeg) if geomask_exr else None
+    if w is None or a is None:
+        _warn("可視雲: 入力を読めません (W=%s α=%s)"
+              % (w is not None, a is not None))
+        return None, None
+    # UE のシーンリニア EXR は α を「1−カバレッジ」で格納する（空=1・不透明=0。
+    # AV024 実測 2026-08-26。PNG 出力は MRQ が標準向きへ反転して書く）
+    a = 1.0 - _np.clip(a, 0.0, 1.0)
+    if g is None:
+        # GeoMask なしはαのみ（遮蔽なし全投影の劣化モード）
+        _warn("可視雲: GeoMask なし＝空画素αのみで合成（遮蔽は反映されない）")
+        vis = _np.clip(a, 0.0, 1.0)
+        scale = scale or 1.0
+    else:
+        t, scale = _backing_t_from_array(w, scale)
+        if t is None:
+            _warn("可視雲: 素のジオメトリ領域が見つからず正規化できません")
+            return None, None
+        vis = _np.where(g > 0.5, 1.0 - t, _np.clip(a, 0.0, 1.0))
+    vis8 = (_np.clip(vis, 0.0, 1.0) * 255.0 + 0.5).astype(_np.uint8)
+    z = _np.zeros_like(vis8)
+    _PILImage.merge("RGBA", tuple(_PILImage.fromarray(c) for c in (z, z, z, vis8))
+                    ).save(out_rgba_png)
+    _log("可視雲マット合成: %s (scale=%.4f)" % (out_rgba_png, scale))
+    return out_rgba_png, scale
+
+
+def compose_visible_cloud_sequence(output_dir, name_body, take_str, ffmpeg=None):
+    """映像用: CloudMatte(EXR W+α) + GeoMask(EXR) 連番から可視雲 RGBA PNG 連番を作る。
+    正規化スケールは最初の成功フレームで固定（チラつき防止）。使用済み EXR は削除。
+    書いたフレーム数を返す。"""
+    pat = re.compile(re.escape("%s_CloudMatte_%s." % (name_body, take_str))
+                     + r"(\d+)\.exr$")
+    frames = {}
+    for f in os.listdir(output_dir):
+        m = pat.match(f)
+        if m:
+            frames[m.group(1)] = f
+    n = 0
+    scale = None
+    for fr in sorted(frames):
+        wp = os.path.join(output_dir, frames[fr])
+        gp = os.path.join(output_dir,
+                          "%s_GeoMask_%s.%s.exr" % (name_body, take_str, fr))
+        op = os.path.join(output_dir,
+                          "%s_CloudMatte_%s.%s.png" % (name_body, take_str, fr))
+        r, sc = compose_visible_cloud(wp, gp if os.path.isfile(gp) else None,
+                                      op, ffmpeg=ffmpeg, scale=scale)
+        if r:
+            n += 1
+            if scale is None:
+                scale = sc
+    # EXR は後段（PNG合成・MP4）で不要なので全て削除
+    for f in list(os.listdir(output_dir)):
+        if (pat.match(f) or f.startswith("%s_GeoMask_%s." % (name_body, take_str))
+                and f.endswith(".exr")):
+            try:
+                os.remove(os.path.join(output_dir, f))
+            except Exception:
+                pass
+    _log("可視雲マット: %d フレーム合成" % n)
+    return n
+
+
 def backing_t_png(white_path, out_path, ffmpeg=None, scale=None):
     """白(発光100)バッキング1レンダから「板より手前の透過率T」16bit グレー PNG を書く。
     W = 手前の発光C + T×100×露出 で C/100 は無視できるため T ≈ W/素板レベル。
@@ -1979,6 +2089,39 @@ def create_temp_normal_material(camera_space=True):
         _warn("一時法線マテリアルの保存に失敗（未保存のまま続行）: %s" % e)
     _log("一時法線マテリアル生成 (%s*0.5+0.5)"
          % ("ViewNormal" if camera_space else "WorldNormal"))
+    return mat
+
+
+_TMP_GEOMASK_NAME = "M_UE5Cap_GeoMask"
+
+
+def delete_temp_geomask_material():
+    _delete_temp_material(_TMP_GEOMASK_NAME, "GeoMask")
+
+
+def create_temp_geomask_material():
+    """SceneDepth < 1e7（ジオメトリ有）の画素を白(1)にする PostProcess マテリアル。
+    可視雲マットの「ジオメトリ画素は 1−T / 空画素は α」の分岐マスクに使う。"""
+    mat = _mx_get_or_create_pp_material(_TMP_GEOMASK_NAME)
+    d = _mx_expr(mat, unreal.MaterialExpressionSceneDepth, -700, 0)
+    c_thresh = _mx_const(mat, 1.0e7, -700, 160)
+    sub = _mx_expr(mat, unreal.MaterialExpressionSubtract, -550, 60)
+    _mx_conn(c_thresh, "", sub, "A")
+    _mx_conn(d, "", sub, "B")
+    c_k = _mx_const(mat, 1.0e-2, -550, 220)
+    mul = _mx_expr(mat, unreal.MaterialExpressionMultiply, -400, 100)
+    _mx_conn(sub, "", mul, "A")
+    _mx_conn(c_k, "", mul, "B")
+    clamp = _mx_expr(mat, unreal.MaterialExpressionClamp, -250, 100)
+    _mx_conn(mul, "", clamp, "")
+    unreal.MaterialEditingLibrary.connect_material_property(
+        clamp, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+    unreal.MaterialEditingLibrary.recompile_material(mat)
+    try:
+        unreal.EditorAssetLibrary.save_loaded_asset(mat)
+    except Exception as e:
+        _warn("一時 GeoMask マテリアルの保存に失敗（未保存のまま続行）: %s" % e)
+    _log("一時 GeoMask マテリアル生成 (SceneDepth<1e7)")
     return mat
 
 
