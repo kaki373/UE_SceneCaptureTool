@@ -59,7 +59,7 @@ NNN は出力フォルダ内の通し番号）。素材名（クリーン名）�
 |---|---|---|---|
 | **Beauty** | PNG/EXR | カメラ実露出+PPV+影/GI/TSR の高品質（シーケンサ相当） | MRQ |
 | **Depth** | 16bit/8bit PNG or EXR | カメラからの距離(**cm**)。Near/Far 正規化、`手前=白/奥=黒`反転可。EXR は生cm | SceneCapture |
-| **Normal** | RGB PNG | GBuffer 法線（XYZ の -1..1 → `*0.5+0.5`）。空間はカメラ（既定・正対=青）/ワールド選択。Beauty と同一ジョブの PP パス＝画素整合。sRGB エンコード注意 | MRQ |
+| **Normal** | RGB PNG | GBuffer 法線（XYZ の -1..1 → `*0.5+0.5`）。空間はカメラ（既定・正対=青）/ワールド選択。空（非描画領域）は黒。Beauty と同一ジョブの PP パス＝画素整合。sRGB エンコード注意 | MRQ |
 | **Matte** | 白黒 PNG | 対象アクターのオクルージョン考慮シルエット | SceneCapture |
 | **MatteBeauty** | RGBA PNG | Beauty に Matte をαとして合成 | MRQ+合成 |
 | **ObjectID** | RGB PNG + `.json` | 対象を色分け（黄金角で分離）+ 色→名 対応表 | SceneCapture |

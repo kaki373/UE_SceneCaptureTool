@@ -197,12 +197,22 @@ def restore_camera_filmback(camera_actor, sw, sh):
 
 
 def get_camera_settings(camera_actor):
-    """カメラの Transform / FOV / アスペクト / PostProcess を取得。"""
+    """カメラの Transform / FOV / アスペクト / PostProcess を取得。
+    aspect_ratio が未設定(≒0)のカメラは filmback (sensor w/h) から算出する。"""
     cam_comp = _camera_component(camera_actor)
+    asp = float(cam_comp.get_editor_property("aspect_ratio"))
+    if asp <= 0.01:
+        try:
+            fb = cam_comp.get_editor_property("filmback")
+            sh = float(fb.get_editor_property("sensor_height"))
+            if sh > 0:
+                asp = float(fb.get_editor_property("sensor_width")) / sh
+        except Exception:
+            pass
     return {
         "transform": camera_actor.get_actor_transform(),
         "fov": float(cam_comp.get_editor_property("field_of_view")),
-        "aspect_ratio": float(cam_comp.get_editor_property("aspect_ratio")),
+        "aspect_ratio": asp,
         "post_process": cam_comp.get_editor_property("post_process_settings"),
     }
 
@@ -1868,8 +1878,24 @@ def create_temp_normal_material(camera_space=True):
     add = _mx_expr(mat, unreal.MaterialExpressionAdd, -250, 0)
     _mx_conn(mul, "", add, "A")
     _mx_conn(c_half, "", add, "B")
+    # 非描画領域（空=ファープレーン）はGBuffer法線がクリア値のまま乗るので、
+    # SceneDepth < 1e7 の valid 判定（Matte 材と同じしきい値）で黒に落とす
+    d = _mx_expr(mat, unreal.MaterialExpressionSceneDepth, -560, 420)
+    c_thresh = _mx_const(mat, 1.0e7, -560, 560)
+    subv = _mx_expr(mat, unreal.MaterialExpressionSubtract, -400, 480)
+    _mx_conn(c_thresh, "", subv, "A")
+    _mx_conn(d, "", subv, "B")
+    c_k = _mx_const(mat, 1.0e-2, -400, 620)
+    mulv = _mx_expr(mat, unreal.MaterialExpressionMultiply, -250, 480)
+    _mx_conn(subv, "", mulv, "A")
+    _mx_conn(c_k, "", mulv, "B")
+    clampv = _mx_expr(mat, unreal.MaterialExpressionClamp, -120, 480)
+    _mx_conn(mulv, "", clampv, "")
+    outm = _mx_expr(mat, unreal.MaterialExpressionMultiply, -60, 100)
+    _mx_conn(add, "", outm, "A")
+    _mx_conn(clampv, "", outm, "B")
     unreal.MaterialEditingLibrary.connect_material_property(
-        add, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+        outm, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
     unreal.MaterialEditingLibrary.recompile_material(mat)
     try:
         unreal.EditorAssetLibrary.save_loaded_asset(mat)

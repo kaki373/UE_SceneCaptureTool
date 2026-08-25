@@ -17,7 +17,7 @@ PNG / EXR で書き出す。映像タブは Sequencer で開いている LevelSe
 
 - **Beauty (MRQ)**: Movie Render Queue で対象カメラを通して高品質レンダ（ビューポート露出 + シーケンサ相当の影 / GI / TSR / ウォームアップ）。出力形式は **PNG 8bit / JPG 8bit / EXR 16bit (float)**。
 - **Z-Depth**: `SCS_SceneDepth`(cm) を Near/Far で正規化して 8bit / 16bit PNG、または EXR(float) で出力。**手前=白 / 奥=黒 固定**。
-- **Normal**: 法線を RGB に出力（XYZ の -1..1 を `*0.5+0.5` で 0..1 に詰める法線マップ規約）。空間は **カメラ（既定。正対面が青 = V-Ray SamplerInfo 等の規約）/ ワールド** を選択。Beauty と同一 MRQ ジョブの追加 PP パスなので WPO/風で揺れる前景も Beauty と画素整合。PNG/MP4 は表示用 sRGB エンコードのため、データとして使う場合はリニア化してから -1..1 に戻す。
+- **Normal**: 法線を RGB に出力（XYZ の -1..1 を `*0.5+0.5` で 0..1 に詰める法線マップ規約）。空間は **カメラ（既定。正対面が青 = V-Ray SamplerInfo 等の規約）/ ワールド** を選択。非描画領域（空=ファープレーン）は黒。Beauty と同一 MRQ ジョブの追加 PP パスなので WPO/風で揺れる前景も Beauty と画素整合。PNG/MP4 は表示用 sRGB エンコードのため、データとして使う場合はリニア化してから -1..1 に戻す。
 - **Matteの前（Beauty+Matte）**: クリーンな Beauty にオクルージョン考慮のマットをアルファとして焼いた RGBA(MatteBeauty)。生の白黒マットは内部素材（自動削除）。
 - **Matteの奥**: マットオブジェクトの**手前を除去して奥だけを描画**（MRQ Beauty 品質）。near-clip で手前を実除去し、マットのシルエット形状でマスク合成して出力。
 - **ObjectID**: 対象アクターを色分け（他は黒）した 1 枚 + 色 -> 名前の対応 JSON。
