@@ -879,9 +879,16 @@ class CaptureWindow(object):
             except Exception as e:
                 skip_notes.append("雲マット: GeoMask 生成失敗（空画素はα劣化）")
                 self.status_var.set("GeoMask 生成失敗: %s" % e)
+            # H5 知覚モデルの3レンダ: 白バッキング(T+α+GeoMask) / 黒バッキング素照明
+            # (ベール輝度) / 雲なしBeauty(背景輝度)。合成は _finalize で行う。
             jobs.append(dict(base=_name("CloudMatte"), cloud=cloudmatte_vols,
                              cloud_kind="cloudvis", fmt="exr",
-                             geomask=geomask_mat))
+                             geomask=geomask_mat, cloud_backing="white"))
+            jobs.append(dict(base=_name("CloudVeil"), cloud=cloudmatte_vols,
+                             cloud_kind="cloudveil", fmt="exr",
+                             cloud_backing="black"))
+            jobs.append(dict(base=_name("CloudBG"), hidden=list(cloudmatte_vols),
+                             ts1=True))
         if want_behind:
             mt = core._resolve_target_actors(None, self._pick_targets_resolved(self.matte_pick) or None)
             mt_p, mt_v = core.split_volumetric_targets(mt)
@@ -951,9 +958,21 @@ class CaptureWindow(object):
             # 合成がスキップされたときは唯一の成果物になるため残す。
             aux = comp_beauty if comp_beauty != beauty_path else None
             keep_beauty = self.beauty_var.get() or bool(skip_notes)
+            # H5 合成: 白T + 黒ベール + 雲なしBeauty から可視雲αを作る
+            cm_png = os.path.join(out, _name("CloudMatte") + ".png")
+            if cloud_alpha_needed:
+                gexr = os.path.join(out, _name("CloudMatte") + "_GeoMask.exr")
+                r = core.compose_visible_cloud_h5(
+                    os.path.join(out, _name("CloudMatte") + ".exr"),
+                    gexr if os.path.isfile(gexr) else None,
+                    os.path.join(out, _name("CloudVeil") + ".exr"),
+                    os.path.join(out, _name("CloudBG") + ".png"),
+                    cm_png,
+                    ffmpeg=core.find_ffmpeg(getattr(self, "_ffmpeg_hint", None)))
+                if not r:
+                    skip_notes.append("雲マット: H5合成失敗")
             # Normal / Depth の雲領域を黒に落とす（α のままの CloudMatte を乗算。
             # 白黒変換前に行う）
-            cm_png = os.path.join(out, _name("CloudMatte") + ".png")
             cloud_applied = os.path.isfile(cm_png)
             if os.path.isfile(cm_png):
                 targets = []
@@ -987,8 +1006,6 @@ class CaptureWindow(object):
                         (normal_exr, False),
                         (os.path.join(out, _name("Beauty") + "_Matte.png"), False),
                         (cm_png, want_cloudmatte),
-                        (os.path.join(out, _name("CloudMatte") + ".exr"), False),
-                        (os.path.join(out, _name("CloudMatte") + "_GeoMask.exr"), False),
                         (os.path.join(out, _name("CloudMatteMF") + ".png"), False),
                         (os.path.join(out, _name("BackingW") + ".exr"), False),
                         (os.path.join(out, _name("Beauty") + "_BackingT.png"), False),
@@ -1002,8 +1019,26 @@ class CaptureWindow(object):
                         os.remove(p)
                     except Exception:
                         pass
-            # 雲抜き/マットは _VIS_CLOUD_GAIN 依存のため、G 値をファイル名へ付与
-            # （例 ..._CloudMatte_017_G7.png。テイク番号検出 _(\d{3})(?=[._]) は
+            # H5 の合成ソースは削除せず _cloudsrc/ へ退避（EXR+雲なしBeauty が
+            # 残っていれば、再レンダなしで濃度パラメータを変えて再合成できる）
+            if cloud_alpha_needed:
+                srcdir = os.path.join(out, "_cloudsrc")
+                try:
+                    os.makedirs(srcdir, exist_ok=True)
+                except Exception:
+                    pass
+                for _sf in (_name("CloudMatte") + ".exr",
+                            _name("CloudMatte") + "_GeoMask.exr",
+                            _name("CloudVeil") + ".exr",
+                            _name("CloudBG") + ".png"):
+                    _p = os.path.join(out, _sf)
+                    if os.path.isfile(_p):
+                        try:
+                            os.replace(_p, os.path.join(srcdir, _sf))
+                        except Exception:
+                            pass
+            # 雲抜き/マットは濃度設定依存のため、設定タグをファイル名へ付与
+            # （例 ..._CloudMatte_019_H5d1.5.png。テイク番号検出 _(\d{3})(?=[._]) は
             # 後置サフィックスでも壊れない）
             if cloud_applied:
                 gtag = core.vis_cloud_gain_tag()
@@ -1058,19 +1093,11 @@ class CaptureWindow(object):
                         except Exception as e:
                             self.status_var.set("雲マット合成エラー: %s" % e)
                 # CloudMatte / 雲ObjectID ジョブ: αを回収して合成へ
-                elif _j.get("cloud_kind") == "cloudvis":
-                    # 可視雲: EXR(W+α) + GeoMask から深度順序どおりの可視雲αを合成
-                    wexr = os.path.join(out, _j["base"] + ".exr")
-                    if not ok or not os.path.isfile(wexr):
-                        skip_notes.append("雲マット: 可視雲レンダ失敗")
-                    else:
-                        gexr = os.path.join(out, _j["base"] + "_GeoMask.exr")
-                        cp2, _sc = core.compose_visible_cloud(
-                            wexr, gexr if os.path.isfile(gexr) else None,
-                            os.path.join(out, _j["base"] + ".png"),
-                            ffmpeg=core.find_ffmpeg(getattr(self, "_ffmpeg_hint", None)))
-                        if not cp2:
-                            skip_notes.append("雲マット: 可視雲合成失敗")
+                elif _j.get("cloud_kind") in ("cloudvis", "cloudveil"):
+                    # H5 の入力レンダ（白T/黒ベール）。合成は _finalize で行う
+                    if not ok or not os.path.isfile(
+                            os.path.join(out, _j["base"] + ".exr")):
+                        skip_notes.append("雲マット: 入力レンダ失敗 (%s)" % _j["base"])
                 elif _j.get("cloud_kind"):
                     cp = os.path.join(out, _j["base"] + ".png")
                     if not ok or not os.path.isfile(cp):
@@ -1141,7 +1168,9 @@ class CaptureWindow(object):
                                           light_direct=j.get("raw_light", False),
                                           cloud_matte_actors=j.get("cloud"),
                                           cloud_visible=(j.get("cloud_kind")
-                                                         == "cloudvis"),
+                                                         in ("cloudvis",
+                                                             "cloudveil")),
+                                          cloud_backing=j.get("cloud_backing"),
                                           geomask_material=j.get("geomask"),
                                           backing_actors=j.get("backing"),
                                           backing_white=j.get("backing_white", False),

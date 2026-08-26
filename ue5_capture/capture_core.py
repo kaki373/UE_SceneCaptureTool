@@ -1640,9 +1640,20 @@ def _read_linear_alpha(path, ffmpeg):
 _VIS_CLOUD_GAIN = 7.0
 
 
+# --- H5 知覚モデル（静止画の可視雲。2026-08-26 frame84 でユーザー目視確定） ---
+# per = V/(V + K·T·Bg): V=黒バッキング素照明のベール輝度 / T=白バッキング透過率 /
+# Bg=雲なしBeautyのリニア背景輝度。日照ブースト 1−(1−per)(1−S·V^P) →
+# カーブ 1−e^(−G·x) → 全体の濃度は透明度ガンマ (1−(1−vis)^γ) で調整する。
+_VIS_CLOUD_K = 0.7          # コントラスト項の背景寄与（小さいほど全体が濃い）
+_VIS_CLOUD_CURVE_G = 2.0    # 飽和カーブ
+_VIS_SUN_BOOST_S = 0.8      # 日照（高ベール輝度）画素の不透明化強さ
+_VIS_SUN_BOOST_P = 1.0      # 日照ブーストの集中度（2で最明部限定）
+_VIS_DENSE_GAMMA = 1.5      # 全体の濃さ（1=素・1.5=一段濃い・2.2=二段濃い）
+
+
 def vis_cloud_gain_tag():
-    """G 値のファイル名タグ（例 'G7' / 'G7.5'）。雲マット/雲抜き出力の識別用。"""
-    return "G%g" % _VIS_CLOUD_GAIN
+    """雲マット/雲抜き出力のファイル名タグ（例 'H5d1.5'）。濃度設定の識別用。"""
+    return "H5d%g" % _VIS_DENSE_GAMMA
 
 
 def compose_visible_cloud(w_exr, geomask_exr, out_rgba_png, ffmpeg=None, scale=None):
@@ -1731,6 +1742,62 @@ def compose_visible_cloud_sequence(output_dir, name_body, take_str, ffmpeg=None)
                 pass
     _log("可視雲マット: %d フレーム合成" % n)
     return n
+
+
+def compose_visible_cloud_h5(w_exr, geomask_exr, veil_exr, bg_png,
+                             out_rgba_png, ffmpeg=None):
+    """H5 知覚モデルの可視雲マット合成（静止画・3レンダ構成）。
+    w_exr=白バッキング（RGB=T×素板・α=全投影雲α）/ geomask_exr=ジオメトリ有無 /
+    veil_exr=黒バッキング素照明（RGB=雲ベール輝度）/ bg_png=雲なしBeauty。
+    出力: α=可視雲量の RGBA PNG。パラメータは _VIS_CLOUD_K ほか（モジュール定数）。
+    戻り値: 出力パス（失敗時 None）。"""
+    if not (_HAS_NUMPY and _HAS_PIL):
+        return None
+    W = _read_linear_gray(w_exr, ffmpeg)
+    A = _read_linear_alpha(w_exr, ffmpeg)
+    Gm = _read_linear_gray(geomask_exr, ffmpeg) if geomask_exr else None
+    V = _read_linear_gray(veil_exr, ffmpeg) if veil_exr else None
+    if W is None or A is None:
+        _warn("可視雲H5: 白バッキング入力を読めません")
+        return None
+    A = 1.0 - _np.clip(A, 0.0, 1.0)   # UE の EXR α は 1−カバレッジ格納
+    if Gm is None or V is None:
+        _warn("可視雲H5: GeoMask/Veil が無いためαのみで合成（遮蔽なし）")
+        vis = A
+    else:
+        geo = Gm > 0.5
+        plate = float(_np.percentile(W[geo], 99)) if geo.sum() else 0.0
+        if plate <= 1e-6:
+            _warn("可視雲H5: 素板レベルを推定できません")
+            return None
+        T = _np.clip(W / plate, 0.0, 1.0)
+        vv = V[V > 1e-6]
+        V = _np.clip(V / max(float(_np.percentile(vv, 99)) if vv.size else 1.0,
+                             1e-6), 0.0, 1.0)
+        try:
+            bg_im = _PILImage.open(bg_png).convert("L")
+            if bg_im.size != (W.shape[1], W.shape[0]):
+                bg_im = bg_im.resize((W.shape[1], W.shape[0]))
+            Bg = _np.power(_np.asarray(bg_im).astype(_np.float32) / 255.0, 2.2)
+        except Exception as e:
+            _warn("可視雲H5: 雲なしBeautyを読めません（背景=0.5固定で続行）: %s" % e)
+            Bg = _np.full_like(W, 0.5)
+        per = V / (V + _VIS_CLOUD_K * T * Bg + 1e-6)
+        boosted = 1.0 - (1.0 - _np.clip(per, 0.0, 1.0)) \
+            * (1.0 - _VIS_SUN_BOOST_S * _np.power(V, _VIS_SUN_BOOST_P))
+        G = _VIS_CLOUD_CURVE_G
+        visg = (1.0 - _np.exp(-G * _np.clip(boosted, 0.0, 1.0))) \
+            / (1.0 - _np.exp(-G))
+        vis = _np.where(geo, _np.clip(visg, 0.0, 1.0), A)
+    vis = 1.0 - _np.power(1.0 - _np.clip(vis, 0.0, 1.0), _VIS_DENSE_GAMMA)
+    vis8 = (_np.clip(vis, 0.0, 1.0) * 255.0 + 0.5).astype(_np.uint8)
+    z = _np.zeros_like(vis8)
+    _PILImage.merge("RGBA", tuple(_PILImage.fromarray(c) for c in (z, z, z, vis8))
+                    ).save(out_rgba_png)
+    _log("可視雲H5合成: %s (K=%g G=%g S=%g P=%g γ=%g)"
+         % (out_rgba_png, _VIS_CLOUD_K, _VIS_CLOUD_CURVE_G,
+            _VIS_SUN_BOOST_S, _VIS_SUN_BOOST_P, _VIS_DENSE_GAMMA))
+    return out_rgba_png
 
 
 def backing_t_png(white_path, out_path, ffmpeg=None, scale=None):

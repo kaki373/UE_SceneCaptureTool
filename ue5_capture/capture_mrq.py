@@ -218,7 +218,7 @@ def render_beauty(camera_actor, output_dir, width, height,
                   normal_material=None,
                   light_pass=False, light_direct=False,
                   cloud_matte_actors=None, cloud_visible=False,
-                  geomask_material=None,
+                  cloud_backing=None, geomask_material=None,
                   backing_actors=None, backing_white=False):
     """対象カメラを MRQ で Beauty レンダリング（非同期）。executor を返す。
     cloud_visible=True（要 cloud_matte_actors）は可視雲モード: 何も隠さず PIE 側で
@@ -273,9 +273,16 @@ def render_beauty(camera_actor, output_dir, width, height,
     saved_cloud = None
     saved_vis = None
     if cloud_matte_actors and cloud_visible:
-        # 可視雲モード: 何も隠さず PIE 側で白バッキング化（深度順序が保たれる）
-        saved_vis = {"pie": _start_pie_backing_white(cloud_matte_actors),
-                     "fills": _spawn_cloud_fill_lights(20.0)}
+        # 可視雲モード: 何も隠さず PIE 側でバッキング材化（深度順序が保たれる）。
+        # cloud_backing: "white"=透過率T測定(白発光100+微弱fill) /
+        # "black"=素照明ベール輝度測定(純黒+fillなし) /
+        # None=従来の黒+20lux（映像タブの単一ジョブ方式）
+        white = (cloud_backing == "white")
+        fills = (5.0 if cloud_backing == "white"
+                 else 0.0 if cloud_backing == "black" else 20.0)
+        saved_vis = {"pie": _start_pie_backing_white(cloud_matte_actors,
+                                                     white=white),
+                     "fills": _spawn_cloud_fill_lights(fills)}
     elif cloud_matte_actors:
         # UE5.7 は holdout 方式のα出力が実質壊れている（cvarペア有効でも最大2/255・
         # 2026-07-24実測）ため分離モード固定。エンジン修正後に
@@ -716,15 +723,17 @@ def _spawn_cloud_fill_lights(intensity=20.0):
     return out
 
 
-def _start_pie_backing_white(vol_targets):
+def _start_pie_backing_white(vol_targets, white=False):
     """可視雲マット用: PIE ワールド側で全メッシュ材を黒アンリット材へ差し替える
     ウォッチャ。何も隠さないので深度順序が保たれ、黒背景に浮かぶ雲の散乱輝度 L が
     「見えている雲量（知覚的カバレッジ）」を画素毎に与える（白バッキングの 1−T は
     物理透過率で Beauty の見た目より薄くなる実測 2026-08-26 → 黒方式へ変更）。
     LevelInstance 内包・スポーナブルにも効かせるため PIE 側で毎 tick 冪等に行う
     （PIE は破棄されるので復元不要）。"""
-    from capture_core import get_or_create_matteboard_material, _is_hv_comp
-    mat = get_or_create_matteboard_material()
+    from capture_core import (get_or_create_backing_white_material,
+                              get_or_create_matteboard_material, _is_hv_comp)
+    mat = (get_or_create_backing_white_material() if white
+           else get_or_create_matteboard_material())
     tnames = set()
     for a in vol_targets or []:
         try:
@@ -786,7 +795,8 @@ def _start_pie_backing_white(vol_targets):
             pass
         if not state["logged"]:
             state["logged"] = True
-            _log("可視雲: PIE 側で %d アクターを黒バッキング材へ差替" % n)
+            _log("可視雲: PIE 側で %d アクターを%sバッキング材へ差替"
+                 % (n, "白" if white else "黒"))
 
     state["h"] = unreal.register_slate_post_tick_callback(_tick)
     state["stop"] = _stop
