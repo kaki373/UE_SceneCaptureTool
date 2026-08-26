@@ -275,7 +275,7 @@ def render_beauty(camera_actor, output_dir, width, height,
     if cloud_matte_actors and cloud_visible:
         # 可視雲モード: 何も隠さず PIE 側で白バッキング化（深度順序が保たれる）
         saved_vis = {"pie": _start_pie_backing_white(cloud_matte_actors),
-                     "fills": _spawn_cloud_fill_lights(2000.0)}
+                     "fills": _spawn_cloud_fill_lights(20.0)}
     elif cloud_matte_actors:
         # UE5.7 は holdout 方式のα出力が実質壊れている（cvarペア有効でも最大2/255・
         # 2026-07-24実測）ため分離モード固定。エンジン修正後に
@@ -1143,7 +1143,7 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
     if cloud_matte_actors and cloud_visible:
         # 可視雲モード: 何も隠さず PIE 側で白バッキング化（深度順序が保たれる）
         saved_vis = {"pie": _start_pie_backing_white(cloud_matte_actors),
-                     "fills": _spawn_cloud_fill_lights(2000.0)}
+                     "fills": _spawn_cloud_fill_lights(20.0)}
     elif cloud_matte_actors:
         # 分離モード固定（render_beauty 側の注記参照。holdout は UE5.7 で出力が壊れている）
         saved_cloud = _set_cloud_matte_mode(cloud_matte_actors, use_holdout=False)
