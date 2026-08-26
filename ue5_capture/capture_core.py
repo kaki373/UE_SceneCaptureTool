@@ -937,6 +937,70 @@ def get_or_create_matteboard_material():
 
 
 _TMP_BACKINGWHITE_NAME = "M_UE5Cap_BackingWhite"
+_TMP_BACKINGCLEAR_NAME = "M_UE5Cap_BackingClear"
+
+
+def material_blend_mode(m):
+    """MaterialInterface の実効ブレンドモード（インスタンスのオーバーライド考慮）。
+    解決できなければ None。"""
+    try:
+        if isinstance(m, unreal.MaterialInstance):
+            bpo = m.get_editor_property("base_property_overrides")
+            if bpo.get_editor_property("override_blend_mode"):
+                return bpo.get_editor_property("blend_mode")
+            base = m.get_base_material()
+            return (base.get_editor_property("blend_mode")
+                    if base is not None else None)
+        return m.get_editor_property("blend_mode")
+    except Exception:
+        return None
+
+
+def material_writes_depth(m):
+    """このマテリアルが不透明深度を書くか（Opaque/Masked）。
+    半透明系（Translucent/Additive/Modulate 等）は深度を書かない＝
+    バッキング材(不透明)に差し替えると Beauty に存在しない遮蔽面が出現し、
+    その奥の HV(VDB雲) が深度テストで丸ごと消える（UDS の雲内フォグ板が
+    雲高度に不可視の巨大水平面を張っていた実測 2026-08-26）。判定不能は
+    True（従来どおり差し替え）。"""
+    bm = material_blend_mode(m)
+    if bm is None:
+        return True
+    return bm in (unreal.BlendMode.BLEND_OPAQUE, unreal.BlendMode.BLEND_MASKED)
+
+
+def get_or_create_backing_clear_material():
+    """バッキングレンダ用の完全不可視マテリアル（Translucent・Unlit・opacity 0）。
+    半透明スロットの差し替え先。深度を書かず何も描かない＝素の半透明が
+    見た目を汚すのも防ぎつつ、幻の遮蔽面を作らない。"""
+    full = _TMP_MAT_PKG + "/" + _TMP_BACKINGCLEAR_NAME
+    mat = None
+    if unreal.EditorAssetLibrary.does_asset_exist(full):
+        mat = unreal.EditorAssetLibrary.load_asset(full)
+    if mat is None:
+        at = unreal.AssetToolsHelpers.get_asset_tools()
+        mat = at.create_asset(_TMP_BACKINGCLEAR_NAME, _TMP_MAT_PKG,
+                              unreal.Material, unreal.MaterialFactoryNew())
+    if mat is None:
+        raise RuntimeError("BackingClear マテリアルの生成に失敗しました。")
+    MEL = unreal.MaterialEditingLibrary
+    mat.set_editor_property("shading_model", unreal.MaterialShadingModel.MSM_UNLIT)
+    mat.set_editor_property("blend_mode", unreal.BlendMode.BLEND_TRANSLUCENT)
+    mat.set_editor_property("two_sided", True)
+    try:
+        MEL.delete_all_material_expressions(mat)
+    except Exception:
+        pass
+    z = _mx_const(mat, 0.0, -300, 0)
+    MEL.connect_material_property(z, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+    z2 = _mx_const(mat, 0.0, -300, 150)
+    MEL.connect_material_property(z2, "", unreal.MaterialProperty.MP_OPACITY)
+    MEL.recompile_material(mat)
+    try:
+        unreal.EditorAssetLibrary.save_loaded_asset(mat)
+    except Exception as ex:
+        _warn("BackingClear マテリアルの保存に失敗（未保存のまま続行）: %s" % ex)
+    return mat
 
 
 def get_or_create_backing_white_material():
@@ -1754,10 +1818,14 @@ def compose_visible_cloud_sequence(output_dir, name_body, take_str, ffmpeg=None)
 
 
 def compose_visible_cloud_h5(w_exr, geomask_exr, veil_exr, bg_png,
-                             out_rgba_png, ffmpeg=None):
-    """H5 知覚モデルの可視雲マット合成（静止画・3レンダ構成）。
+                             out_rgba_png, ffmpeg=None, veil_none_exr=None):
+    """H5 知覚モデルの可視雲マット合成（静止画）。
     w_exr=白バッキング（RGB=T×素板・α=全投影雲α）/ geomask_exr=ジオメトリ有無 /
     veil_exr=黒バッキング素照明（RGB=雲ベール輝度）/ bg_png=雲なしBeauty。
+    veil_none_exr を渡すと4レンダのペア方式: V = VeilAll − VeilNone（大気・雲ON
+    ベール同士の差分）。UDS 雲レイヤー/フォグ板の雲も V に乗り、空のグラデと
+    大気ヘイズは正確に相殺される（HV だけの旧3レンダ方式は中距離の層雲を
+    取りこぼす実測 2026-08-26）。空領域はαではなく T=1 の同式で合成する。
     出力: α=可視雲量の RGBA PNG。パラメータは _VIS_CLOUD_K ほか（モジュール定数）。
     戻り値: 出力パス（失敗時 None）。"""
     if not (_HAS_NUMPY and _HAS_PIL):
@@ -1766,6 +1834,8 @@ def compose_visible_cloud_h5(w_exr, geomask_exr, veil_exr, bg_png,
     A = _read_linear_alpha(w_exr, ffmpeg)
     Gm = _read_linear_gray(geomask_exr, ffmpeg) if geomask_exr else None
     V = _read_linear_gray(veil_exr, ffmpeg) if veil_exr else None
+    Vn0 = (_read_linear_gray(veil_none_exr, ffmpeg)
+           if veil_none_exr else None)
     if W is None or A is None:
         _warn("可視雲H5: 白バッキング入力を読めません")
         return None
@@ -1780,6 +1850,9 @@ def compose_visible_cloud_h5(w_exr, geomask_exr, veil_exr, bg_png,
             _warn("可視雲H5: 素板レベルを推定できません")
             return None
         T = _np.clip(W / plate, 0.0, 1.0)
+        if Vn0 is not None:
+            V = _np.clip(V - Vn0, 0.0, None)   # ペア差分＝純粋な雲ベール輝度
+            T = _np.where(geo, T, 1.0)         # 空は「明るい背景」として同式で扱う
         vv = V[V > 1e-6]
         V = _np.clip(V / max(float(_np.percentile(vv, 99)) if vv.size else 1.0,
                              1e-6), 0.0, 1.0)
@@ -1797,7 +1870,11 @@ def compose_visible_cloud_h5(w_exr, geomask_exr, veil_exr, bg_png,
         G = _VIS_CLOUD_CURVE_G
         visg = (1.0 - _np.exp(-G * _np.clip(boosted, 0.0, 1.0))) \
             / (1.0 - _np.exp(-G))
-        vis = _np.where(geo, _np.clip(visg, 0.0, 1.0), A)
+        if Vn0 is not None:
+            # ペア方式: 空領域も同式（大気ONの W はαが使えないため）
+            vis = _np.clip(visg, 0.0, 1.0)
+        else:
+            vis = _np.where(geo, _np.clip(visg, 0.0, 1.0), A)
     vis = 1.0 - _np.power(1.0 - _np.clip(vis, 0.0, 1.0), _VIS_DENSE_GAMMA)
     vis8 = (_np.clip(vis, 0.0, 1.0) * 255.0 + 0.5).astype(_np.uint8)
     z = _np.zeros_like(vis8)

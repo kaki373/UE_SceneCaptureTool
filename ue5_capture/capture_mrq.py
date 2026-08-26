@@ -218,7 +218,8 @@ def render_beauty(camera_actor, output_dir, width, height,
                   normal_material=None,
                   light_pass=False, light_direct=False,
                   cloud_matte_actors=None, cloud_visible=False,
-                  cloud_backing=None, geomask_material=None,
+                  cloud_backing=None, cloud_sources_off=False,
+                  geomask_material=None,
                   backing_actors=None, backing_white=False, sky_matte=False):
     """対象カメラを MRQ で Beauty レンダリング（非同期）。executor を返す。
     cloud_visible=True（要 cloud_matte_actors）は可視雲モード: 何も隠さず PIE 側で
@@ -283,6 +284,10 @@ def render_beauty(camera_actor, output_dir, width, height,
         saved_vis = {"pie": _start_pie_backing_white(cloud_matte_actors,
                                                      white=white),
                      "fills": _spawn_cloud_fill_lights(fills)}
+        if cloud_sources_off:
+            # 雲なしベール（VeilNone）: UDS の雲内フォグ板も PIE 側で隠す
+            # （HV は hidden_actors・雲レイヤーは ShowFlag.Cloud 0 が受け持つ）
+            saved_vis["plane_hider"] = _start_pie_udsplane_hider()
     elif cloud_matte_actors:
         # UE5.7 は holdout 方式のα出力が実質壊れている（cvarペア有効でも最大2/255・
         # 2026-07-24実測）ため分離モード固定。エンジン修正後に
@@ -329,6 +334,7 @@ def render_beauty(camera_actor, output_dir, width, height,
                              light_pass, light_direct,
                              cloud_matte=bool(cloud_matte_actors),
                              cloud_visible=cloud_visible,
+                             cloud_sources_off=cloud_sources_off,
                              geomask_material=geomask_material,
                              backing=bool(backing_actors), sky_matte=sky_matte)
     except Exception:
@@ -353,7 +359,8 @@ def _start_render(sub, camera_actor, output_dir, width, height,
                   fog_off, restore_scene, scene_sequence=None, scene_frame=None,
                   matte_material=None, depth_material=None, normal_material=None,
                   light_pass=False, light_direct=False, cloud_matte=False,
-                  cloud_visible=False, geomask_material=None,
+                  cloud_visible=False, cloud_sources_off=False,
+                  geomask_material=None,
                   backing=False, sky_matte=False):
     seq, seq_path = _create_temp_sequence(camera_actor,
                                           scene_sequence=scene_sequence,
@@ -487,9 +494,19 @@ def _start_render(sub, camera_actor, output_dir, width, height,
         # SupportPrimitiveAlphaHoldout も UE5.7 では無効（全て 2026-08-26 実測）。
         # マスク対象は HV(VDB) 雲のみ。
         pairs += [("r.PostProcessing.PropagateAlpha", 1),
-                  ("ShowFlag.Atmosphere", 0), ("ShowFlag.Fog", 0),
-                  ("ShowFlag.VolumetricFog", 0)]
-        _log("cloud matte (alpha / atmosphere+fog off)")
+                  ("ShowFlag.Fog", 0), ("ShowFlag.VolumetricFog", 0)]
+        if cloud_visible:
+            # 可視雲(H5)系は大気・雲レイヤーを生かす（UDS 雲レイヤー/フォグ板の雲も
+            # ベール/透過に写す。空・大気ヘイズは VeilNone との差分で相殺）。
+            # VeilNone は ShowFlag.Cloud 0 でレイヤーだけ消す（HV は hidden_actors、
+            # フォグ板は PIE ウォッチャが受け持つ）。
+            if cloud_sources_off:
+                pairs.append(("ShowFlag.Cloud", 0))
+            _log("cloud matte (visible / atmosphere on / fog off%s)"
+                 % (" / cloud-layer off" if cloud_sources_off else ""))
+        else:
+            pairs.append(("ShowFlag.Atmosphere", 0))
+            _log("cloud matte (alpha / atmosphere+fog off)")
     if sky_matte:
         # 空マット: PPマテリアル(スタイライズ等)とブルームを切る。大気・雲は
         # ShowFlag で明示的に ON（環境光と雲の維持。ue-sky-matte-capture 実証）
@@ -740,11 +757,19 @@ def _start_pie_backing_white(vol_targets, white=False):
     「見えている雲量（知覚的カバレッジ）」を画素毎に与える（白バッキングの 1−T は
     物理透過率で Beauty の見た目より薄くなる実測 2026-08-26 → 黒方式へ変更）。
     LevelInstance 内包・スポーナブルにも効かせるため PIE 側で毎 tick 冪等に行う
-    （PIE は破棄されるので復元不要）。"""
+    （PIE は破棄されるので復元不要）。
+    ⚠️ 差し替えるのは「元々不透明深度を書くスロット」だけ。半透明系スロットは
+    不可視マテ(BackingClear)へ、非表示コンポーネントは触らない — 一律差し替えは
+    UDS の雲内フォグ板（半透明・深度なし）を雲高度の不透明面に変えてしまい、
+    その奥の HV(VDB雲) が深度テストで全滅する（中距離雲のマット落ち実測
+    2026-08-26）。"""
     from capture_core import (get_or_create_backing_white_material,
-                              get_or_create_matteboard_material, _is_hv_comp)
+                              get_or_create_matteboard_material,
+                              get_or_create_backing_clear_material,
+                              material_writes_depth, _is_hv_comp)
     mat = (get_or_create_backing_white_material() if white
            else get_or_create_matteboard_material())
+    clear_mat = get_or_create_backing_clear_material()
     tnames = set()
     for a in vol_targets or []:
         try:
@@ -794,7 +819,16 @@ def _start_pie_backing_white(vol_targets, white=False):
                         if _is_hv_comp(comp):
                             continue      # 雲(HV)は差し替え不可・対象そのもの
                         try:
+                            # 描画されないコンポーネントには触らない（BPの隠し
+                            # ヘルパー等。set_material は BP 側の再表示ロジックと
+                            # 干渉し得る）
+                            if (not comp.is_visible()
+                                    or comp.get_editor_property("hidden_in_game")):
+                                continue
                             for i in range(comp.get_num_materials()):
+                                cur = comp.get_material(i)
+                                if cur is not None and not material_writes_depth(cur):
+                                    continue   # 半透明系は元のまま（深度も見た目もBeautyと同じ挙動）
                                 comp.set_material(i, mat)
                         except Exception:
                             pass
@@ -808,6 +842,60 @@ def _start_pie_backing_white(vol_targets, white=False):
             state["logged"] = True
             _log("可視雲: PIE 側で %d アクターを%sバッキング材へ差替"
                  % (n, "白" if white else "黒"))
+
+    state["h"] = unreal.register_slate_post_tick_callback(_tick)
+    state["stop"] = _stop
+    return state
+
+
+def _start_pie_udsplane_hider():
+    """VeilNone（雲なしベール）用: UDS の雲内フォグ板（Inside_Clouds 材の
+    StaticMeshComponent。実体は雲高度に張られた世界横断の巨大板で、通常は
+    半透明・深度なし）を PIE 側で set_visibility(False) するウォッチャ。
+    HV でも VolumetricCloud でもない第3の雲ソースで、これを消し忘れると
+    ベール差分 VeilAll−VeilNone に板の雲が残らず層雲がマット落ちする
+    （AV024 中距離雲の取りこぼし実測 2026-08-26）。PIE は破棄されるので復元不要。"""
+    state = {"h": None, "done": set()}
+
+    def _stop():
+        h = state.pop("h", None)
+        if h is not None:
+            try:
+                unreal.unregister_slate_post_tick_callback(h)
+            except Exception:
+                pass
+
+    def _tick(dt):
+        try:
+            pie = unreal.get_editor_subsystem(
+                unreal.UnrealEditorSubsystem).get_game_world()
+        except Exception:
+            pie = None
+        if pie is None:
+            return
+        try:
+            for a in unreal.GameplayStatics.get_all_actors_of_class(pie, unreal.Actor):
+                if "Ultra_Dynamic_Sky" not in a.get_class().get_name():
+                    continue
+                for c in a.get_components_by_class(unreal.StaticMeshComponent):
+                    key = c.get_path_name()
+                    if key in state["done"]:
+                        continue
+                    try:
+                        mats = [c.get_material(i).get_name()
+                                for i in range(c.get_num_materials())
+                                if c.get_material(i)]
+                    except Exception:
+                        mats = []
+                    if any("Inside_Clouds" in n for n in mats):
+                        try:
+                            c.set_visibility(False, True)
+                            state["done"].add(key)
+                            _log("VeilNone: UDS 雲内フォグ板を PIE 側で非表示")
+                        except Exception:
+                            pass
+        except Exception:
+            pass
 
     state["h"] = unreal.register_slate_post_tick_callback(_tick)
     state["stop"] = _stop
@@ -969,12 +1057,13 @@ def _restore_sky_matte_mode(saved):
 def _restore_visible_cloud_mode(saved):
     """可視雲モードの後始末: PIE 白差替ウォッチャ停止 + フィルライト破棄。
     PIE ワールド側の材差替は PIE 破棄で消えるので復元不要。"""
-    pie_state = (saved or {}).get("pie")
-    if pie_state and pie_state.get("stop"):
-        try:
-            pie_state["stop"]()
-        except Exception:
-            pass
+    for key in ("pie", "plane_hider"):
+        pie_state = (saved or {}).get(key)
+        if pie_state and pie_state.get("stop"):
+            try:
+                pie_state["stop"]()
+            except Exception:
+                pass
     eas = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
     for a in (saved or {}).get("fills") or []:
         try:

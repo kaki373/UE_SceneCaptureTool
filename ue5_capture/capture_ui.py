@@ -898,6 +898,13 @@ class CaptureWindow(object):
             jobs.append(dict(base=_name("CloudVeil"), cloud=cloudmatte_vols,
                              cloud_kind="cloudveil", fmt="exr",
                              cloud_backing="black"))
+            # 雲なしベール: HV 隠し + ShowFlag.Cloud 0 + UDS フォグ板隠し。
+            # V = CloudVeil − CloudVeil0 で UDS 雲レイヤー/板の雲も拾い、
+            # 空グラデ・大気ヘイズを相殺する（ペア方式 2026-08-26）
+            jobs.append(dict(base=_name("CloudVeil0"), cloud=cloudmatte_vols,
+                             cloud_kind="cloudveil", fmt="exr",
+                             cloud_backing="black",
+                             hidden=list(cloudmatte_vols), sources_off=True))
             jobs.append(dict(base=_name("CloudBG"), hidden=list(cloudmatte_vols),
                              ts1=True))
         if self.skymatte_var.get():
@@ -976,13 +983,15 @@ class CaptureWindow(object):
             cm_png = os.path.join(out, _name("CloudMatte") + ".png")
             if cloud_alpha_needed:
                 gexr = os.path.join(out, _name("CloudMatte") + "_GeoMask.exr")
+                v0_exr = os.path.join(out, _name("CloudVeil0") + ".exr")
                 r = core.compose_visible_cloud_h5(
                     os.path.join(out, _name("CloudMatte") + ".exr"),
                     gexr if os.path.isfile(gexr) else None,
                     os.path.join(out, _name("CloudVeil") + ".exr"),
                     os.path.join(out, _name("CloudBG") + ".png"),
                     cm_png,
-                    ffmpeg=core.find_ffmpeg(getattr(self, "_ffmpeg_hint", None)))
+                    ffmpeg=core.find_ffmpeg(getattr(self, "_ffmpeg_hint", None)),
+                    veil_none_exr=v0_exr if os.path.isfile(v0_exr) else None)
                 if not r:
                     skip_notes.append("雲マット: H5合成失敗")
             # Normal / Depth の雲領域を黒に落とす（α のままの CloudMatte を乗算。
@@ -1051,6 +1060,7 @@ class CaptureWindow(object):
                 for _sf in (_name("CloudMatte") + ".exr",
                             _name("CloudMatte") + "_GeoMask.exr",
                             _name("CloudVeil") + ".exr",
+                            _name("CloudVeil0") + ".exr",
                             _name("CloudBG") + ".png"):
                     _p = os.path.join(out, _sf)
                     if os.path.isfile(_p):
@@ -1192,6 +1202,8 @@ class CaptureWindow(object):
                                                          in ("cloudvis",
                                                              "cloudveil")),
                                           cloud_backing=j.get("cloud_backing"),
+                                          cloud_sources_off=j.get("sources_off",
+                                                                  False),
                                           geomask_material=j.get("geomask"),
                                           sky_matte=j.get("sky", False),
                                           backing_actors=j.get("backing"),
