@@ -1513,9 +1513,11 @@ def apply_cloud_black(path, cloud_path):
     else:
         # sRGB 値に直接 (1−α) を掛けるとリニア換算 (1−α)^2.2 で二重に濃くなる
         # （雲マットのαは正しいのに Normal だけ濃く見える実測 2026-08-26 AV024
-        # take020）→ リニア化してから乗算し再エンコードする
+        # take020）。リニア化して乗算するが、純リニア(m=1)は薄く感じるとの
+        # 目視評価により、強さは _CLOUD_MUL_POW で連続調整する（(1−α)^m）
         arr = _np.asarray(im.convert("RGB")).astype(_np.float32) / 255.0
-        lin = _np.power(arr, 2.2) * (1.0 - ca)[:, :, None]
+        keep = _np.power(_np.clip(1.0 - ca, 0.0, 1.0), _CLOUD_MUL_POW)
+        lin = _np.power(arr, 2.2) * keep[:, :, None]
         out = (_np.power(_np.clip(lin, 0.0, 1.0), 1.0 / 2.2) * 255.0 + 0.5
                ).astype(_np.uint8)
         _PILImage.fromarray(out, "RGB").save(path)
@@ -1654,6 +1656,8 @@ _VIS_CLOUD_CURVE_G = 2.0    # 飽和カーブ
 _VIS_SUN_BOOST_S = 0.8      # 日照（高ベール輝度）画素の不透明化強さ
 _VIS_SUN_BOOST_P = 1.0      # 日照ブーストの集中度（2で最明部限定）
 _VIS_DENSE_GAMMA = 1.5      # 全体の濃さ（1=素・1.5=一段濃い・2.2=二段濃い）
+_CLOUD_MUL_POW = 1.6        # Normal/Depth 雲抜きの乗算強さ（リニア空間で (1−α)^m。
+                            # 1.0=リニア正確=薄め / 2.2=旧sRGB直乗算相当=濃い）
 
 
 def vis_cloud_gain_tag():
