@@ -1497,9 +1497,16 @@ class CaptureWindow(object):
                 parts.append(core._safe_name(c))
         parts.append(core._safe_name(seq.get_name()))
         name_body = "_".join(parts)
-        out = base_out
+        final_out = base_out
         if self.seq_subdir_var.get():
-            out = os.path.join(base_out, "%s_%s" % (name_body, take_str))
+            final_out = os.path.join(base_out, "%s_%s" % (name_body, take_str))
+        # 中間ファイル（内部素材・EXR・トリム前連番）は作業フォルダに集約し、
+        # 完了時に成果物だけを final_out へ移して作業フォルダごと削除する
+        out = os.path.join(final_out, "_work_%s" % take_str)
+        try:
+            os.makedirs(out, exist_ok=True)
+        except Exception:
+            pass
         self._save_ui_state()
 
         depth_mat = matte_mat = matte_sil_mat = objid_mat = normal_mat = None
@@ -1551,7 +1558,22 @@ class CaptureWindow(object):
                 # 雲ジョブが残す r.PostProcessing.PropagateAlpha=1 を元値へ（実測リーク）
                 unreal.SystemLibrary.execute_console_command(
                     None, "r.PostProcessing.PropagateAlpha %d" % (1 if pa0 else 0))
-            msg = (("シーケンスレンダ完了: %s" % od) if ok
+            # 成功時: 作業フォルダに残った成果物（素材サブフォルダ/MP4/JSON）を
+            # final_out へ移し、作業フォルダごと削除。失敗時は診断用に残す
+            if ok:
+                try:
+                    for f in os.listdir(out):
+                        os.replace(os.path.join(out, f),
+                                   os.path.join(final_out, f))
+                    os.rmdir(out)
+                except Exception as e:
+                    seq_notes.append("作業フォルダの後片付けに失敗（%s に残置）"
+                                     % os.path.basename(out))
+                    unreal.log_warning("[SceneCapture] 作業フォルダ移動失敗: %s" % e)
+            else:
+                seq_notes.append("中間ファイルは %s に残置（診断用）"
+                                 % os.path.basename(out))
+            msg = (("シーケンスレンダ完了: %s" % final_out) if ok
                    else "シーケンスレンダ失敗 (Output Log 参照)")
             if seq_notes:
                 msg += "（%s）" % " / ".join(seq_notes)
