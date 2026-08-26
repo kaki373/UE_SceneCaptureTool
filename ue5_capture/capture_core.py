@@ -1637,7 +1637,7 @@ def _read_linear_alpha(path, ffmpeg):
 
 # 可視雲のジオメトリ画素に掛ける飽和ゲイン（1−e^(−G·x) 正規化）。上げるほど
 # 雲の中身が早く不透明になる（輪郭・貫通の筋は輝度≈0のため影響が小さい）
-_VIS_CLOUD_GAIN = 12.0
+_VIS_CLOUD_GAIN = 9.0
 
 
 def compose_visible_cloud(w_exr, geomask_exr, out_rgba_png, ffmpeg=None, scale=None):
