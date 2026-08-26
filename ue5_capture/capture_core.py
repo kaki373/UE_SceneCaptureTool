@@ -1511,8 +1511,13 @@ def apply_cloud_black(path, cloud_path):
         arr = _np.asarray(im).astype(_np.float32) / 65535.0
         _write_png_u16_gray(path, arr * (1.0 - ca))
     else:
-        arr = _np.asarray(im.convert("RGB")).astype(_np.float32)
-        out = (arr * (1.0 - ca)[:, :, None]).clip(0, 255).astype(_np.uint8)
+        # sRGB 値に直接 (1−α) を掛けるとリニア換算 (1−α)^2.2 で二重に濃くなる
+        # （雲マットのαは正しいのに Normal だけ濃く見える実測 2026-08-26 AV024
+        # take020）→ リニア化してから乗算し再エンコードする
+        arr = _np.asarray(im.convert("RGB")).astype(_np.float32) / 255.0
+        lin = _np.power(arr, 2.2) * (1.0 - ca)[:, :, None]
+        out = (_np.power(_np.clip(lin, 0.0, 1.0), 1.0 / 2.2) * 255.0 + 0.5
+               ).astype(_np.uint8)
         _PILImage.fromarray(out, "RGB").save(path)
 
 

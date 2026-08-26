@@ -972,7 +972,7 @@ class CaptureWindow(object):
                 if not r:
                     skip_notes.append("雲マット: H5合成失敗")
             # Normal / Depth の雲領域を黒に落とす（α のままの CloudMatte を乗算。
-            # 白黒変換前に行う）
+            # 白黒変換前に行う）。乗算前の素材は _cloudsrc/ に退避して再合成可能に
             cloud_applied = os.path.isfile(cm_png)
             if os.path.isfile(cm_png):
                 targets = []
@@ -983,6 +983,13 @@ class CaptureWindow(object):
                 for _lbl, _p in targets:
                     if not os.path.isfile(_p):
                         continue
+                    try:
+                        srcdir = os.path.join(out, "_cloudsrc")
+                        os.makedirs(srcdir, exist_ok=True)
+                        import shutil
+                        shutil.copy2(_p, os.path.join(srcdir, os.path.basename(_p)))
+                    except Exception:
+                        pass
                     try:
                         core.apply_cloud_black(_p, cm_png)
                     except Exception as e:
