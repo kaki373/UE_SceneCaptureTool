@@ -954,6 +954,7 @@ class CaptureWindow(object):
             # Normal / Depth の雲領域を黒に落とす（α のままの CloudMatte を乗算。
             # 白黒変換前に行う）
             cm_png = os.path.join(out, _name("CloudMatte") + ".png")
+            cloud_applied = os.path.isfile(cm_png)
             if os.path.isfile(cm_png):
                 targets = []
                 if normal_pp_mat is not None:
@@ -1001,6 +1002,26 @@ class CaptureWindow(object):
                         os.remove(p)
                     except Exception:
                         pass
+            # 雲抜き/マットは _VIS_CLOUD_GAIN 依存のため、G 値をファイル名へ付与
+            # （例 ..._CloudMatte_017_G7.png。テイク番号検出 _(\d{3})(?=[._]) は
+            # 後置サフィックスでも壊れない）
+            if cloud_applied:
+                gtag = core.vis_cloud_gain_tag()
+                gt_names = []
+                if want_cloudmatte:
+                    gt_names.append("CloudMatte")
+                if normal_pp_mat is not None:
+                    gt_names.append("Normal")
+                if depth_black_ok:
+                    gt_names.append("Depth")
+                for _bn in gt_names:
+                    _src = os.path.join(out, _name(_bn) + ".png")
+                    if os.path.isfile(_src):
+                        try:
+                            os.replace(_src, os.path.join(
+                                out, "%s_%s.png" % (_name(_bn), gtag)))
+                        except Exception:
+                            skip_notes.append("%s: Gタグ付与失敗" % _bn)
             _restore_fb()
             if pa0 is not None:
                 unreal.SystemLibrary.execute_console_command(

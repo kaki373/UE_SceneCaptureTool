@@ -1640,6 +1640,11 @@ def _read_linear_alpha(path, ffmpeg):
 _VIS_CLOUD_GAIN = 7.0
 
 
+def vis_cloud_gain_tag():
+    """G 値のファイル名タグ（例 'G7' / 'G7.5'）。雲マット/雲抜き出力の識別用。"""
+    return "G%g" % _VIS_CLOUD_GAIN
+
+
 def compose_visible_cloud(w_exr, geomask_exr, out_rgba_png, ffmpeg=None, scale=None):
     """可視雲マット合成（黒バッキング方式）: 全ジオメトリを黒アンリット材で
     レンダした EXR（RGB=雲の散乱輝度 L・α=全投影雲α）と GeoMask（ジオメトリ有=白）
