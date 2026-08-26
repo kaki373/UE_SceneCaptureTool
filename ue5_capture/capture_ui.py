@@ -44,6 +44,7 @@ _SEQ_OUTPUTS = [
     ("mfront", "Matteの前（Beauty+Matte）", "MatteBeauty"),
     ("behind", "Matteの奥", "Behind"),
     ("cloudmatte", "雲マット（VDB雲=黒）", "CloudMatte"),
+    ("skymatte", "空マット（空=黒・大気光維持）", "SkyMatte"),
     ("objid", "ObjectID", "ObjectID"),
     ("rlfull", "Raw Lighting Full(Sun+GI+Sky)", "RawLightingFull"),
     ("rldir", "Raw Lighting Direct", "RawLightingDirect"),
@@ -360,6 +361,16 @@ class CaptureWindow(object):
             row=row, column=0, columnspan=3, sticky="w", padx=8)
         row += 1
         ttk.Label(matf, text="  （対象はレベル内の全VDB雲。分離モード＝手前ジオメトリの遮蔽は反映されない）",
+                  foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", padx=8)
+        row += 1
+
+        # 空マット（空=純黒・大気光/雲は維持。ue-sky-matte-capture 方式）
+        self.skymatte_var = tk.BooleanVar(master=self.root, value=False)
+        ttk.Checkbutton(matf, text="空マット（空=黒・大気光/雲は維持）",
+                        variable=self.skymatte_var).grid(
+            row=row, column=0, columnspan=3, sticky="w", padx=8)
+        row += 1
+        ttk.Label(matf, text="  （UDSのSky_Sphereを黒ドームに差替え・PPマテリアル/ブルームOFFの追加レンダ1回）",
                   foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", padx=8)
         row += 1
         matf.columnconfigure(1, weight=1)
@@ -777,7 +788,7 @@ class CaptureWindow(object):
                          or depth_pp_mat is not None or normal_pp_mat is not None
                          or want_rlfull)
         if (not beauty_needed and not want_rldir and not objid_cloud_vols
-                and not self.cloudmatte_var.get()):
+                and not self.cloudmatte_var.get() and not self.skymatte_var.get()):
             _restore_fb()
             self.status_var.set("完了（データパスのみ出力）" if (s.do_depth or s.do_object_id)
                                 else "出力が選ばれていません")
@@ -889,6 +900,9 @@ class CaptureWindow(object):
                              cloud_backing="black"))
             jobs.append(dict(base=_name("CloudBG"), hidden=list(cloudmatte_vols),
                              ts1=True))
+        if self.skymatte_var.get():
+            # 空マット: 空=黒・大気光/雲維持の追加レンダ（Beauty と同形式）
+            jobs.append(dict(base=_name("SkyMatte"), fmt=img_fmt, sky=True))
         if want_behind:
             mt = core._resolve_target_actors(None, self._pick_targets_resolved(self.matte_pick) or None)
             mt_p, mt_v = core.split_volumetric_targets(mt)
@@ -1179,9 +1193,13 @@ class CaptureWindow(object):
                                                              "cloudveil")),
                                           cloud_backing=j.get("cloud_backing"),
                                           geomask_material=j.get("geomask"),
+                                          sky_matte=j.get("sky", False),
                                           backing_actors=j.get("backing"),
+                                          # 空マットはフォグ散乱が空を埋めるため
+                                          # fog_off 強制（実績スクリプトと同条件）
                                           backing_white=j.get("backing_white", False),
-                                          fog_off=self.fog_off_var.get(),
+                                          fog_off=(True if j.get("sky")
+                                                   else self.fog_off_var.get()),
                                           scene_sequence=scene_seq,
                                           scene_frame=scene_frame, on_done=_jdone)
             except Exception as e:
@@ -1449,6 +1467,7 @@ class CaptureWindow(object):
         rlfull_needed = _need("rlfull")
         rldir_needed = _need("rldir")
         cloudmatte_needed = _need("cloudmatte")
+        skymatte_needed = _need("skymatte")
         # Direct だけならメインジョブ自体を直射レンダにする（全編2回レンダの回避）
         only_direct = rldir_needed and not (
             _need("beauty") or depth_needed or normal_needed or matte_needed
@@ -1638,6 +1657,8 @@ class CaptureWindow(object):
                 return
             try:
                 trim_list = list(pass_files_main)
+                if skymatte_needed:
+                    trim_list.append("SkyMatte")
                 if _need("behind"):
                     trim_list.append("BehindPlate")
                 if rldir_needed and not only_direct:
@@ -1815,20 +1836,50 @@ class CaptureWindow(object):
                 self.status_var.set("バッキング起動失敗: %s" % e)
                 _finish_outputs(True, od)
 
+        def _run_skymatte(ok, od):
+            """空マット（空=黒・大気光/雲維持）の専用ジョブ。UDS Sky_Sphere→黒ドーム
+            差替は render_sequence(sky_matte=True) が行い、レンダ後に自動復元される。
+            失敗してもメイン素材の後処理は完走する（注記のみ）。"""
+            if not (ok and skymatte_needed):
+                _run_cloud_matte(ok, od)
+                return
+
+            def _sm_done(sok, sod):
+                if not sok:
+                    wants["skymatte"] = (False, False)
+                    seq_notes.append("空マット: レンダ失敗")
+                _run_cloud_matte(True, od)
+
+            self.status_var.set("空マット(SkyMatte)をレンダ中… (空=黒・大気光維持)")
+            self.root.update()
+            try:
+                capture_mrq.render_sequence(
+                    seq, out, W, H, name_body, take_str,
+                    do_png=True, do_mp4=False,
+                    temporal_samples=ts, warmup=warm,
+                    custom_start=cs, custom_end=ce,
+                    sky_matte=True, beauty_label="SkyMatte",
+                    fog_off=True, on_done=_sm_done)
+            except Exception as e:
+                wants["skymatte"] = (False, False)
+                seq_notes.append("空マット: 起動失敗")
+                self.status_var.set("空マット起動失敗: %s" % e)
+                _run_cloud_matte(True, od)
+
         def _run_direct(ok, od):
             """Raw Lighting Direct の専用ジョブ（GI/Sky/AO を切った直射のみ）。
             only_direct のときはメインジョブが直射レンダ済みなのでスキップ。
             このジョブの失敗ではレンダ済みのメイン素材の後処理を放棄しない
             （rldir を無効化して完走し、完了メッセージに注記する）。"""
             if not (ok and rldir_needed and not only_direct):
-                _run_cloud_matte(ok, od)
+                _run_skymatte(ok, od)
                 return
 
             def _direct_done(dok, dod):
                 if not dok:
                     wants["rldir"] = (False, False)
                     seq_notes.append("Raw Lighting Direct: レンダ失敗")
-                _run_cloud_matte(True, od)
+                _run_skymatte(True, od)
 
             self.status_var.set("Raw Lighting Direct をレンダ中… (GI/Sky/AO off)")
             self.root.update()
@@ -1847,7 +1898,7 @@ class CaptureWindow(object):
                 wants["rldir"] = (False, False)
                 seq_notes.append("Raw Lighting Direct: 起動失敗")
                 self.status_var.set("Raw Lighting Direct 起動失敗: %s" % e)
-                _run_cloud_matte(True, od)
+                _run_skymatte(True, od)
 
         def _after_main(ok, od):
             if not (ok and _need("behind")):
@@ -2226,6 +2277,7 @@ class CaptureWindow(object):
                 "depth": self.depth_var.get(),
                 "normal": self.normal_var.get(),
                 "cloudmatte": self.cloudmatte_var.get(),
+                "skymatte": self.skymatte_var.get(),
                 "beauty": self.beauty_var.get(),
                 "mfront": self.mfront_var.get(),
                 "behind": self.behind_var.get(),
@@ -2304,6 +2356,7 @@ class CaptureWindow(object):
         _setvar(self.depth_var, "depth")
         _setvar(self.normal_var, "normal")
         _setvar(self.cloudmatte_var, "cloudmatte")
+        _setvar(self.skymatte_var, "skymatte")
         _setvar(self.beauty_var, "beauty")
         _setvar(self.mfront_var, "mfront")
         _setvar(self.behind_var, "behind")

@@ -2120,6 +2120,41 @@ def _mx_get_or_create_pp_material(name):
     return mat
 
 
+_TMP_SKYBLACK_NAME = "M_UE5Cap_SkyBlack"
+
+
+def delete_temp_sky_black_material():
+    _delete_temp_material(_TMP_SKYBLACK_NAME, "SkyBlack")
+
+
+def get_or_create_sky_black_material():
+    """空マット用の黒スカイドーム材（Unlit/Opaque/TwoSided/is_sky=True）。
+    is_sky=True で空気遠近(aerial perspective)を受けない＝純黒が保たれる
+    （ue-sky-matte-capture スキルで実証済みの構成）。"""
+    full = _TMP_MAT_PKG + "/" + _TMP_SKYBLACK_NAME
+    mat = None
+    if unreal.EditorAssetLibrary.does_asset_exist(full):
+        mat = unreal.EditorAssetLibrary.load_asset(full)
+    if mat is None:
+        at = unreal.AssetToolsHelpers.get_asset_tools()
+        mat = at.create_asset(_TMP_SKYBLACK_NAME, _TMP_MAT_PKG,
+                              unreal.Material, unreal.MaterialFactoryNew())
+    if mat is None:
+        raise RuntimeError("SkyBlack マテリアルの生成に失敗しました。")
+    MEL = unreal.MaterialEditingLibrary
+    mat.set_editor_property("shading_model", unreal.MaterialShadingModel.MSM_UNLIT)
+    mat.set_editor_property("blend_mode", unreal.BlendMode.BLEND_OPAQUE)
+    mat.set_editor_property("two_sided", True)
+    mat.set_editor_property("is_sky", True)
+    MEL.delete_all_material_expressions(mat)
+    c = MEL.create_material_expression(mat, unreal.MaterialExpressionConstant, -300, 0)
+    c.set_editor_property("r", 0.0)
+    MEL.connect_material_property(c, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+    MEL.recompile_material(mat)
+    _log("一時 SkyBlack マテリアル生成")
+    return mat
+
+
 _TMP_NORMAL_NAME = "M_UE5Cap_Normal"
 
 

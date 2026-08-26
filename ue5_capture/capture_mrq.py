@@ -219,7 +219,7 @@ def render_beauty(camera_actor, output_dir, width, height,
                   light_pass=False, light_direct=False,
                   cloud_matte_actors=None, cloud_visible=False,
                   cloud_backing=None, geomask_material=None,
-                  backing_actors=None, backing_white=False):
+                  backing_actors=None, backing_white=False, sky_matte=False):
     """対象カメラを MRQ で Beauty レンダリング（非同期）。executor を返す。
     cloud_visible=True（要 cloud_matte_actors）は可視雲モード: 何も隠さず PIE 側で
     全ジオメトリを白発光材へ差し替え、EXR の RGB=W(=T×素板レベル)・α=全投影雲αを
@@ -291,6 +291,9 @@ def render_beauty(camera_actor, output_dir, width, height,
     saved_backing = None
     if backing_actors:
         saved_backing = _set_backing_materials(backing_actors, backing_white)
+    saved_sky = None
+    if sky_matte:
+        saved_sky = _set_sky_matte_mode(camera_actor)
     saved_players = _suppress_autoplay_players()
     saved_cam = [c for c in (_fill_aspect_comp(camera_actor, width, height),)
                  if c is not None]
@@ -311,6 +314,8 @@ def render_beauty(camera_actor, output_dir, width, height,
             _restore_visible_cloud_mode(saved_vis)
         if saved_backing:
             _restore_backing_materials(saved_backing)
+        if saved_sky:
+            _restore_sky_matte_mode(saved_sky)
         _restore_autoplay_players(saved_players)
         _restore_cameras_aspect(saved_cam)
 
@@ -325,7 +330,7 @@ def render_beauty(camera_actor, output_dir, width, height,
                              cloud_matte=bool(cloud_matte_actors),
                              cloud_visible=cloud_visible,
                              geomask_material=geomask_material,
-                             backing=bool(backing_actors))
+                             backing=bool(backing_actors), sky_matte=sky_matte)
     except Exception:
         # 起動に失敗したら状態を巻き戻す（次回レンダを塞がない）
         _restore_scene()
@@ -349,7 +354,7 @@ def _start_render(sub, camera_actor, output_dir, width, height,
                   matte_material=None, depth_material=None, normal_material=None,
                   light_pass=False, light_direct=False, cloud_matte=False,
                   cloud_visible=False, geomask_material=None,
-                  backing=False):
+                  backing=False, sky_matte=False):
     seq, seq_path = _create_temp_sequence(camera_actor,
                                           scene_sequence=scene_sequence,
                                           scene_frame=scene_frame)
@@ -485,6 +490,12 @@ def _start_render(sub, camera_actor, output_dir, width, height,
                   ("ShowFlag.Atmosphere", 0), ("ShowFlag.Fog", 0),
                   ("ShowFlag.VolumetricFog", 0)]
         _log("cloud matte (alpha / atmosphere+fog off)")
+    if sky_matte:
+        # 空マット: PPマテリアル(スタイライズ等)とブルームを切る。大気・雲は
+        # ShowFlag で明示的に ON（環境光と雲の維持。ue-sky-matte-capture 実証）
+        pairs += [("ShowFlag.PostProcessMaterial", 0), ("r.BloomQuality", 0),
+                  ("ShowFlag.Atmosphere", 1), ("ShowFlag.Cloud", 1)]
+        _log("sky matte (PPマテリアルOFF / ブルームOFF / 大気・雲ON)")
     if backing or cloud_visible:
         # 露出適応は白板に反応して画面全体を沈める（-18%実測）ため、適応と
         # ローカル露出をジョブ内で無効化。白板は発光100なのでブルームと
@@ -874,6 +885,87 @@ def _start_pie_cloud_hider(vol_targets):
     return state
 
 
+def _set_sky_matte_mode(camera_actor):
+    """空マット: UDS の Sky_Sphere を非表示にし、カメラ中心に黒スカイドーム
+    （Unlit黒・is_sky=True＝空気遠近を受けない・寄与フラグ全OFF）をスポーンする。
+    大気/雲の ShowFlag は ON のまま＝環境光と雲は維持（ue-sky-matte-capture 実証:
+    ShowFlag.Atmosphere 0 で消すと雲が消え環境光も -25% 落ちる）。
+    UDS コンポーネントに効くのは BlueprintCallable の set_visibility /
+    set_hidden_in_game のみ（set_editor_property は BP 再構築で無効化）。"""
+    from capture_core import get_or_create_sky_black_material
+    eas = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    pairs = []
+    for actor in eas.get_all_level_actors():
+        if actor.get_class().get_name() != "Ultra_Dynamic_Sky_C":
+            continue
+        for comp in actor.get_components_by_class(unreal.StaticMeshComponent):
+            if comp.get_name() == "Sky_Sphere":
+                pairs.append((actor, comp))
+    if not pairs:
+        raise RuntimeError("空マット: UDS の Sky_Sphere が見つかりません")
+    _o, ext, _r = unreal.SystemLibrary.get_component_bounds(pairs[0][1])
+    radius = max(ext.x, ext.y, ext.z) * 0.9
+    mat = get_or_create_sky_black_material()
+    saved = []
+    for actor, comp in pairs:
+        saved.append((comp, comp.get_editor_property("visible"),
+                      comp.get_editor_property("hidden_in_game")))
+        comp.set_visibility(False, False)
+        comp.set_hidden_in_game(True, False)
+    mesh = unreal.EditorAssetLibrary.load_asset("/Engine/BasicShapes/Sphere.Sphere")
+    dome = eas.spawn_actor_from_class(
+        unreal.StaticMeshActor, camera_actor.get_actor_location(),
+        unreal.Rotator(0.0, 0.0, 0.0))
+    dome.set_actor_label("UE5Cap_SkyDome_TMP")
+    s = radius / 50.0                       # BasicShapes/Sphere は半径 50cm
+    dome.set_actor_scale3d(unreal.Vector(s, s, s))
+    comp = dome.static_mesh_component
+    comp.set_static_mesh(mesh)
+    comp.set_material(0, mat)
+    for prop, val in (("cast_shadow", False),
+                      ("affect_dynamic_indirect_lighting", False),
+                      ("affect_distance_field_lighting", False),
+                      ("visible_in_ray_tracing", False),
+                      ("visible_in_real_time_sky_captures", False),
+                      ("visible_in_reflection_captures", False)):
+        try:
+            comp.set_editor_property(prop, val)
+        except Exception:
+            pass
+    # bIsSky メッシュ + リアルタイムスカイライトの黄色い画面警告がレンダに
+    # 焼き込まれる（実測）ため、レンダ中は画面メッセージを止める（復元付き）
+    try:
+        unreal.SystemLibrary.execute_console_command(
+            _editor_world(), "DisableAllScreenMessages")
+    except Exception:
+        pass
+    _log("空マット構成: Sky_Sphere %d個非表示 + 黒ドーム(半径 %.0fm)"
+         % (len(saved), radius / 100.0))
+    return {"vis": saved, "dome": dome}
+
+
+def _restore_sky_matte_mode(saved):
+    from capture_core import delete_temp_sky_black_material
+    eas = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    try:
+        eas.destroy_actor(saved["dome"])
+    except Exception as e:
+        _warn("空マット: ドーム削除失敗: %s" % e)
+    for comp, pv, ph in saved.get("vis") or []:
+        try:
+            comp.set_visibility(pv, False)
+            comp.set_hidden_in_game(ph, False)
+        except Exception:
+            pass
+    try:
+        unreal.SystemLibrary.execute_console_command(
+            _editor_world(), "EnableAllScreenMessages")
+    except Exception:
+        pass
+    delete_temp_sky_black_material()
+    _log("空マット構成を復元")
+
+
 def _restore_visible_cloud_mode(saved):
     """可視雲モードの後始末: PIE 白差替ウォッチャ停止 + フィルライト破棄。
     PIE ワールド側の材差替は PIE 破棄で消えるので復元不要。"""
@@ -1087,7 +1179,8 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
                     light_label="RawLightingFull",
                     cloud_matte_actors=None, cloud_visible=False,
                     geomask_material=None,
-                    backing_actors=None, backing_white=False, use_exr=False):
+                    backing_actors=None, backing_white=False, use_exr=False,
+                    sky_matte=False):
     """開いている/指定の LevelSequence を MRQ でレンダリング（非同期）。
     一時シーケンスは作らず job.sequence に直接指定し、カメラはシーケンスの
     カメラカットトラックに従う。fps はシーケンスの Display Rate。
@@ -1160,6 +1253,13 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
     saved_backing = None
     if backing_actors:
         saved_backing = _set_backing_materials(backing_actors, backing_white)
+    saved_sky = None
+    if sky_matte:
+        from capture_core import list_cameras
+        cams = list_cameras()
+        if not cams:
+            raise RuntimeError("空マット: カメラが見つかりません")
+        saved_sky = _set_sky_matte_mode(cams[0])
     # レンダ対象以外の auto-play プレイヤーが PIE で並走するとシーンが二重評価される
     saved_players = _suppress_autoplay_players()
     # 全ジョブで適用する。メイン/BehindPlate 間でビュー矩形が食い違うと
@@ -1177,6 +1277,8 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
             _restore_visible_cloud_mode(saved_vis)
         if saved_backing:
             _restore_backing_materials(saved_backing)
+        if saved_sky:
+            _restore_sky_matte_mode(saved_sky)
         for a in hidden:
             try:
                 a.set_actor_hidden_in_game(False)
@@ -1197,7 +1299,8 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
                                       cloud_matte=bool(cloud_matte_actors),
                                       cloud_visible=cloud_visible,
                                       geomask_material=geomask_material,
-                                      backing=bool(backing_actors), use_exr=use_exr)
+                                      backing=bool(backing_actors), use_exr=use_exr,
+                                      sky_matte=sky_matte)
     except Exception:
         _restore_scene()
         if near_clip_cm is not None:
@@ -1220,7 +1323,7 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
                            light_pass=False, light_direct=False,
                            light_label="RawLightingFull", cloud_matte=False,
                            cloud_visible=False, geomask_material=None,
-                           backing=False, use_exr=False):
+                           backing=False, use_exr=False, sky_matte=False):
     queue = sub.get_queue()
     for j in list(queue.get_jobs()):
         queue.delete_job(j)
@@ -1342,6 +1445,12 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
                   ("ShowFlag.Atmosphere", 0), ("ShowFlag.Fog", 0),
                   ("ShowFlag.VolumetricFog", 0)]
         _log("cloud matte (alpha / atmosphere+fog off)")
+    if sky_matte:
+        # 空マット: PPマテリアル(スタイライズ等)とブルームを切る。大気・雲は
+        # ShowFlag で明示的に ON（環境光と雲の維持。ue-sky-matte-capture 実証）
+        pairs += [("ShowFlag.PostProcessMaterial", 0), ("r.BloomQuality", 0),
+                  ("ShowFlag.Atmosphere", 1), ("ShowFlag.Cloud", 1)]
+        _log("sky matte (PPマテリアルOFF / ブルームOFF / 大気・雲ON)")
     if backing or cloud_visible:
         # 露出適応は白板に反応して画面全体を沈める（-18%実測）ため、適応と
         # ローカル露出をジョブ内で無効化。白板は発光100なのでブルームと
