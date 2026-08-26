@@ -1656,7 +1656,7 @@ _VIS_CLOUD_CURVE_G = 2.0    # 飽和カーブ
 _VIS_SUN_BOOST_S = 0.8      # 日照（高ベール輝度）画素の不透明化強さ
 _VIS_SUN_BOOST_P = 1.0      # 日照ブーストの集中度（2で最明部限定）
 _VIS_DENSE_GAMMA = 1.5      # 全体の濃さ（1=素・1.5=一段濃い・2.2=二段濃い）
-_CLOUD_MUL_POW = 1.6        # Normal/Depth 雲抜きの乗算強さ（リニア空間で (1−α)^m。
+_CLOUD_MUL_POW = 2.2        # Normal/Depth 雲抜きの乗算強さ（リニア空間で (1−α)^m。
                             # 1.0=リニア正確=薄め / 2.2=旧sRGB直乗算相当=濃い）
 
 
