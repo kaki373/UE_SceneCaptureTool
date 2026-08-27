@@ -1760,6 +1760,46 @@ class CaptureWindow(object):
                               if wants[key][0]]
                 if png_passes:
                     core.move_pass_frames_to_subdirs(out, name_body, take_str, png_passes)
+                # 濃度タグ付与（静止画と同じ _H5d1.5。雲抜き/マットは濃度設定依存の
+                # ため。テイク番号検出 _(\d{3})(?=[._]) は後置サフィックスでも壊れない）
+                if cloud_seq["run"] and not cloud_seq["mfront"]:
+                    gtag = core.vis_cloud_gain_tag()
+                    tag_passes = []
+                    if cloudmatte_needed:
+                        tag_passes.append("CloudMatte")
+                    if cloud_for_black:
+                        if normal_needed:
+                            tag_passes.append("Normal")
+                        if depth_needed:
+                            tag_passes.append("Depth")
+                    for pn in tag_passes:
+                        mp4 = os.path.join(out, "%s_%s_%s.mp4"
+                                           % (name_body, pn, take_str))
+                        if os.path.isfile(mp4):
+                            try:
+                                os.replace(mp4, os.path.join(
+                                    out, "%s_%s_%s_%s.mp4"
+                                    % (name_body, pn, take_str, gtag)))
+                            except Exception:
+                                seq_notes.append("%s: MP4のGタグ付与失敗" % pn)
+                        sub = os.path.join(out, "%s_%s" % (pn, take_str))
+                        if os.path.isdir(sub):
+                            pre = "%s_%s_%s." % (name_body, pn, take_str)
+                            for f in os.listdir(sub):
+                                if f.startswith(pre):
+                                    try:
+                                        os.replace(
+                                            os.path.join(sub, f),
+                                            os.path.join(sub, "%s_%s_%s_%s.%s"
+                                                         % (name_body, pn, take_str,
+                                                            gtag, f[len(pre):])))
+                                    except Exception:
+                                        pass
+                            try:
+                                os.replace(sub, os.path.join(
+                                    out, "%s_%s_%s" % (pn, take_str, gtag)))
+                            except Exception:
+                                seq_notes.append("%s: フォルダのGタグ付与失敗" % pn)
                 _final(enc_ok, od)
 
             if cmds:
@@ -2024,13 +2064,15 @@ class CaptureWindow(object):
                 wants["behind"] = (False, False)
                 _run_direct(True, od)
 
-        if cloudmatte_needed and not (
+        if (cloudmatte_needed or skymatte_needed) and not (
                 _need("beauty") or depth_needed or normal_needed or matte_needed
                 or objid_needed or rlfull_needed or rldir_needed):
-            # 雲マットのみ: 全編の Beauty メインジョブを省いて雲ジョブから開始する
-            self.status_var.set("雲マット(CloudMatte)のみをレンダ中…")
+            # 雲マット/空マットのみ: 全編の Beauty メインジョブを省いて
+            # 専用ジョブチェーンから開始する（従来は空マット単独でも捨て
+            # Beauty を全編レンダしていた）
+            self.status_var.set("マット素材のみをレンダ中…")
             self.root.update()
-            _run_cloud_matte(True, out)
+            _run_skymatte(True, out)
             return
 
         self.status_var.set("シーケンスレンダ中… (PIE / %d〜%dF @%gfps)"
