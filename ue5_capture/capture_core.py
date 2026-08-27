@@ -375,16 +375,71 @@ def _visible_mask(target_depth, full_depth):
     return (target_depth < _DEPTH_FAR_CM) & (_np.abs(target_depth - full_depth) <= tol)
 
 
-def _render_depth_r(world, cam, w, h, spawned, show_only_actors=None, hidden_actors=None):
+def _render_depth_r(world, cam, w, h, spawned, show_only_actors=None,
+                    hidden_actors=None, fmt=None):
     """SCS_SCENE_DEPTH を1枚撮り、R チャンネル（cm 距離）を float32 (H,W) で返す。
-    UE5.7: SceneDepth を R32F へ撮ると全画素一定値になる不具合があるため RGBA16F を使う。"""
+    UE5.7: SceneDepth を R32F へ撮ると全画素一定値になる不具合があるため既定は
+    RGBA16F（⚠️ FP16 上限 65504cm≈655m で飽和する）。fmt=RTF_RGBA32F を渡すと
+    655m 超も測れる（4ch 32F は R32F バグの対象外か要実測）。"""
     rt = _make_render_target(world, w, h,
-                             unreal.TextureRenderTargetFormat.RTF_RGBA16F, True)
+                             fmt or unreal.TextureRenderTargetFormat.RTF_RGBA16F,
+                             True)
     actor = _spawn_capture(world, cam["transform"], cam["fov"], rt,
                            unreal.SceneCaptureSource.SCS_SCENE_DEPTH,
                            show_only_actors=show_only_actors, hidden_actors=hidden_actors)
     spawned.append(actor)
     return _read_rt_raw_r(world, rt, w, h)
+
+
+def measure_depth_range(camera_actor, w=384, h=216,
+                        lo_pct=0.5, hi_pct=99.5, pad=0.05):
+    """Depth 自動レンジ: SceneCapture 深度を低解像度で1枚撮り、可視ジオメトリの
+    最近/最遠距離 (cm) をロバスト百分位で推定する。空/ファープレーン(≥1e7)は除外。
+    pad は両端の余白率（クリップ防止）。値は2有効数字へ丸める（near切下げ/far切上げ）。
+    戻り値 (near_cm, far_cm)。有効画素が無ければ None。
+    ※ バウンズ走査でなく実描画ベース: 遮蔽・マスク材・巨大スカイ球・LevelInstance
+    列挙の罠を全て回避できる（現在のシーン状態＝現在フレームで測る）。"""
+    if not _HAS_NUMPY:
+        return None
+    world = _get_editor_world()
+    cam = get_camera_settings(camera_actor)
+    spawned = []
+    try:
+        # RGBA32F で FP16 の 655m 飽和を回避（R32F 単チャンネルのみのバグ）。
+        # 万一 32F が全画素一定（バグ該当）なら 16F に落として続行
+        d = _render_depth_r(world, cam, int(w), int(h), spawned,
+                            fmt=unreal.TextureRenderTargetFormat.RTF_RGBA32F)
+        if d is not None and float(_np.ptp(d)) < 1e-3:
+            _warn("Depth自動レンジ: RGBA32F が定数値（バグ該当）→ RGBA16F で再測定"
+                  "（655m 超は飽和）")
+            d = _render_depth_r(world, cam, int(w), int(h), spawned)
+    finally:
+        _destroy_actors(spawned)
+    if d is None:
+        return None
+    v = d[(d > 1.0) & (d < 1e7)]
+    if v.size < 64:
+        return None
+    near = float(_np.percentile(v, lo_pct)) * (1.0 - pad)
+    far = float(_np.percentile(v, hi_pct)) * (1.0 + pad)
+    if far <= near:
+        return None
+
+    def _round_sig(x, up):
+        if x <= 0:
+            return 0.0
+        import math
+        exp = math.floor(math.log10(x)) - 1
+        q = 10.0 ** exp
+        f = math.ceil if up else math.floor
+        return f(x / q) * q
+
+    near = max(_round_sig(near, up=False), 0.0)
+    far = _round_sig(far, up=True)
+    _log("Depth自動レンジ: near=%.0fcm far=%.0fcm (%.1fm〜%.1fm, 有効%.0f%%)"
+         % (near, far, near / 100.0, far / 100.0,
+            100.0 * v.size / d.size))
+    return near, far
 
 
 def _render_final_color(world, settings, cam, w, h, aa, spawned,

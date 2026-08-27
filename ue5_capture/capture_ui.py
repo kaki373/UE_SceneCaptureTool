@@ -305,6 +305,11 @@ class CaptureWindow(object):
         self.far_var = tk.StringVar(master=self.root, value="10000")
         tk.Entry(depth_frm, textvariable=self.far_var, width=7).pack(side="left", padx=2)
         ttk.Label(depth_frm, text="cm（1m=100cm）").pack(side="left")
+        # 自動: キャプチャ時に可視ジオメトリの最近/最遠を実測して Near/Far を決める
+        # （測った値は欄に書き戻す＝結果が見える。OFF なら欄の手動値）
+        self.depth_auto_var = tk.BooleanVar(master=self.root, value=False)
+        ttk.Checkbutton(depth_frm, text="自動",
+                        variable=self.depth_auto_var).pack(side="left", padx=(6, 0))
         depth_frm.grid(row=row, column=0, columnspan=3, sticky="w", padx=24)
         row += 1
 
@@ -518,6 +523,12 @@ class CaptureWindow(object):
                 self.seq_far_var = tk.StringVar(master=self.root, value="10000")
                 tk.Entry(depf, textvariable=self.seq_far_var, width=7).pack(side="left", padx=2)
                 ttk.Label(depf, text="cm（手前=白/奥=黒）").pack(side="left")
+                # 自動: 先頭/中間/終端フレームをサンプリングして全編を包む
+                # Near/Far を実測（測った値は欄へ書き戻し）
+                self.seq_depth_auto_var = tk.BooleanVar(master=self.root, value=False)
+                ttk.Checkbutton(depf, text="自動",
+                                variable=self.seq_depth_auto_var).pack(
+                    side="left", padx=(6, 0))
                 depf.grid(row=i + 1, column=3, sticky="w", padx=(12, 0))
             elif key == "normal":
                 nrmf = ttk.Frame(mtx)
@@ -728,6 +739,19 @@ class CaptureWindow(object):
             except Exception as e:
                 skip_notes.append("Matteの前: 一時マテリアル生成失敗でスキップ")
                 self.status_var.set("Matteの前: 一時マテリアル生成失敗: %s" % e)
+        if self.depth_var.get() and self.depth_auto_var.get():
+            # Depth 自動レンジ: 現在フレームの可視ジオメトリの最近/最遠を実測して
+            # Near/Far を決定（値は欄へ書き戻す。失敗時は欄の手動値のまま）
+            rng = None
+            try:
+                rng = core.measure_depth_range(self._current_camera())
+            except Exception as e:
+                unreal.log_warning("[SceneCapture] Depth自動レンジ失敗: %s" % e)
+            if rng:
+                self.near_var.set("%g" % rng[0])
+                self.far_var.set("%g" % rng[1])
+            else:
+                skip_notes.append("Depth自動レンジ: 測定失敗（手動値を使用）")
         depth_pp_mat = None
         if self.depth_var.get() and self.depth_bit_var.get() == "8bit PNG":
             # 8bit深度は Beauty と同一 MRQ ジョブの PP パスで撮る（WPO/風の位相一致）。
@@ -995,7 +1019,7 @@ class CaptureWindow(object):
                 if not r:
                     skip_notes.append("雲マット: H5合成失敗")
             # Normal / Depth の雲領域を黒に落とす（α のままの CloudMatte を乗算。
-            # 白黒変換前に行う）。乗算前の素材は _cloudsrc/ に退避して再合成可能に
+            # 白黒変換前に行う）
             cloud_applied = os.path.isfile(cm_png)
             if os.path.isfile(cm_png):
                 targets = []
@@ -1006,13 +1030,6 @@ class CaptureWindow(object):
                 for _lbl, _p in targets:
                     if not os.path.isfile(_p):
                         continue
-                    try:
-                        srcdir = os.path.join(out, "_cloudsrc")
-                        os.makedirs(srcdir, exist_ok=True)
-                        import shutil
-                        shutil.copy2(_p, os.path.join(srcdir, os.path.basename(_p)))
-                    except Exception:
-                        pass
                     try:
                         core.apply_cloud_black(_p, cm_png)
                     except Exception as e:
@@ -1049,25 +1066,36 @@ class CaptureWindow(object):
                         os.remove(p)
                     except Exception:
                         pass
-            # H5 の合成ソースは削除せず _cloudsrc/ へ退避（EXR+雲なしBeauty が
-            # 残っていれば、再レンダなしで濃度パラメータを変えて再合成できる）
+            # H5 の合成ソース: 完成品が出たら削除（ユーザー指定 2026-08-27）。
+            # 合成失敗時のみ診断・手動再合成用に _cloudsrc/ へ退避して残す
             if cloud_alpha_needed:
-                srcdir = os.path.join(out, "_cloudsrc")
-                try:
-                    os.makedirs(srcdir, exist_ok=True)
-                except Exception:
-                    pass
-                for _sf in (_name("CloudMatte") + ".exr",
-                            _name("CloudMatte") + "_GeoMask.exr",
-                            _name("CloudVeil") + ".exr",
-                            _name("CloudVeil0") + ".exr",
-                            _name("CloudBG") + ".png"):
-                    _p = os.path.join(out, _sf)
-                    if os.path.isfile(_p):
-                        try:
-                            os.replace(_p, os.path.join(srcdir, _sf))
-                        except Exception:
-                            pass
+                srcs = (_name("CloudMatte") + ".exr",
+                        _name("CloudMatte") + "_GeoMask.exr",
+                        _name("CloudVeil") + ".exr",
+                        _name("CloudVeil0") + ".exr",
+                        _name("CloudBG") + ".png")
+                if cloud_applied:
+                    for _sf in srcs:
+                        _p = os.path.join(out, _sf)
+                        if os.path.isfile(_p):
+                            try:
+                                os.remove(_p)
+                            except Exception:
+                                pass
+                else:
+                    srcdir = os.path.join(out, "_cloudsrc")
+                    try:
+                        os.makedirs(srcdir, exist_ok=True)
+                    except Exception:
+                        pass
+                    for _sf in srcs:
+                        _p = os.path.join(out, _sf)
+                        if os.path.isfile(_p):
+                            try:
+                                os.replace(_p, os.path.join(srcdir, _sf))
+                            except Exception:
+                                pass
+                    skip_notes.append("雲マット: 合成失敗のためソースを _cloudsrc に残置")
             # 雲抜き/マットは濃度設定依存のため、設定タグをファイル名へ付与
             # （例 ..._CloudMatte_019_H5d1.5.png。テイク番号検出 _(\d{3})(?=[._]) は
             # 後置サフィックスでも壊れない）
@@ -1545,6 +1573,38 @@ class CaptureWindow(object):
             pass
         self._save_ui_state()
 
+        if depth_needed and self.seq_depth_auto_var.get():
+            # Depth 自動レンジ: 先頭/中間/終端フレームをスクラブして実測し、
+            # 全編を包む Near/Far を決定（欄へ書き戻し・プレイヘッドは復元）
+            try:
+                t0 = int(unreal.LevelSequenceEditorBlueprintLibrary
+                         .get_current_time())
+            except Exception:
+                t0 = None
+            lo = hi = None
+            for f in sorted({cs_eff, (cs_eff + ce_eff - 1) // 2, ce_eff - 1}):
+                c = self._sequence_camera_at(seq, f)
+                if c is None:
+                    continue
+                rng = None
+                try:
+                    rng = core.measure_depth_range(c)
+                except Exception as e:
+                    unreal.log_warning(
+                        "[SceneCapture] Depth自動レンジ失敗 (F%d): %s" % (f, e))
+                if rng:
+                    lo = rng[0] if lo is None else min(lo, rng[0])
+                    hi = rng[1] if hi is None else max(hi, rng[1])
+            if t0 is not None:
+                try:
+                    unreal.LevelSequenceEditorBlueprintLibrary.set_current_time(t0)
+                except Exception:
+                    pass
+            if lo is not None and hi is not None and hi > lo:
+                self.seq_near_var.set("%g" % lo)
+                self.seq_far_var.set("%g" % hi)
+            else:
+                seq_notes.append("Depth自動レンジ: 測定失敗（手動値を使用）")
         depth_mat = matte_mat = matte_sil_mat = objid_mat = normal_mat = None
         hide_actors = None
         try:
@@ -2391,6 +2451,8 @@ class CaptureWindow(object):
                 "name_custom": self.name_custom_var.get(),
                 "name_usecam": self.name_usecam_var.get(),
                 "depth": self.depth_var.get(),
+                "depth_auto": self.depth_auto_var.get(),
+                "seq_depth_auto": self.seq_depth_auto_var.get(),
                 "normal": self.normal_var.get(),
                 "cloudmatte": self.cloudmatte_var.get(),
                 "skymatte": self.skymatte_var.get(),
@@ -2504,6 +2566,8 @@ class CaptureWindow(object):
         if st.get("depth_bit") in ("8bit PNG", "16bit PNG", "EXR float"):
             self.depth_bit_var.set(st["depth_bit"])
         _setvar(self.near_var, "near"); _setvar(self.far_var, "far")
+        _setvar(self.depth_auto_var, "depth_auto")
+        _setvar(self.seq_depth_auto_var, "seq_depth_auto")
         if st.get("normal_space") in ("カメラ", "ワールド"):
             self.normal_space_var.set(st["normal_space"])
         if st.get("seq_normal_space") in ("カメラ", "ワールド"):
