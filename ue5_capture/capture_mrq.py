@@ -19,7 +19,8 @@ SceneCapture2D では CineCamera の物理露出やシーケンサ相当の品�
 import os
 import unreal
 
-from capture_core import MATTE_STENCIL
+from capture_core import (MATTE_STENCIL, _HV_COMP_CLASS, _is_hv_comp,
+                          is_volumetric_actor)
 
 _TAG = "[SceneCapture/MRQ] "
 def _log(m): unreal.log(_TAG + str(m))
@@ -214,8 +215,21 @@ def render_beauty(camera_actor, output_dir, width, height,
                   near_clip_cm=None, overscan=0.0, fog_off=False,
                   scene_sequence=None, scene_frame=None,
                   matte_material=None, matte_actors=None, depth_material=None,
-                  light_pass=False, light_direct=False):
+                  normal_material=None,
+                  light_pass=False, light_direct=False,
+                  cloud_matte_actors=None, cloud_visible=False,
+                  cloud_backing=None, cloud_sources_off=False,
+                  geomask_material=None,
+                  backing_actors=None, backing_white=False, sky_matte=False,
+                  pp_materials_off=False):
     """対象カメラを MRQ で Beauty レンダリング（非同期）。executor を返す。
+    cloud_visible=True（要 cloud_matte_actors）は可視雲モード: 何も隠さず PIE 側で
+    全ジオメトリを白発光材へ差し替え、EXR の RGB=W(=T×素板レベル)・α=全投影雲αを
+    1ジョブで出す（geomask_material を渡すと GeoMask PP パスも同乗）。
+    後段の core.compose_visible_cloud で深度順序どおりの可視雲αに合成する。
+    cloud_matte_actors を渡すと CloudMatte ジョブになる: 対象 HV ボリューム(雲)を
+    holdout・他プリミティブも holdout・大気/フォグ OFF で、PNG のαに可視雲
+    不透明度が入る（RGB はほぼ黒＝マット専用）。要 cloud_matte_ready()。
     light_pass=True で LightingOnly レンダパス（アルベド無視のライティングのみ＝
     落ち影+シェーディング）を同一ジョブに追加する（出力: file_basename_LightingOnly.*）。
     light_direct=True はこのジョブ全体の GI/スカイライト/AO を ShowFlag cvar で切り、
@@ -227,7 +241,9 @@ def render_beauty(camera_actor, output_dir, width, height,
     matte_material / matte_actors を渡すと、対象をマットレンダモード（Beauty 非表示 +
     CustomDepth ステンシル）にして同一ジョブの追加 PP パスで Matte マスクも出力する
     （出力: file_basename_Matte.png）。depth_material を渡すと正規化深度も同一ジョブの
-    PP パスで出力する（出力: file_basename_Depth.png）。SceneCapture 別撮りだと
+    PP パスで出力する（出力: file_basename_Depth.png）。normal_material も同様に
+    同一ジョブの PP パスでワールド法線を出力する（出力: file_basename_Normal.png）。
+    SceneCapture 別撮りだと
     WPO/風で揺れる前景のシルエット位相が Beauty とズレるため、同一ジョブで撮って
     画素整合を保証する。
     出力は output_dir 直下に file_basename.png (or .exr)。完了時 on_done(success, out_dir) を呼ぶ。"""
@@ -256,6 +272,34 @@ def render_beauty(camera_actor, output_dir, width, height,
     saved_matte = None
     if matte_material is not None:
         saved_matte = _set_matte_render_mode(matte_actors)
+    saved_cloud = None
+    saved_vis = None
+    if cloud_matte_actors and cloud_visible:
+        # 可視雲モード: 何も隠さず PIE 側でバッキング材化（深度順序が保たれる）。
+        # cloud_backing: "white"=透過率T測定(白発光100+微弱fill) /
+        # "black"=素照明ベール輝度測定(純黒+fillなし) /
+        # None=従来の黒+20lux（映像タブの単一ジョブ方式）
+        white = (cloud_backing == "white")
+        fills = (5.0 if cloud_backing == "white"
+                 else 0.0 if cloud_backing == "black" else 20.0)
+        saved_vis = {"pie": _start_pie_backing_white(cloud_matte_actors,
+                                                     white=white),
+                     "fills": _spawn_cloud_fill_lights(fills)}
+        if cloud_sources_off:
+            # 雲なしベール（VeilNone）: UDS の雲内フォグ板も PIE 側で隠す
+            # （HV は hidden_actors・雲レイヤーは ShowFlag.Cloud 0 が受け持つ）
+            saved_vis["plane_hider"] = _start_pie_udsplane_hider()
+    elif cloud_matte_actors:
+        # UE5.7 は holdout 方式のα出力が実質壊れている（cvarペア有効でも最大2/255・
+        # 2026-07-24実測）ため分離モード固定。エンジン修正後に
+        # use_holdout=cloud_matte_holdout_ready() へ戻す。
+        saved_cloud = _set_cloud_matte_mode(cloud_matte_actors, use_holdout=False)
+    saved_backing = None
+    if backing_actors:
+        saved_backing = _set_backing_materials(backing_actors, backing_white)
+    saved_sky = None
+    if sky_matte:
+        saved_sky = _set_sky_matte_mode(camera_actor)
     saved_players = _suppress_autoplay_players()
     saved_cam = [c for c in (_fill_aspect_comp(camera_actor, width, height),)
                  if c is not None]
@@ -270,6 +314,14 @@ def render_beauty(camera_actor, output_dir, width, height,
                 pass
         if saved_matte:
             _restore_matte_render_mode(saved_matte)
+        if saved_cloud:
+            _restore_cloud_matte_mode(saved_cloud)
+        if saved_vis:
+            _restore_visible_cloud_mode(saved_vis)
+        if saved_backing:
+            _restore_backing_materials(saved_backing)
+        if saved_sky:
+            _restore_sky_matte_mode(saved_sky)
         _restore_autoplay_players(saved_players)
         _restore_cameras_aspect(saved_cam)
 
@@ -279,11 +331,24 @@ def render_beauty(camera_actor, output_dir, width, height,
                              spatial_samples, temporal_samples, warmup,
                              file_basename, on_done, near_clip_cm, overscan,
                              fog_off, _restore_scene, scene_sequence, scene_frame,
-                             matte_material, depth_material,
-                             light_pass, light_direct)
+                             matte_material, depth_material, normal_material,
+                             light_pass, light_direct,
+                             cloud_matte=bool(cloud_matte_actors),
+                             cloud_visible=cloud_visible,
+                             cloud_sources_off=cloud_sources_off,
+                             geomask_material=geomask_material,
+                             backing=bool(backing_actors), sky_matte=sky_matte,
+                             pp_materials_off=pp_materials_off)
     except Exception:
         # 起動に失敗したら状態を巻き戻す（次回レンダを塞がない）
         _restore_scene()
+        if near_clip_cm is not None:
+            # 起動前にグローバル適用済みの near clip を戻す
+            try:
+                unreal.SystemLibrary.execute_console_command(
+                    _editor_world(), "r.SetNearClipPlane 10")
+            except Exception:
+                pass
         _delete_temp_sequence()
         _KEEP.clear()
         raise
@@ -294,8 +359,11 @@ def _start_render(sub, camera_actor, output_dir, width, height,
                   spatial_samples, temporal_samples, warmup,
                   file_basename, on_done, near_clip_cm, overscan,
                   fog_off, restore_scene, scene_sequence=None, scene_frame=None,
-                  matte_material=None, depth_material=None,
-                  light_pass=False, light_direct=False):
+                  matte_material=None, depth_material=None, normal_material=None,
+                  light_pass=False, light_direct=False, cloud_matte=False,
+                  cloud_visible=False, cloud_sources_off=False,
+                  geomask_material=None,
+                  backing=False, sky_matte=False, pp_materials_off=False):
     seq, seq_path = _create_temp_sequence(camera_actor,
                                           scene_sequence=scene_sequence,
                                           scene_frame=scene_frame)
@@ -310,7 +378,9 @@ def _start_render(sub, camera_actor, output_dir, width, height,
 
     cfg = job.get_configuration()
     extra_passes = []
-    for pass_name, pass_mat in (("Matte", matte_material), ("Depth", depth_material)):
+    for pass_name, pass_mat in (("Matte", matte_material), ("Depth", depth_material),
+                                ("Normal", normal_material),
+                                ("GeoMask", geomask_material)):
         if pass_mat is None:
             continue
         ppp = unreal.MoviePipelinePostProcessPass()
@@ -325,6 +395,9 @@ def _start_render(sub, camera_actor, output_dir, width, height,
         deferred = cfg.find_or_add_setting_by_class(unreal.MoviePipelineDeferredPassBase)
         if extra_passes:
             deferred.set_editor_property("additional_post_process_materials", extra_passes)
+        if cloud_matte:
+            # タイル蓄積にαを含める（これが無いと最終画像のαが 1 固定になる）
+            deferred.set_editor_property("accumulator_includes_alpha", True)
     if light_pass:
         # LightingOnly は独立したレンダパス（追加 PP 材とは別系統）。
         # 出力は <basename>_LightingOnly.* になる（{render_pass} 命名が必須になる）。
@@ -334,8 +407,8 @@ def _start_render(sub, camera_actor, output_dir, width, height,
     fmt = (image_format or ("exr" if use_exr else "png")).lower()
     if fmt == "exr":
         exr_out = cfg.find_or_add_setting_by_class(unreal.MoviePipelineImageSequenceOutput_EXR)
-        if light_pass:
-            # マルチレイヤ EXR だと LightingOnly が別ファイルにならないため分割する
+        if light_pass or cloud_visible:
+            # マルチレイヤ EXR だと LightingOnly/追加PPパスが別ファイルにならないため分割
             exr_out.set_editor_property("multilayer", False)
         if also_png:
             png_fmt = cfg.find_or_add_setting_by_class(unreal.MoviePipelineImageSequenceOutput_PNG)
@@ -351,7 +424,7 @@ def _start_render(sub, camera_actor, output_dir, width, height,
     else:
         out_fmt = cfg.find_or_add_setting_by_class(unreal.MoviePipelineImageSequenceOutput_PNG)
         try:
-            out_fmt.set_editor_property("write_alpha", False)
+            out_fmt.set_editor_property("write_alpha", bool(cloud_matte))
         except Exception:
             pass
 
@@ -414,6 +487,58 @@ def _start_render(sub, camera_actor, output_dir, width, height,
         # 直射のみ: LightingOnly が「直接光の落ち影+シェーディングのみ・影は完全な黒」になる。
         pairs += list(_DIRECT_ONLY_CVARS)
         _log("direct lighting only (GI/Sky/AO off)")
+    if cloud_matte:
+        # α伝播（MRQ 既定でも ON になるが明示）+ αを埋める大気/フォグを OFF。
+        # ⚠️ ShowFlag.Cloud 0 は VolumetricCloud だけでなく HV(VDB雲)も消す（実測）
+        # ため使用禁止。
+        # ⚠️ UDS の雲レイヤー（VolumetricCloud=大気雲）は α マットに乗せられない:
+        # Atmosphere ON だと大気自体が全画素 α=1 で埋め、SkyAtmosphere の holdout +
+        # SupportPrimitiveAlphaHoldout も UE5.7 では無効（全て 2026-08-26 実測）。
+        # マスク対象は HV(VDB) 雲のみ。
+        pairs += [("r.PostProcessing.PropagateAlpha", 1),
+                  ("ShowFlag.Fog", 0), ("ShowFlag.VolumetricFog", 0)]
+        if cloud_visible:
+            # 可視雲(H5)系は大気・雲レイヤーを生かす（UDS 雲レイヤー/フォグ板の雲も
+            # ベール/透過に写す。空・大気ヘイズは VeilNone との差分で相殺）。
+            # VeilNone は ShowFlag.Cloud 0 でレイヤーだけ消す（HV は hidden_actors、
+            # フォグ板は PIE ウォッチャが受け持つ）。
+            if cloud_sources_off:
+                pairs.append(("ShowFlag.Cloud", 0))
+            _log("cloud matte (visible / atmosphere on / fog off%s)"
+                 % (" / cloud-layer off" if cloud_sources_off else ""))
+        else:
+            pairs.append(("ShowFlag.Atmosphere", 0))
+            _log("cloud matte (alpha / atmosphere+fog off)")
+    if sky_matte:
+        # 空マット: PPマテリアル(スタイライズ等)とブルームを切る。大気・雲は
+        # ShowFlag で明示的に ON（環境光と雲の維持。ue-sky-matte-capture 実証）
+        pairs += [("ShowFlag.PostProcessMaterial", 0), ("r.BloomQuality", 0),
+                  ("ShowFlag.Atmosphere", 1), ("ShowFlag.Cloud", 1)]
+        _log("sky matte (PPマテリアルOFF / ブルームOFF / 大気・雲ON)")
+    if pp_materials_off and not sky_matte:
+        # レベルのスタイライズPPマテリアル(桑原フィルタ等)を切る。MRQ の追加
+        # PP パス(Normal/Depth 等)は AdditionalPostProcessMaterials 経由なので
+        # この ShowFlag の影響を受けない（AV024 実測 2026-08-27）
+        pairs.append(("ShowFlag.PostProcessMaterial", 0))
+        _log("PPマテリアル OFF")
+    if backing or cloud_visible:
+        # 露出適応は白板に反応して画面全体を沈める（-18%実測）ため、適応と
+        # ローカル露出をジョブ内で無効化。白板は発光100なのでブルームと
+        # Lumen スクリーントレースの撒き散らしも切る（×100で無視できなくなる）。
+        pairs += [("r.EyeAdaptationQuality", 0),
+                  ("r.LocalExposure.HighlightContrastScale", 1.0),
+                  ("r.LocalExposure.ShadowContrastScale", 1.0),
+                  ("r.BloomQuality", 0),
+                  ("r.Lumen.ScreenProbeGather.ScreenTraces", 0),
+                  ("r.Lumen.Reflections.ScreenTraces", 0)]
+        # 既定の EXR はトーンカーブ適用済み（発光100が~1.0に圧縮される実測）。
+        # T=W/素板レベル の線形性が前提なのでトーンカーブを切ってシーンリニアで書く。
+        try:
+            col = cfg.find_or_add_setting_by_class(unreal.MoviePipelineColorSetting)
+            col.set_editor_property("disable_tone_curve", True)
+        except Exception as e:
+            _warn("backing: トーンカーブ無効化に失敗（Tが非線形になる）: %s" % e)
+        _log("backing render (exposure locked / bloom+screen traces off / linear)")
     cv = cfg.find_or_add_setting_by_class(unreal.MoviePipelineConsoleVariableSetting)
     cv.set_editor_property("cvars", _cv_entries(pairs))   # レンダ後にエンジンが自動復元
     cmds = []
@@ -422,6 +547,11 @@ def _start_render(sub, camera_actor, output_dir, width, height,
         # r.SetNearClipPlane は cvar でなくコマンド＝自動復元されない（完了時に手動復元）。
         cmds.append("r.SetNearClipPlane %f" % float(near_clip_cm))
         _log("near clip = %.1f cm" % float(near_clip_cm))
+        # start_console_commands だけだとウォームアップ/最初のサブフレームに間に合わず、
+        # クリップ有り/無しが平均されて手前オブジェクトが半透明ゴースト化する（実測）。
+        # レンダ起動前にグローバルへも適用しておく（_on_finished が既定 10cm へ復元）。
+        unreal.SystemLibrary.execute_console_command(
+            _editor_world(), "r.SetNearClipPlane %f" % float(near_clip_cm))
     cv.set_editor_property("start_console_commands", cmds)
 
     executor = unreal.MoviePipelinePIEExecutor()
@@ -438,6 +568,8 @@ def _start_render(sub, camera_actor, output_dir, width, height,
                         continue
                     nf = (f.replace("_FinalImageMatte", "_Matte")
                            .replace("_FinalImageDepth", "_Depth")
+                           .replace("_FinalImageNormal", "_Normal")
+                           .replace("_FinalImageGeoMask", "_GeoMask")
                            .replace("_FinalImage", ""))
                     os.replace(os.path.join(output_dir, f), os.path.join(output_dir, nf))
             except Exception as e:
@@ -480,6 +612,8 @@ def _set_matte_render_mode(actors):
         if a is None:
             continue
         for comp in a.get_components_by_class(unreal.PrimitiveComponent):
+            if _is_hv_comp(comp):
+                continue   # HV(雲)は CustomDepth に写らない: cloud_matte 側で扱う
             try:
                 saved.append((comp,
                               comp.get_editor_property("render_in_main_pass"),
@@ -512,6 +646,504 @@ def _restore_matte_render_mode(saved):
             comp.set_editor_property("affect_dynamic_indirect_lighting", dil)
         except Exception as e:
             _warn("Matte レンダモード復元に失敗: %s" % e)
+
+
+def cloud_matte_holdout_ready():
+    """ホールドアウト方式（遮蔽考慮の雲マット）が使えるか。
+    r.Deferred.SupportPrimitiveAlphaHoldout は読み取り専用 cvar（ini・要再起動）。
+    ⚠️ UE5.7 では有効化するとエディタビューポートの HV 描画で
+    RWHoldoutTexture 未束縛の Fatal クラッシュ（エンジンバグ・2026-07-24 実測）。
+    通常は無効のままで、CloudMatte は分離モード（遮蔽なし）で撮る。"""
+    try:
+        return unreal.SystemLibrary.get_console_variable_int_value(
+            "r.Deferred.SupportPrimitiveAlphaHoldout") != 0
+    except Exception:
+        return False
+
+
+def _set_cloud_matte_mode(vol_targets, use_holdout=False):
+    """CloudMatte ジョブ用のシーン状態。
+    use_holdout=True（要 cloud_matte_holdout_ready・UE5.7 ではエンジンバグで通常不可）:
+      - 対象ボリューム: holdout=True（合成シェーダでαに可視不透明度が加算される）
+      - 対象外のボリューム: 非表示 / その他の全プリミティブ: holdout（遮蔽のみ）
+    use_holdout=False（分離モード・既定）:
+      - 対象以外のアクターを**アクター単位で**隠す。ただし**ライトコンポーネントを
+        持つアクター（UDS/UDW/各ライト）は隠さない** — HV は無照明だとαも出ず全黒
+        （2026-07-24実測）。ライト持ちの見た目（大気/フォグ）は ShowFlag 側で消す。
+      - ⚠️ 他アクターの SCS コンポーネント単位で hidden_in_game/visible を編集する
+        方式は不可（BP再構築の副作用で HV が全黒になる・実測）。ShowFlag.Cloud も
+        HV ごと消すため不可。αは遮蔽を考慮しない全投影の雲不透明度になる。
+    返り値: (holdout解除リスト, アクター再表示リスト, コンポーネント再表示リスト)。"""
+    targets = set(a.get_name() for a in vol_targets or [])
+    holdout_comps, hidden_actors, hidden_comps = [], [], []
+    actors = unreal.get_editor_subsystem(
+        unreal.EditorActorSubsystem).get_all_level_actors()
+    for a in actors:
+        if a.get_name() in targets:
+            if use_holdout and _HV_COMP_CLASS is not None:
+                for c in a.get_components_by_class(_HV_COMP_CLASS):
+                    try:
+                        if not c.get_editor_property("holdout"):
+                            c.set_editor_property("holdout", True)
+                            holdout_comps.append(c)
+                    except Exception:
+                        pass
+            continue
+        if not use_holdout:
+            try:
+                # 太陽/スカイライト持ちだけ残す（隠すと HV が無照明でα全黒・2026-07-24実測）。
+                # ローカルライト（Point/Spot/Rect）しか持たないアクターは隠す — 雲の照明は
+                # 太陽/スカイ支配で、残すと不透明ジオメトリがα=1でマスクを汚す
+                # （AV024 でライト内蔵の街BPが雲マットに白く混入した実測 2026-08-25）。
+                lights = a.get_components_by_class(unreal.LightComponentBase)
+                if lights and any(isinstance(c, (unreal.DirectionalLightComponent,
+                                                 unreal.SkyLightComponent))
+                                  for c in lights):
+                    continue
+                if not a.get_editor_property("hidden"):
+                    a.set_actor_hidden_in_game(True)
+                    hidden_actors.append(a)
+            except Exception:
+                pass
+            continue
+        if is_volumetric_actor(a):
+            try:
+                if not a.get_editor_property("hidden"):
+                    a.set_actor_hidden_in_game(True)
+                    hidden_actors.append(a)
+            except Exception:
+                pass
+            continue
+        for c in a.get_components_by_class(unreal.PrimitiveComponent):
+            try:
+                if not c.get_editor_property("holdout"):
+                    c.set_editor_property("holdout", True)
+                    holdout_comps.append(c)
+            except Exception:
+                pass
+    _log("CloudMatte(%s): holdout %d comps / 非表示 %d actors / %d comps"
+         % ("holdout" if use_holdout else "分離", len(holdout_comps),
+            len(hidden_actors), len(hidden_comps)))
+    pie_state = None
+    fill_lights = []
+    if not use_holdout:
+        pie_state = _start_pie_cloud_hider(vol_targets)
+        fill_lights = _spawn_cloud_fill_lights()
+    return holdout_comps, hidden_actors, hidden_comps, pie_state, fill_lights
+
+
+def _spawn_cloud_fill_lights(intensity=20.0):
+    """CloudMatte 分離レンダ用の無影フィルライトを一時スポーンする。
+    HV(VDB雲) の α は照明依存（無照明で α0・照明の弱い遠景雲が α から消える実測）
+    なので、シーン照明に依らず全方位からフラットに照らして α を安定させる。
+    RGB は捨てるので過露光は問題ない（可視雲モードでは W=T×素板 の誤差 ≈
+    雲散乱/素板レベルになるため低強度を渡す）。返り値: レンダ後に破棄するリスト。"""
+    eas = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    out = []
+    for i, (pitch, yaw) in enumerate(((-90.0, 0.0), (30.0, 45.0), (30.0, 225.0))):
+        try:
+            a = eas.spawn_actor_from_class(
+                unreal.DirectionalLight, unreal.Vector(0.0, 0.0, 200000.0),
+                unreal.Rotator(roll=0.0, pitch=pitch, yaw=yaw))
+            a.set_actor_label("UE5Cap_CloudFill_%d" % i)
+            lc = a.get_editor_property("light_component")
+            lc.set_editor_property("intensity", float(intensity))
+            lc.set_editor_property("cast_shadows", False)
+            lc.set_editor_property("atmosphere_sun_light", False)
+            out.append(a)
+        except Exception as e:
+            _warn("CloudMatte: フィルライト生成に失敗: %s" % e)
+    if out:
+        _log("CloudMatte: 無影フィルライト %d 灯を一時スポーン (%.1f lux)"
+             % (len(out), intensity))
+    return out
+
+
+def _start_pie_backing_white(vol_targets, white=False):
+    """可視雲マット用: PIE ワールド側で全メッシュ材を黒アンリット材へ差し替える
+    ウォッチャ。何も隠さないので深度順序が保たれ、黒背景に浮かぶ雲の散乱輝度 L が
+    「見えている雲量（知覚的カバレッジ）」を画素毎に与える（白バッキングの 1−T は
+    物理透過率で Beauty の見た目より薄くなる実測 2026-08-26 → 黒方式へ変更）。
+    LevelInstance 内包・スポーナブルにも効かせるため PIE 側で毎 tick 冪等に行う
+    （PIE は破棄されるので復元不要）。
+    ⚠️ 差し替えるのは「元々不透明深度を書くスロット」だけ。半透明系スロットは
+    不可視マテ(BackingClear)へ、非表示コンポーネントは触らない — 一律差し替えは
+    UDS の雲内フォグ板（半透明・深度なし）を雲高度の不透明面に変えてしまい、
+    その奥の HV(VDB雲) が深度テストで全滅する（中距離雲のマット落ち実測
+    2026-08-26）。"""
+    from capture_core import (get_or_create_backing_white_material,
+                              get_or_create_matteboard_material,
+                              get_or_create_backing_clear_material,
+                              material_writes_depth, _is_hv_comp)
+    mat = (get_or_create_backing_white_material() if white
+           else get_or_create_matteboard_material())
+    clear_mat = get_or_create_backing_clear_material()
+    tnames = set()
+    for a in vol_targets or []:
+        try:
+            tnames.add(a.get_name())
+            tnames.add(a.get_actor_label())
+        except Exception:
+            pass
+    state = {"h": None, "done": set(), "logged": False}
+
+    def _stop():
+        h = state.pop("h", None)
+        if h is not None:
+            try:
+                unreal.unregister_slate_post_tick_callback(h)
+            except Exception:
+                pass
+
+    def _tick(dt):
+        pie = None
+        try:
+            pie = unreal.get_editor_subsystem(
+                unreal.UnrealEditorSubsystem).get_game_world()
+        except Exception:
+            try:
+                pie = unreal.EditorLevelLibrary.get_game_world()
+            except Exception:
+                pie = None
+        if pie is None:
+            if state["logged"]:
+                _stop()
+            return
+        n = 0
+        try:
+            for a in unreal.GameplayStatics.get_all_actors_of_class(pie, unreal.Actor):
+                try:
+                    key = a.get_path_name()
+                    if key in state["done"]:
+                        continue
+                    if a.get_name() in tnames or a.get_actor_label() in tnames:
+                        continue
+                    if isinstance(a, unreal.CameraActor):
+                        continue
+                    comps = a.get_components_by_class(unreal.MeshComponent)
+                    if not comps:
+                        continue
+                    for comp in comps:
+                        if _is_hv_comp(comp):
+                            continue      # 雲(HV)は差し替え不可・対象そのもの
+                        try:
+                            # 描画されないコンポーネントには触らない（BPの隠し
+                            # ヘルパー等。set_material は BP 側の再表示ロジックと
+                            # 干渉し得る）
+                            if (not comp.is_visible()
+                                    or comp.get_editor_property("hidden_in_game")):
+                                continue
+                            for i in range(comp.get_num_materials()):
+                                cur = comp.get_material(i)
+                                if cur is not None and not material_writes_depth(cur):
+                                    continue   # 半透明系は元のまま（深度も見た目もBeautyと同じ挙動）
+                                comp.set_material(i, mat)
+                        except Exception:
+                            pass
+                    state["done"].add(key)
+                    n += 1
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        if not state["logged"]:
+            state["logged"] = True
+            _log("可視雲: PIE 側で %d アクターを%sバッキング材へ差替"
+                 % (n, "白" if white else "黒"))
+
+    state["h"] = unreal.register_slate_post_tick_callback(_tick)
+    state["stop"] = _stop
+    return state
+
+
+def _start_pie_udsplane_hider():
+    """VeilNone（雲なしベール）用: UDS の雲内フォグ板（Inside_Clouds 材の
+    StaticMeshComponent。実体は雲高度に張られた世界横断の巨大板で、通常は
+    半透明・深度なし）を PIE 側で set_visibility(False) するウォッチャ。
+    HV でも VolumetricCloud でもない第3の雲ソースで、これを消し忘れると
+    ベール差分 VeilAll−VeilNone に板の雲が残らず層雲がマット落ちする
+    （AV024 中距離雲の取りこぼし実測 2026-08-26）。PIE は破棄されるので復元不要。"""
+    state = {"h": None, "done": set()}
+
+    def _stop():
+        h = state.pop("h", None)
+        if h is not None:
+            try:
+                unreal.unregister_slate_post_tick_callback(h)
+            except Exception:
+                pass
+
+    def _tick(dt):
+        try:
+            pie = unreal.get_editor_subsystem(
+                unreal.UnrealEditorSubsystem).get_game_world()
+        except Exception:
+            pie = None
+        if pie is None:
+            return
+        try:
+            for a in unreal.GameplayStatics.get_all_actors_of_class(pie, unreal.Actor):
+                if "Ultra_Dynamic_Sky" not in a.get_class().get_name():
+                    continue
+                for c in a.get_components_by_class(unreal.StaticMeshComponent):
+                    key = c.get_path_name()
+                    if key in state["done"]:
+                        continue
+                    try:
+                        mats = [c.get_material(i).get_name()
+                                for i in range(c.get_num_materials())
+                                if c.get_material(i)]
+                    except Exception:
+                        mats = []
+                    if any("Inside_Clouds" in n for n in mats):
+                        try:
+                            c.set_visibility(False, True)
+                            state["done"].add(key)
+                            _log("VeilNone: UDS 雲内フォグ板を PIE 側で非表示")
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+    state["h"] = unreal.register_slate_post_tick_callback(_tick)
+    state["stop"] = _stop
+    return state
+
+
+def _start_pie_cloud_hider(vol_targets):
+    """PIE ワールド側で雲以外の描画アクターを隠すウォッチャを開始する。
+    LevelInstance 内包アクターは PIE で資産から再生成されるため、エディタ側の
+    hidden が伝搬しない（AV024 の街 LevelInstance の StaticMeshActor 184台が
+    隠れずαを汚した実測 2026-08-25）。Sequencer スポーナブルも同様。
+    PIE 出現を slate tick で待ち、毎 tick 冪等に隠す（ストリーミングの遅延流入や
+    スポーナブルも拾う）。PIE は終了時に破棄されるので復元不要。"""
+    tnames = set()
+    for a in vol_targets or []:
+        try:
+            tnames.add(a.get_name())
+            tnames.add(a.get_actor_label())
+        except Exception:
+            pass
+    state = {"h": None, "n": 0, "logged": False}
+
+    def _stop():
+        h = state.pop("h", None)
+        if h is not None:
+            try:
+                unreal.unregister_slate_post_tick_callback(h)
+            except Exception:
+                pass
+
+    def _tick(dt):
+        pie = None
+        try:
+            pie = unreal.get_editor_subsystem(
+                unreal.UnrealEditorSubsystem).get_game_world()
+        except Exception:
+            try:
+                pie = unreal.EditorLevelLibrary.get_game_world()
+            except Exception:
+                pie = None
+        if pie is None:
+            if state["logged"]:
+                _stop()        # PIE が終わった → 監視終了
+            return
+        n = 0
+        try:
+            for a in unreal.GameplayStatics.get_all_actors_of_class(pie, unreal.Actor):
+                try:
+                    if a.get_name() in tnames or a.get_actor_label() in tnames:
+                        continue
+                    if isinstance(a, unreal.CameraActor):
+                        continue      # レンダ視点（スポーナブルカメラ含む）は触らない
+                    if not a.get_components_by_class(unreal.PrimitiveComponent):
+                        continue
+                    if a.get_editor_property("hidden"):
+                        continue      # エディタ側で隠した分の複製・処理済み分
+                    lights = a.get_components_by_class(unreal.LightComponentBase)
+                    if lights and any(isinstance(c, (unreal.DirectionalLightComponent,
+                                                     unreal.SkyLightComponent))
+                                      for c in lights):
+                        continue      # 太陽/スカイライト持ちは残す（雲の照明）
+                    a.set_actor_hidden_in_game(True)
+                    n += 1
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        state["n"] += n
+        if not state["logged"]:
+            state["logged"] = True
+            _log("CloudMatte: PIE 側で %d アクターを追加で隠しました" % n)
+
+    state["h"] = unreal.register_slate_post_tick_callback(_tick)
+    state["stop"] = _stop
+    return state
+
+
+def _set_sky_matte_mode(camera_actor):
+    """空マット: UDS の Sky_Sphere を非表示にし、カメラ中心に黒スカイドーム
+    （Unlit黒・is_sky=True＝空気遠近を受けない・寄与フラグ全OFF）をスポーンする。
+    大気/雲の ShowFlag は ON のまま＝環境光と雲は維持（ue-sky-matte-capture 実証:
+    ShowFlag.Atmosphere 0 で消すと雲が消え環境光も -25% 落ちる）。
+    UDS コンポーネントに効くのは BlueprintCallable の set_visibility /
+    set_hidden_in_game のみ（set_editor_property は BP 再構築で無効化）。"""
+    from capture_core import get_or_create_sky_black_material
+    eas = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    pairs = []
+    for actor in eas.get_all_level_actors():
+        if actor.get_class().get_name() != "Ultra_Dynamic_Sky_C":
+            continue
+        for comp in actor.get_components_by_class(unreal.StaticMeshComponent):
+            if comp.get_name() == "Sky_Sphere":
+                pairs.append((actor, comp))
+    if not pairs:
+        raise RuntimeError("空マット: UDS の Sky_Sphere が見つかりません")
+    _o, ext, _r = unreal.SystemLibrary.get_component_bounds(pairs[0][1])
+    radius = max(ext.x, ext.y, ext.z) * 0.9
+    mat = get_or_create_sky_black_material()
+    saved = []
+    for actor, comp in pairs:
+        saved.append((comp, comp.get_editor_property("visible"),
+                      comp.get_editor_property("hidden_in_game")))
+        comp.set_visibility(False, False)
+        comp.set_hidden_in_game(True, False)
+    mesh = unreal.EditorAssetLibrary.load_asset("/Engine/BasicShapes/Sphere.Sphere")
+    dome = eas.spawn_actor_from_class(
+        unreal.StaticMeshActor, camera_actor.get_actor_location(),
+        unreal.Rotator(0.0, 0.0, 0.0))
+    dome.set_actor_label("UE5Cap_SkyDome_TMP")
+    s = radius / 50.0                       # BasicShapes/Sphere は半径 50cm
+    dome.set_actor_scale3d(unreal.Vector(s, s, s))
+    comp = dome.static_mesh_component
+    comp.set_static_mesh(mesh)
+    comp.set_material(0, mat)
+    for prop, val in (("cast_shadow", False),
+                      ("affect_dynamic_indirect_lighting", False),
+                      ("affect_distance_field_lighting", False),
+                      ("visible_in_ray_tracing", False),
+                      ("visible_in_real_time_sky_captures", False),
+                      ("visible_in_reflection_captures", False)):
+        try:
+            comp.set_editor_property(prop, val)
+        except Exception:
+            pass
+    # bIsSky メッシュ + リアルタイムスカイライトの黄色い画面警告がレンダに
+    # 焼き込まれる（実測）ため、レンダ中は画面メッセージを止める（復元付き）
+    try:
+        unreal.SystemLibrary.execute_console_command(
+            _editor_world(), "DisableAllScreenMessages")
+    except Exception:
+        pass
+    _log("空マット構成: Sky_Sphere %d個非表示 + 黒ドーム(半径 %.0fm)"
+         % (len(saved), radius / 100.0))
+    return {"vis": saved, "dome": dome}
+
+
+def _restore_sky_matte_mode(saved):
+    from capture_core import delete_temp_sky_black_material
+    eas = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    try:
+        eas.destroy_actor(saved["dome"])
+    except Exception as e:
+        _warn("空マット: ドーム削除失敗: %s" % e)
+    for comp, pv, ph in saved.get("vis") or []:
+        try:
+            comp.set_visibility(pv, False)
+            comp.set_hidden_in_game(ph, False)
+        except Exception:
+            pass
+    try:
+        unreal.SystemLibrary.execute_console_command(
+            _editor_world(), "EnableAllScreenMessages")
+    except Exception:
+        pass
+    delete_temp_sky_black_material()
+    _log("空マット構成を復元")
+
+
+def _restore_visible_cloud_mode(saved):
+    """可視雲モードの後始末: PIE 白差替ウォッチャ停止 + フィルライト破棄。
+    PIE ワールド側の材差替は PIE 破棄で消えるので復元不要。"""
+    for key in ("pie", "plane_hider"):
+        pie_state = (saved or {}).get(key)
+        if pie_state and pie_state.get("stop"):
+            try:
+                pie_state["stop"]()
+            except Exception:
+                pass
+    eas = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    for a in (saved or {}).get("fills") or []:
+        try:
+            eas.destroy_actor(a)
+        except Exception:
+            pass
+
+
+def _restore_cloud_matte_mode(saved):
+    saved = tuple(saved or ([], [], []))
+    if len(saved) == 3:               # 旧形式互換
+        saved += (None,)
+    if len(saved) == 4:
+        saved += ([],)
+    holdout_comps, hidden_actors, hidden_comps, pie_state, fill_lights = saved
+    if pie_state and pie_state.get("stop"):
+        try:
+            pie_state["stop"]()
+        except Exception:
+            pass
+    eas = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    for a in fill_lights or []:
+        try:
+            eas.destroy_actor(a)
+        except Exception:
+            pass
+    for c in holdout_comps:
+        try:
+            c.set_editor_property("holdout", False)
+        except Exception:
+            pass
+    for a in hidden_actors:
+        try:
+            a.set_actor_hidden_in_game(False)
+        except Exception:
+            pass
+    for c, prop, val in hidden_comps:
+        try:
+            c.set_editor_property(prop, val)
+        except Exception:
+            pass
+
+
+def _set_backing_materials(actors, white):
+    """バッキング差分レンダ用: マット板の全メッシュスロットを白(1.0)/黒(板の常用
+    アンリット材)へ一時差替え（アクター単位の property でなく material のみ・
+    HV コンポーネントは対象外）。復元用 [(comp, slot, 元material)] を返す。"""
+    from capture_core import (get_or_create_backing_white_material,
+                              get_or_create_matteboard_material)
+    mat = (get_or_create_backing_white_material() if white
+           else get_or_create_matteboard_material())
+    saved = []
+    for a in actors or []:
+        try:
+            comps = a.get_components_by_class(unreal.MeshComponent)
+        except Exception:
+            continue
+        for comp in comps:
+            if _is_hv_comp(comp):
+                continue
+            for i in range(comp.get_num_materials()):
+                saved.append((comp, i, comp.get_material(i)))
+                comp.set_material(i, mat)
+    return saved
+
+
+def _restore_backing_materials(saved):
+    for comp, i, mat in saved or []:
+        try:
+            comp.set_material(i, mat)
+        except Exception:
+            pass
 
 
 def _set_objid_render_mode(actors):
@@ -549,8 +1181,10 @@ def _restore_objid_render_mode(saved):
 
 
 def _camera_cut_camera_actors(level_sequence, world):
-    """カメラカットに束縛された CineCameraActor を全セクションから解決して返す
-    （スポーナブルはエディタワールドに実体が無く解決できない＝既知の限界）。"""
+    """カメラカットに束縛されたカメラアクターを全セクションから解決して返す
+    （CineCameraActor / 素の CameraActor の両方。スポーナブルは Sequencer が
+    プレビュー用にスポーンした実体がワールドに居ても locate_bound_objects では
+    解決できない＝既知の限界。呼び出し側でワールド走査にフォールバックする）。"""
     ext = unreal.MovieSceneSequenceExtensions
     actors = []
     guids = []
@@ -558,28 +1192,37 @@ def _camera_cut_camera_actors(level_sequence, world):
             level_sequence, unreal.MovieSceneCameraCutTrack) or []):
         for sec in tr.get_sections():
             try:
-                guids.append(sec.get_camera_binding_id().get_editor_property("guid"))
+                # Guid 構造体の == は UE5.7 Python では常に False（実測）。
+                # export_text() の文字列で比較する。
+                guids.append(sec.get_camera_binding_id()
+                             .get_editor_property("guid").export_text())
             except Exception:
                 pass
     for b in ext.get_bindings(level_sequence):
-        if any(b.get_id() == g for g in guids):
+        if b.get_id().export_text() in guids:
             for o in ext.locate_bound_objects(level_sequence, b, world):
-                if isinstance(o, unreal.CineCameraActor) and o not in actors:
+                if isinstance(o, unreal.CameraActor) and o not in actors:
                     actors.append(o)
     return actors
 
 
 def _fill_aspect_comp(camera_actor, width, height):
     """カメラのアスペクト拘束が出力解像度とミスマッチなら constrain_aspect_ratio を
-    False にしてそのコンポーネントを返す（一致 or 非拘束 or 非Cineカメラは None）。"""
+    False にしてそのコンポーネントを返す（一致 or 非拘束なら None）。
+    CineCamera は filmback、素の CameraActor は aspect_ratio プロパティで判定する
+    （素のカメラも constrain_aspect_ratio + aspect_ratio で黒帯が出る。従来は
+    Cine 専用で素のカメラは放置＝黒帯+パス間ズレになっていた）。"""
     try:
-        comp = camera_actor.get_cine_camera_component()
+        comp = camera_actor.camera_component
         if not bool(comp.get_editor_property("constrain_aspect_ratio")):
             return None
-        fb = comp.get_editor_property("filmback")
-        fb_asp = (float(fb.get_editor_property("sensor_width"))
-                  / max(float(fb.get_editor_property("sensor_height")), 1e-6))
-        if abs(fb_asp - float(width) / float(height)) < 1e-3:
+        try:
+            fb = comp.get_editor_property("filmback")
+            cam_asp = (float(fb.get_editor_property("sensor_width"))
+                       / max(float(fb.get_editor_property("sensor_height")), 1e-6))
+        except Exception:
+            cam_asp = float(comp.get_editor_property("aspect_ratio"))
+        if cam_asp <= 0.0 or abs(cam_asp - float(width) / float(height)) < 1e-3:
             return None            # 一致していれば拘束は無害（黒帯が出ない）
         comp.set_editor_property("constrain_aspect_ratio", False)
         return comp
@@ -599,10 +1242,10 @@ def _set_cameras_fill_aspect(level_sequence, width, height):
         _warn("カメラカットのカメラ解決に失敗: %s" % e)
         actors = []
     if not actors:
-        # フォールバック: レベル内の全 CineCamera（ミスマッチのものだけ触り、復元する）
+        # フォールバック: レベル内の全カメラ（ミスマッチのものだけ触り、復元する）
         try:
             actors = unreal.GameplayStatics.get_all_actors_of_class(
-                _editor_world(), unreal.CineCameraActor)
+                _editor_world(), unreal.CameraActor)
         except Exception:
             actors = []
     saved = [c for c in (_fill_aspect_comp(a, width, height) for a in actors)
@@ -625,19 +1268,24 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
                     temporal_samples=8, warmup=32,
                     custom_start=None, custom_end=None,
                     depth_material=None, matte_material=None, matte_actors=None,
-                    matte_sil_material=None,
+                    matte_sil_material=None, normal_material=None,
                     objid_material=None, objid_actors=None,
                     hidden_actors=None, near_clip_cm=None, beauty_label="Beauty",
                     fog_off=False, on_done=None,
                     light_pass=False, light_direct=False,
-                    light_label="RawLightingFull"):
+                    light_label="RawLightingFull",
+                    cloud_matte_actors=None, cloud_visible=False,
+                    cloud_backing=None, cloud_sources_off=False,
+                    geomask_material=None,
+                    backing_actors=None, backing_white=False, use_exr=False,
+                    sky_matte=False, pp_materials_off=False):
     """開いている/指定の LevelSequence を MRQ でレンダリング（非同期）。
     一時シーケンスは作らず job.sequence に直接指定し、カメラはシーケンスの
     カメラカットトラックに従う。fps はシーケンスの Display Rate。
     静止画と違いモーションブラーは殺さない（切ると動きがストロボ状になる）。
     do_png=PNG連番 / do_mp4=内蔵 H.264 MP4（CRF 指定・音声なし）。両方同時可。
-    depth_material / matte_material を渡すと additional_post_process_materials で
-    パスが増え、パス毎に別ファイルで出力される。matte_material / matte_sil_material
+    depth_material / matte_material / normal_material を渡すと
+    additional_post_process_materials でパスが増え、パス毎に別ファイルで出力される。matte_material / matte_sil_material
     には matte_actors も必須（対象を main pass 非表示 + CustomDepth 書き込みに切替え、
     完了時に復元）。matte_sil_material は遮蔽非依存の全投影シルエット（Behind 合成用）。
     hidden_actors は単純な非表示（クリーンプレートのみ。matte とは排他で使う）。
@@ -678,10 +1326,12 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
     # シーン状態の変更（レンダ後・起動失敗時に必ず復元）
     saved_matte = None
     saved_objid = None
+    saved_cloud = None
     hidden = []
     if matte_material is not None or matte_sil_material is not None:
         saved_matte = _set_matte_render_mode(matte_actors)
-    elif hidden_actors:
+    if hidden_actors:
+        # matte レンダモードと独立に適用する（板＝matte機構 / 雲＝単純非表示 の併用）
         for a in hidden_actors:
             try:
                 a.set_actor_hidden_in_game(True)
@@ -690,6 +1340,34 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
                 pass
     if objid_material is not None:
         saved_objid = _set_objid_render_mode(objid_actors)
+    saved_vis = None
+    if cloud_matte_actors and cloud_visible:
+        # 可視雲モード: 何も隠さず PIE 側でバッキング材化（深度順序が保たれる）。
+        # cloud_backing は静止画タブと同義: "white"=T測定(白発光100+微弱fill) /
+        # "black"=ベール輝度(純黒+fillなし) / None=従来の黒+20lux（旧L方式）
+        white = (cloud_backing == "white")
+        fills = (5.0 if cloud_backing == "white"
+                 else 0.0 if cloud_backing == "black" else 20.0)
+        saved_vis = {"pie": _start_pie_backing_white(cloud_matte_actors,
+                                                     white=white),
+                     "fills": _spawn_cloud_fill_lights(fills)}
+        if cloud_sources_off:
+            # 雲なしベール（CloudVeil0）: UDS の雲内フォグ板も PIE 側で隠す
+            # （HV は hidden_actors・雲レイヤーは ShowFlag.Cloud 0 が受け持つ）
+            saved_vis["plane_hider"] = _start_pie_udsplane_hider()
+    elif cloud_matte_actors:
+        # 分離モード固定（render_beauty 側の注記参照。holdout は UE5.7 で出力が壊れている）
+        saved_cloud = _set_cloud_matte_mode(cloud_matte_actors, use_holdout=False)
+    saved_backing = None
+    if backing_actors:
+        saved_backing = _set_backing_materials(backing_actors, backing_white)
+    saved_sky = None
+    if sky_matte:
+        from capture_core import list_cameras
+        cams = list_cameras()
+        if not cams:
+            raise RuntimeError("空マット: カメラが見つかりません")
+        saved_sky = _set_sky_matte_mode(cams[0])
     # レンダ対象以外の auto-play プレイヤーが PIE で並走するとシーンが二重評価される
     saved_players = _suppress_autoplay_players()
     # 全ジョブで適用する。メイン/BehindPlate 間でビュー矩形が食い違うと
@@ -701,6 +1379,14 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
             _restore_matte_render_mode(saved_matte)
         if saved_objid:
             _restore_objid_render_mode(saved_objid)
+        if saved_cloud:
+            _restore_cloud_matte_mode(saved_cloud)
+        if saved_vis:
+            _restore_visible_cloud_mode(saved_vis)
+        if saved_backing:
+            _restore_backing_materials(saved_backing)
+        if saved_sky:
+            _restore_sky_matte_mode(saved_sky)
         for a in hidden:
             try:
                 a.set_actor_hidden_in_game(False)
@@ -714,12 +1400,26 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
                                       name_body, take_str, do_png, do_mp4, mp4_crf,
                                       temporal_samples, warmup, custom_start, custom_end,
                                       depth_material, matte_material, matte_sil_material,
-                                      objid_material,
+                                      objid_material, normal_material,
                                       near_clip_cm, beauty_label, fog_off,
                                       _restore_scene, on_done,
-                                      light_pass, light_direct, light_label)
+                                      light_pass, light_direct, light_label,
+                                      cloud_matte=bool(cloud_matte_actors),
+                                      cloud_visible=cloud_visible,
+                                      cloud_sources_off=cloud_sources_off,
+                                      geomask_material=geomask_material,
+                                      backing=bool(backing_actors), use_exr=use_exr,
+                                      sky_matte=sky_matte,
+                                      pp_materials_off=pp_materials_off)
     except Exception:
         _restore_scene()
+        if near_clip_cm is not None:
+            # 起動前にグローバル適用済みの near clip を戻す
+            try:
+                unreal.SystemLibrary.execute_console_command(
+                    _editor_world(), "r.SetNearClipPlane 10")
+            except Exception:
+                pass
         _KEEP.clear()      # 起動失敗時に次回レンダを塞がない
         raise
 
@@ -728,10 +1428,14 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
                            name_body, take_str, do_png, do_mp4, mp4_crf,
                            temporal_samples, warmup, custom_start, custom_end,
                            depth_material, matte_material, matte_sil_material,
-                           objid_material,
+                           objid_material, normal_material,
                            near_clip_cm, beauty_label, fog_off, restore_scene, on_done,
                            light_pass=False, light_direct=False,
-                           light_label="RawLightingFull"):
+                           light_label="RawLightingFull", cloud_matte=False,
+                           cloud_visible=False, cloud_sources_off=False,
+                           geomask_material=None,
+                           backing=False, use_exr=False, sky_matte=False,
+                           pp_materials_off=False):
     queue = sub.get_queue()
     for j in list(queue.get_jobs()):
         queue.delete_job(j)
@@ -744,7 +1448,9 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
     extra_passes = []
     for pass_name, pass_mat in (("Depth", depth_material), ("Matte", matte_material),
                                 ("MatteSil", matte_sil_material),
-                                ("ObjectID", objid_material)):
+                                ("ObjectID", objid_material),
+                                ("Normal", normal_material),
+                                ("GeoMask", geomask_material)):
         if pass_mat is None:
             continue
         ppp = unreal.MoviePipelinePostProcessPass()
@@ -758,17 +1464,26 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
         deferred = cfg.find_or_add_setting_by_class(unreal.MoviePipelineDeferredPassBase)
         if extra_passes:
             deferred.set_editor_property("additional_post_process_materials", extra_passes)
+        if cloud_matte:
+            deferred.set_editor_property("accumulator_includes_alpha", True)
     if light_pass:
         # LightingOnly は独立したレンダパス（出力 <name>_LightingOnly_take.####、
         # 完了時に _light_label へリネーム）
         cfg.find_or_add_setting_by_class(_lighting_only_class())
 
     if do_png:
-        png = cfg.find_or_add_setting_by_class(unreal.MoviePipelineImageSequenceOutput_PNG)
-        try:
-            png.set_editor_property("write_alpha", False)
-        except Exception:
-            pass
+        if use_exr:
+            # バッキング差分は線形色の減算が要るため EXR（PNG はトーンマップ後で非線形）
+            exr = cfg.find_or_add_setting_by_class(unreal.MoviePipelineImageSequenceOutput_EXR)
+            # multilayer だと {render_pass} トークンが空になり W/B ジョブが同名で
+            # 上書きし合う（実測）。分割出力で FinalImage 名を出しリネームに乗せる。
+            exr.set_editor_property("multilayer", False)
+        else:
+            png = cfg.find_or_add_setting_by_class(unreal.MoviePipelineImageSequenceOutput_PNG)
+            try:
+                png.set_editor_property("write_alpha", bool(cloud_matte))
+            except Exception:
+                pass
     if do_mp4:
         mp4 = cfg.find_or_add_setting_by_class(unreal.MoviePipelineMP4EncoderOutput)
         mp4.set_editor_property("constant_rate_factor", int(mp4_crf))
@@ -836,6 +1551,51 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
     if light_direct:
         pairs += list(_DIRECT_ONLY_CVARS)
         _log("direct lighting only (GI/Sky/AO off)")
+    if cloud_matte:
+        # ShowFlag.Cloud は HV も巻き込むため通常は不使用（render_beauty 側の注記参照）
+        pairs += [("r.PostProcessing.PropagateAlpha", 1),
+                  ("ShowFlag.Fog", 0), ("ShowFlag.VolumetricFog", 0)]
+        if cloud_visible:
+            # 可視雲(H5ペア)系は大気・雲レイヤーを生かす（静止画タブと同じ）。
+            # CloudVeil0 だけ ShowFlag.Cloud 0 でレイヤーを消す（HV は
+            # hidden_actors・フォグ板は PIE ウォッチャが受け持つ）。
+            if cloud_sources_off:
+                pairs.append(("ShowFlag.Cloud", 0))
+            _log("cloud matte (visible / atmosphere on / fog off%s)"
+                 % (" / cloud-layer off" if cloud_sources_off else ""))
+        else:
+            pairs.append(("ShowFlag.Atmosphere", 0))
+            _log("cloud matte (alpha / atmosphere+fog off)")
+    if sky_matte:
+        # 空マット: PPマテリアル(スタイライズ等)とブルームを切る。大気・雲は
+        # ShowFlag で明示的に ON（環境光と雲の維持。ue-sky-matte-capture 実証）
+        pairs += [("ShowFlag.PostProcessMaterial", 0), ("r.BloomQuality", 0),
+                  ("ShowFlag.Atmosphere", 1), ("ShowFlag.Cloud", 1)]
+        _log("sky matte (PPマテリアルOFF / ブルームOFF / 大気・雲ON)")
+    if pp_materials_off and not sky_matte:
+        # レベルのスタイライズPPマテリアル(桑原フィルタ等)を切る。MRQ の追加
+        # PP パス(Normal/Depth 等)は AdditionalPostProcessMaterials 経由なので
+        # この ShowFlag の影響を受けない（AV024 実測 2026-08-27）
+        pairs.append(("ShowFlag.PostProcessMaterial", 0))
+        _log("PPマテリアル OFF")
+    if backing or cloud_visible:
+        # 露出適応は白板に反応して画面全体を沈める（-18%実測）ため、適応と
+        # ローカル露出をジョブ内で無効化。白板は発光100なのでブルームと
+        # Lumen スクリーントレースの撒き散らしも切る（×100で無視できなくなる）。
+        pairs += [("r.EyeAdaptationQuality", 0),
+                  ("r.LocalExposure.HighlightContrastScale", 1.0),
+                  ("r.LocalExposure.ShadowContrastScale", 1.0),
+                  ("r.BloomQuality", 0),
+                  ("r.Lumen.ScreenProbeGather.ScreenTraces", 0),
+                  ("r.Lumen.Reflections.ScreenTraces", 0)]
+        # 既定の EXR はトーンカーブ適用済み（発光100が~1.0に圧縮される実測）。
+        # T=W/素板レベル の線形性が前提なのでトーンカーブを切ってシーンリニアで書く。
+        try:
+            col = cfg.find_or_add_setting_by_class(unreal.MoviePipelineColorSetting)
+            col.set_editor_property("disable_tone_curve", True)
+        except Exception as e:
+            _warn("backing: トーンカーブ無効化に失敗（Tが非線形になる）: %s" % e)
+        _log("backing render (exposure locked / bloom+screen traces off / linear)")
     cv = cfg.find_or_add_setting_by_class(unreal.MoviePipelineConsoleVariableSetting)
     cv.set_editor_property("cvars", _cv_entries(pairs))   # レンダ後にエンジンが自動復元
     cmds = []
@@ -843,6 +1603,10 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
         # r.SetNearClipPlane は cvar でなくコマンド＝自動復元されない（完了時に手動復元）
         cmds.append("r.SetNearClipPlane %f" % float(near_clip_cm))
         _log("near clip = %.1f cm" % float(near_clip_cm))
+        # ウォームアップ/先頭サブフレームにも効かせるため起動前にグローバル適用
+        # （半透明ゴースト防止・_on_finished が既定 10cm へ復元）
+        unreal.SystemLibrary.execute_console_command(
+            _editor_world(), "r.SetNearClipPlane %f" % float(near_clip_cm))
     cv.set_editor_property("start_console_commands", cmds)
 
     executor = unreal.MoviePipelinePIEExecutor()
@@ -889,7 +1653,8 @@ def _rename_final_image(output_dir, beauty_label="Beauty", light_label=None):
                 continue
             nf = f
             # MatteSil は Matte より先（長い識別子から置換しないと _MatteSil が壊れる）
-            for pass_name in ("Depth", "MatteSil", "Matte", "ObjectID"):
+            for pass_name in ("Depth", "MatteSil", "Matte", "ObjectID", "Normal",
+                              "GeoMask"):
                 nf = nf.replace("_FinalImage" + pass_name, "_" + pass_name)
             nf = nf.replace("_FinalImage", "_" + beauty_label)
             if light_label:

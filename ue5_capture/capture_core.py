@@ -197,12 +197,22 @@ def restore_camera_filmback(camera_actor, sw, sh):
 
 
 def get_camera_settings(camera_actor):
-    """カメラの Transform / FOV / アスペクト / PostProcess を取得。"""
+    """カメラの Transform / FOV / アスペクト / PostProcess を取得。
+    aspect_ratio が未設定(≒0)のカメラは filmback (sensor w/h) から算出する。"""
     cam_comp = _camera_component(camera_actor)
+    asp = float(cam_comp.get_editor_property("aspect_ratio"))
+    if asp <= 0.01:
+        try:
+            fb = cam_comp.get_editor_property("filmback")
+            sh = float(fb.get_editor_property("sensor_height"))
+            if sh > 0:
+                asp = float(fb.get_editor_property("sensor_width")) / sh
+        except Exception:
+            pass
     return {
         "transform": camera_actor.get_actor_transform(),
         "fov": float(cam_comp.get_editor_property("field_of_view")),
-        "aspect_ratio": float(cam_comp.get_editor_property("aspect_ratio")),
+        "aspect_ratio": asp,
         "post_process": cam_comp.get_editor_property("post_process_settings"),
     }
 
@@ -365,16 +375,71 @@ def _visible_mask(target_depth, full_depth):
     return (target_depth < _DEPTH_FAR_CM) & (_np.abs(target_depth - full_depth) <= tol)
 
 
-def _render_depth_r(world, cam, w, h, spawned, show_only_actors=None, hidden_actors=None):
+def _render_depth_r(world, cam, w, h, spawned, show_only_actors=None,
+                    hidden_actors=None, fmt=None):
     """SCS_SCENE_DEPTH を1枚撮り、R チャンネル（cm 距離）を float32 (H,W) で返す。
-    UE5.7: SceneDepth を R32F へ撮ると全画素一定値になる不具合があるため RGBA16F を使う。"""
+    UE5.7: SceneDepth を R32F へ撮ると全画素一定値になる不具合があるため既定は
+    RGBA16F（⚠️ FP16 上限 65504cm≈655m で飽和する）。fmt=RTF_RGBA32F を渡すと
+    655m 超も測れる（4ch 32F は R32F バグの対象外か要実測）。"""
     rt = _make_render_target(world, w, h,
-                             unreal.TextureRenderTargetFormat.RTF_RGBA16F, True)
+                             fmt or unreal.TextureRenderTargetFormat.RTF_RGBA16F,
+                             True)
     actor = _spawn_capture(world, cam["transform"], cam["fov"], rt,
                            unreal.SceneCaptureSource.SCS_SCENE_DEPTH,
                            show_only_actors=show_only_actors, hidden_actors=hidden_actors)
     spawned.append(actor)
     return _read_rt_raw_r(world, rt, w, h)
+
+
+def measure_depth_range(camera_actor, w=384, h=216,
+                        lo_pct=0.5, hi_pct=99.5, pad=0.05):
+    """Depth 自動レンジ: SceneCapture 深度を低解像度で1枚撮り、可視ジオメトリの
+    最近/最遠距離 (cm) をロバスト百分位で推定する。空/ファープレーン(≥1e7)は除外。
+    pad は両端の余白率（クリップ防止）。値は2有効数字へ丸める（near切下げ/far切上げ）。
+    戻り値 (near_cm, far_cm)。有効画素が無ければ None。
+    ※ バウンズ走査でなく実描画ベース: 遮蔽・マスク材・巨大スカイ球・LevelInstance
+    列挙の罠を全て回避できる（現在のシーン状態＝現在フレームで測る）。"""
+    if not _HAS_NUMPY:
+        return None
+    world = _get_editor_world()
+    cam = get_camera_settings(camera_actor)
+    spawned = []
+    try:
+        # RGBA32F で FP16 の 655m 飽和を回避（R32F 単チャンネルのみのバグ）。
+        # 万一 32F が全画素一定（バグ該当）なら 16F に落として続行
+        d = _render_depth_r(world, cam, int(w), int(h), spawned,
+                            fmt=unreal.TextureRenderTargetFormat.RTF_RGBA32F)
+        if d is not None and float(_np.ptp(d)) < 1e-3:
+            _warn("Depth自動レンジ: RGBA32F が定数値（バグ該当）→ RGBA16F で再測定"
+                  "（655m 超は飽和）")
+            d = _render_depth_r(world, cam, int(w), int(h), spawned)
+    finally:
+        _destroy_actors(spawned)
+    if d is None:
+        return None
+    v = d[(d > 1.0) & (d < 1e7)]
+    if v.size < 64:
+        return None
+    near = float(_np.percentile(v, lo_pct)) * (1.0 - pad)
+    far = float(_np.percentile(v, hi_pct)) * (1.0 + pad)
+    if far <= near:
+        return None
+
+    def _round_sig(x, up):
+        if x <= 0:
+            return 0.0
+        import math
+        exp = math.floor(math.log10(x)) - 1
+        q = 10.0 ** exp
+        f = math.ceil if up else math.floor
+        return f(x / q) * q
+
+    near = max(_round_sig(near, up=False), 0.0)
+    far = _round_sig(far, up=True)
+    _log("Depth自動レンジ: near=%.0fcm far=%.0fcm (%.1fm〜%.1fm, 有効%.0f%%)"
+         % (near, far, near / 100.0, far / 100.0,
+            100.0 * v.size / d.size))
+    return near, far
 
 
 def _render_final_color(world, settings, cam, w, h, aa, spawned,
@@ -648,8 +713,17 @@ def _capture_depth(world, settings, cam, w, h, ts, spawned):
         hidden = _resolve_target_actors(settings.matte_actors, settings.matte_actor_names)
         if hidden:
             _log("Depth: Matte 対象 %d 個を深度から除外" % len(hidden))
-    depth = _render_depth_r(world, cam, w * aa, h * aa, spawned, hidden_actors=hidden)
-    depth = _downscale(depth, aa)  # cm 単位の距離（空/未ヒットは half 最大 ~65504）
+    # RGBA32F で撮る: 16F だと空/未ヒットと 655m 超が half 最大 65504cm に飽和し、
+    # far>655m のとき空が「far より手前」扱いでグレーに残る（far=700m で空 6.4%
+    # グレーの実測 2026-08-27）。32F が定数値（R32F 系バグ該当）なら 16F へ退避
+    depth = _render_depth_r(world, cam, w * aa, h * aa, spawned,
+                            hidden_actors=hidden,
+                            fmt=unreal.TextureRenderTargetFormat.RTF_RGBA32F)
+    if depth is not None and float(_np.ptp(depth)) < 1e-3:
+        _warn("Depth: RGBA32F が定数値 → RGBA16F で再取得（655m 超と空は飽和）")
+        depth = _render_depth_r(world, cam, w * aa, h * aa, spawned,
+                                hidden_actors=hidden)
+    depth = _downscale(depth, aa)  # cm 単位の距離（空/未ヒットは 1e8 オーダー）
 
     near, far = settings.depth_near, settings.depth_far
 
@@ -819,6 +893,34 @@ def _capture_object_id(world, settings, cam, w, h, ts, spawned):
     return outs
 
 
+# HeterogeneousVolume（VDB/SVT の雲等）。CustomDepth/SceneDepth を書かないため
+# 既存のマット/ObjectID 機構（ステンシル・深度一致）には一切写らない。
+# マット系はアルファレンダ（capture_mrq の cloud_matte ジョブ）で扱う。
+_HV_COMP_CLASS = getattr(unreal, "HeterogeneousVolumeComponent", None)
+
+
+def _is_hv_comp(comp):
+    return _HV_COMP_CLASS is not None and isinstance(comp, _HV_COMP_CLASS)
+
+
+def is_volumetric_actor(actor):
+    """HeterogeneousVolume(VDB) コンポーネントを持つアクターか。"""
+    if _HV_COMP_CLASS is None or actor is None:
+        return False
+    try:
+        return bool(actor.get_components_by_class(_HV_COMP_CLASS))
+    except Exception:
+        return False
+
+
+def split_volumetric_targets(actors):
+    """対象アクターを (通常プリミティブ, ボリューム(HV)) に分ける。"""
+    prims, vols = [], []
+    for a in actors or []:
+        (vols if is_volumetric_actor(a) else prims).append(a)
+    return prims, vols
+
+
 def _matte_clip_plane(actors, cam):
     """マット対象群の代表平面（base, normal）を求める。normal は『奥』を向くよう調整。
     平面マットは actor の up ベクトルが面法線。複数なら可視点に最も近い1つを採用。"""
@@ -846,6 +948,8 @@ def set_matte_shadow_occlusion(actors, enabled):
         if a is None:
             continue
         for comp in a.get_components_by_class(unreal.PrimitiveComponent):
+            if _is_hv_comp(comp):
+                continue   # ボリューム(雲)は板ではない: ライティング分離しない
             try:
                 comp.set_editor_property("cast_shadow", bool(enabled))
             except Exception:
@@ -866,8 +970,10 @@ _MATTE_ORIGMAT_TAG = "ue5cap_origmat"
 
 
 def get_or_create_matteboard_material():
-    """マット板用のアンリット単色マテリアル（ライティング・影を一切受けない）。
-    板の見た目を撮影素材に使わない前提のニュートラル表示用。"""
+    """マット板用のアンリット純黒マテリアル（ライティング・影を一切受けない）。
+    黒＝放射ゼロなので Lumen スクリーントレース/反射経由で周囲のオブジェクトに
+    色が被らない（旧 0.18 グレーはビューポートで茶色く見え色被りも起きた）。
+    バッキング差分の黒側も 0 になり数学が単純化する。"""
     full = _TMP_MAT_PKG + "/" + _TMP_MATTEBOARD_NAME
     mat = None
     if unreal.EditorAssetLibrary.does_asset_exist(full):
@@ -884,7 +990,7 @@ def get_or_create_matteboard_material():
         MEL.delete_all_material_expressions(mat)
     except Exception:
         pass
-    e = _mx_const(mat, 0.18, -300, 0)   # 50%グレー相当（リニア）
+    e = _mx_const(mat, 0.0, -300, 0)    # 純黒（放射ゼロ）
     MEL.connect_material_property(e, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
     MEL.recompile_material(mat)
     try:
@@ -892,6 +998,128 @@ def get_or_create_matteboard_material():
     except Exception as ex:
         _warn("MatteBoard マテリアルの保存に失敗（未保存のまま続行）: %s" % ex)
     return mat
+
+
+_TMP_BACKINGWHITE_NAME = "M_UE5Cap_BackingWhite"
+_TMP_BACKINGCLEAR_NAME = "M_UE5Cap_BackingClear"
+
+
+def material_blend_mode(m):
+    """MaterialInterface の実効ブレンドモード（インスタンスのオーバーライド考慮）。
+    解決できなければ None。"""
+    try:
+        if isinstance(m, unreal.MaterialInstance):
+            bpo = m.get_editor_property("base_property_overrides")
+            if bpo.get_editor_property("override_blend_mode"):
+                return bpo.get_editor_property("blend_mode")
+            base = m.get_base_material()
+            return (base.get_editor_property("blend_mode")
+                    if base is not None else None)
+        return m.get_editor_property("blend_mode")
+    except Exception:
+        return None
+
+
+def material_writes_depth(m):
+    """このマテリアルが不透明深度を書くか（Opaque/Masked）。
+    半透明系（Translucent/Additive/Modulate 等）は深度を書かない＝
+    バッキング材(不透明)に差し替えると Beauty に存在しない遮蔽面が出現し、
+    その奥の HV(VDB雲) が深度テストで丸ごと消える（UDS の雲内フォグ板が
+    雲高度に不可視の巨大水平面を張っていた実測 2026-08-26）。判定不能は
+    True（従来どおり差し替え）。"""
+    bm = material_blend_mode(m)
+    if bm is None:
+        return True
+    return bm in (unreal.BlendMode.BLEND_OPAQUE, unreal.BlendMode.BLEND_MASKED)
+
+
+def get_or_create_backing_clear_material():
+    """バッキングレンダ用の完全不可視マテリアル（Translucent・Unlit・opacity 0）。
+    半透明スロットの差し替え先。深度を書かず何も描かない＝素の半透明が
+    見た目を汚すのも防ぎつつ、幻の遮蔽面を作らない。"""
+    full = _TMP_MAT_PKG + "/" + _TMP_BACKINGCLEAR_NAME
+    mat = None
+    if unreal.EditorAssetLibrary.does_asset_exist(full):
+        mat = unreal.EditorAssetLibrary.load_asset(full)
+    if mat is None:
+        at = unreal.AssetToolsHelpers.get_asset_tools()
+        mat = at.create_asset(_TMP_BACKINGCLEAR_NAME, _TMP_MAT_PKG,
+                              unreal.Material, unreal.MaterialFactoryNew())
+    if mat is None:
+        raise RuntimeError("BackingClear マテリアルの生成に失敗しました。")
+    MEL = unreal.MaterialEditingLibrary
+    mat.set_editor_property("shading_model", unreal.MaterialShadingModel.MSM_UNLIT)
+    mat.set_editor_property("blend_mode", unreal.BlendMode.BLEND_TRANSLUCENT)
+    mat.set_editor_property("two_sided", True)
+    try:
+        MEL.delete_all_material_expressions(mat)
+    except Exception:
+        pass
+    z = _mx_const(mat, 0.0, -300, 0)
+    MEL.connect_material_property(z, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+    z2 = _mx_const(mat, 0.0, -300, 150)
+    MEL.connect_material_property(z2, "", unreal.MaterialProperty.MP_OPACITY)
+    MEL.recompile_material(mat)
+    try:
+        unreal.EditorAssetLibrary.save_loaded_asset(mat)
+    except Exception as ex:
+        _warn("BackingClear マテリアルの保存に失敗（未保存のまま続行）: %s" % ex)
+    return mat
+
+
+def get_or_create_backing_white_material():
+    """バッキングレンダ用のアンリット白(発光100)マテリアル。
+    板をこの材で1回レンダした線形色 W = 手前の内容の発光C + 透過率T×100 で、
+    C は通常のシーン輝度（〜1程度）なので C/100 ≤ 1% となり無視できる
+    → T ≈ W/素板レベル。黒板との2レンダ差分は不要（レンダ1本で済む）。
+    発光100はブルーム/スクリーントレースを撒くため、バッキングジョブは
+    それらをジョブ内 cvar で切る（capture_mrq 側）。"""
+    full = _TMP_MAT_PKG + "/" + _TMP_BACKINGWHITE_NAME
+    mat = None
+    if unreal.EditorAssetLibrary.does_asset_exist(full):
+        mat = unreal.EditorAssetLibrary.load_asset(full)
+    # 白側は板と違い常設表示されない（バッキングレンダ中のみ差し替え）ため発光1.0のまま
+    if mat is None:
+        at = unreal.AssetToolsHelpers.get_asset_tools()
+        mat = at.create_asset(_TMP_BACKINGWHITE_NAME, _TMP_MAT_PKG,
+                              unreal.Material, unreal.MaterialFactoryNew())
+    if mat is None:
+        raise RuntimeError("BackingWhite マテリアルの生成に失敗しました。")
+    MEL = unreal.MaterialEditingLibrary
+    mat.set_editor_property("shading_model", unreal.MaterialShadingModel.MSM_UNLIT)
+    mat.set_editor_property("two_sided", True)
+    try:
+        MEL.delete_all_material_expressions(mat)
+    except Exception:
+        pass
+    e = _mx_const(mat, 100.0, -300, 0)
+    MEL.connect_material_property(e, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+    MEL.recompile_material(mat)
+    try:
+        unreal.EditorAssetLibrary.save_loaded_asset(mat)
+    except Exception as ex:
+        _warn("BackingWhite マテリアルの保存に失敗（未保存のまま続行）: %s" % ex)
+    return mat
+
+
+def level_has_volumetrics():
+    """レベル内に HV(VDB雲) アクターがあるか（バッキング差分の自動トリガー用）。"""
+    return bool(level_volumetrics())
+
+
+def level_volumetrics():
+    """レベル内の HV(VDB雲) アクターを列挙する（雲マット独立出力の既定対象）。"""
+    if _HV_COMP_CLASS is None:
+        return []
+    sub = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    out = []
+    for a in sub.get_all_level_actors():
+        try:
+            if a.get_components_by_class(_HV_COMP_CLASS):
+                out.append(a)
+        except Exception:
+            pass
+    return out
 
 
 def set_matte_unlit(actors):
@@ -906,6 +1134,10 @@ def set_matte_unlit(actors):
             continue
         tags = [unreal.Name(str(t)) for t in a.tags]
         for comp in a.get_components_by_class(unreal.MeshComponent):
+            if _is_hv_comp(comp):
+                # ボリューム(雲)は板ではない。Volume ドメイン材が必要で差替え不可、
+                # かつ現在材は BP が作る Transient MID で退避パスも復元不能になる。
+                continue
             cname = comp.get_name()
             for i in range(comp.get_num_materials()):
                 cur = comp.get_material(i)
@@ -1065,10 +1297,15 @@ def delete_pass_frames(output_dir, name_body, take_str, pass_names):
     return n
 
 
-def composite_mattefront_sequence(output_dir, name_body, take_str):
+def composite_mattefront_sequence(output_dir, name_body, take_str, use_cloud=False,
+                                  use_backing=False):
     """Beauty（クリーン）に Matte をアルファとして焼いた MatteBeauty 連番を書く
     （Matteの前＝マット部分が穴。選択=黒がアルファ0）。RGB はアルファ乗算済みなので
-    MP4 化しても穴が黒になる。出力フレーム数を返す。"""
+    MP4 化しても穴が黒になる。use_cloud=True なら CloudMatte 連番（PNG の α=
+    雲の可視不透明度）も mask×(1-α) で統合する（板マスクが無い雲のみの場合は
+    白地から作る）。use_backing=True なら BackingT 連番（16bit グレー = 板より
+    手前の透過率）を mask' = 255−(255−mask)×T で統合する（板の手前の雲・半透明が
+    遮蔽関係どおり穴を塞ぐ）。出力フレーム数を返す。"""
     if not (_HAS_NUMPY and _HAS_PIL):
         return 0
     pat = re.compile(re.escape("%s_Beauty_%s." % (name_body, take_str)) + r"(\d+)\.png$")
@@ -1079,12 +1316,31 @@ def composite_mattefront_sequence(output_dir, name_body, take_str):
             continue
         fr = m.group(1)
         matte_p = os.path.join(output_dir, "%s_Matte_%s.%s.png" % (name_body, take_str, fr))
-        if not os.path.isfile(matte_p):
-            _warn("MatteBeauty 合成: フレーム %s の Matte が無い" % fr)
-            continue
+        cloud_p = os.path.join(output_dir, "%s_CloudMatte_%s.%s.png" % (name_body, take_str, fr))
         beauty = _np.asarray(_PILImage.open(os.path.join(output_dir, f)).convert("RGB"),
                              dtype=_np.float32)
-        matte = _np.asarray(_PILImage.open(matte_p).convert("L"), dtype=_np.float32)
+        matte = None
+        if os.path.isfile(matte_p):
+            matte = _np.asarray(_PILImage.open(matte_p).convert("L"), dtype=_np.float32)
+        if use_cloud and os.path.isfile(cloud_p):
+            cim = _PILImage.open(cloud_p)
+            if cim.mode == "RGBA":
+                ca = _np.asarray(cim)[:, :, 3].astype(_np.float32) / 255.0
+                if matte is None:
+                    matte = _np.full(ca.shape, 255.0, dtype=_np.float32)
+                matte = matte * (1.0 - ca)
+        if use_backing and matte is not None:
+            bt_p = os.path.join(output_dir,
+                                "%s_BackingT_%s.%s.png" % (name_body, take_str, fr))
+            if os.path.isfile(bt_p):
+                tim = _PILImage.open(bt_p)
+                t = _np.asarray(tim).astype(_np.float32) / (
+                    65535.0 if tim.mode in ("I;16", "I") else 255.0)
+                if t.shape == matte.shape:
+                    matte = 255.0 - (255.0 - matte) * t
+        if matte is None:
+            _warn("MatteBeauty 合成: フレーム %s の Matte/CloudMatte が無い" % fr)
+            continue
         rgb = beauty * (matte / 255.0)[:, :, None]
         rgba = _np.dstack([rgb, matte])
         out = os.path.join(output_dir, "%s_MatteBeauty_%s.%s.png" % (name_body, take_str, fr))
@@ -1149,6 +1405,82 @@ def matte_near_clip_cm(actors, cam):
     to = unreal.Vector(base.x - cam_loc.x, base.y - cam_loc.y, base.z - cam_loc.z)
     dist = to.x * fwd.x + to.y * fwd.y + to.z * fwd.z
     return max(1.0, float(dist))
+
+
+def render_matte_sil_sequence(output_dir, name_body, take_str, start, end,
+                              actors, width, height, camera_for_frame, aa=2):
+    """映像 Behind 用: 各フレームをシーケンサーでスクラブ評価し、マット対象の
+    全投影シルエット（選択=黒/周囲=白）を show-only 深度から MatteSil 連番として
+    書く（静止画側の composite_behind_in_matte と同一手法）。
+    メインジョブの MatteSil PP パスは使わない: ObjectID 対象のステンシルが
+    「板より手前」の画素でシルエットを上書きして穴を開け、合成が Beauty 側
+    （手前オブジェクト入り）を選んでしまう（実測 2026-07-24）。
+    camera_for_frame(frame) はスクラブ込みでそのフレームのカメラアクターを返す。
+    書いたフレーム数を返す。"""
+    if not (_HAS_NUMPY and _HAS_PIL):
+        return 0
+    world = _get_editor_world()
+    try:
+        t0 = unreal.LevelSequenceEditorBlueprintLibrary.get_current_time()
+    except Exception:
+        t0 = None
+    n = 0
+    try:
+        for fr in range(int(start), int(end) + 1):
+            cam_actor = camera_for_frame(fr)
+            if cam_actor is None:
+                _warn("MatteSil 生成: フレーム %d のカメラを特定できずスキップ" % fr)
+                continue
+            cam = get_camera_settings(cam_actor)
+            tmp = []
+            try:
+                d = _render_depth_r(world, cam, width * aa, height * aa, tmp,
+                                    show_only_actors=actors)
+            finally:
+                _destroy_actors(tmp)
+            sil = _downscale((d < _DEPTH_FAR_CM).astype(_np.float32) * 255.0, aa)
+            out = os.path.join(output_dir,
+                               "%s_MatteSil_%s.%04d.png" % (name_body, take_str, fr))
+            _write_png_u8(out, 255.0 - sil)     # 選択=黒 / 周囲=白
+            n += 1
+    finally:
+        if t0 is not None:
+            try:
+                unreal.LevelSequenceEditorBlueprintLibrary.set_current_time(int(t0))
+            except Exception:
+                pass
+    _log("MatteSil 生成（スクラブ+show-only深度）: %d フレーム" % n)
+    return n
+
+
+def volumetrics_nearer_than(dist_cm, cam):
+    """カメラ視線方向の深度が dist_cm より手前にある HV(VDB雲) アクターを返す。
+    HV は r.SetNearClipPlane の描画クリップを無視して写り込む（実測 2026-07-24）
+    ため、Matteの奥のプレートでは手前の雲をアクター単位で隠す必要がある。"""
+    if _HV_COMP_CLASS is None:
+        return []
+    cam_loc = cam["transform"].translation
+    fwd = cam["transform"].rotation.rotator().get_forward_vector()
+    sub = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    out = []
+    for a in sub.get_all_level_actors():
+        try:
+            if not a.get_components_by_class(_HV_COMP_CLASS):
+                continue
+        except Exception:
+            continue
+        # 中心でなくバウンズの最近点で判定する: クリップ面を跨ぐ大きな雲
+        # （中心は奥・手前に張り出し）がゴーストとして残るのを防ぐ
+        try:
+            origin, ext = a.get_actor_bounds(False)
+        except Exception:
+            origin, ext = a.get_actor_location(), unreal.Vector(0, 0, 0)
+        d = ((origin.x - cam_loc.x) * fwd.x + (origin.y - cam_loc.y) * fwd.y
+             + (origin.z - cam_loc.z) * fwd.z)
+        d_near = d - (abs(ext.x * fwd.x) + abs(ext.y * fwd.y) + abs(ext.z * fwd.z))
+        if d_near < float(dist_cm):
+            out.append(a)
+    return out
 
 
 def capture_behind_matte(world, settings, cam, w, h, ts, spawned):
@@ -1228,6 +1560,597 @@ def compose_rgba(rgb_path, mask_path, out_path):
     _write_png_u8(out_path, _np.dstack([rgb, m]))
     _log("behind-matte 合成出力: %s" % out_path)
     return out_path
+
+
+def merge_cloud_alpha_into_matte(matte_path, cloud_png_path, out_path, size_wh=None):
+    """Matte マスク（選択=黒/周囲=白）へ CloudMatte のα（雲の可視不透明度）を合成する。
+    mask' = mask × (1 - cloud_α)。matte_path が無ければ白地から作る
+    （雲だけがマット対象のケース）。出力パスを返す（入力不足なら None）。"""
+    if not (_HAS_NUMPY and _HAS_PIL):
+        return None
+    if not (cloud_png_path and os.path.isfile(cloud_png_path)):
+        _warn("merge_cloud_alpha: CloudMatte 画像がありません: %s" % cloud_png_path)
+        return None
+    im = _PILImage.open(cloud_png_path)
+    if im.mode != "RGBA":
+        _warn("merge_cloud_alpha: CloudMatte にαがありません（mode=%s）" % im.mode)
+        return None
+    ca = _np.asarray(im)[:, :, 3].astype(_np.float32) / 255.0
+    H, W = ca.shape
+    if matte_path and os.path.isfile(matte_path):
+        mask = _np.asarray(_PILImage.open(matte_path).convert("L"), dtype=_np.float32)
+        if mask.shape != (H, W):
+            mask = _np.asarray(_PILImage.fromarray(mask.astype(_np.uint8)).resize((W, H)),
+                               dtype=_np.float32)
+    else:
+        mask = _np.full((H, W), 255.0, dtype=_np.float32)
+    merged = mask * (1.0 - ca)
+    _write_png_u8(out_path, merged)
+    _log("Matte マスクへ雲αを合成: %s" % out_path)
+    return out_path
+
+
+def cloudmatte_alpha_to_mask(path, invert=True):
+    """CloudMatte PNG（RGB≒黒 + α=可視雲不透明度）を白黒マスク RGB PNG に変換する
+    （in place・MP4 エンコード可能になる）。invert=True（既定）で 雲=黒/なし=白。"""
+    if not _HAS_PIL:
+        raise RuntimeError("Pillow がありません（雲マットの白黒変換に必要）")
+    im = _PILImage.open(path)
+    if im.mode != "RGBA":
+        raise RuntimeError("CloudMatte にαがありません（mode=%s）" % im.mode)
+    a = im.getchannel("A")
+    if invert:
+        a = a.point(lambda v: 255 - v)
+    _PILImage.merge("RGB", (a, a, a)).save(path)
+
+
+def cloudmatte_frames_to_mask(output_dir, name_body, take_str, invert=True):
+    """CloudMatte 連番（%s_CloudMatte_%s.NNNN.png）を全フレーム白黒マスク化する。
+    変換したフレーム数を返す。"""
+    prefix = "%s_CloudMatte_%s." % (name_body, take_str)
+    n = 0
+    for f in sorted(os.listdir(output_dir)):
+        if not (f.startswith(prefix) and f.endswith(".png")):
+            continue
+        try:
+            cloudmatte_alpha_to_mask(os.path.join(output_dir, f), invert=invert)
+            n += 1
+        except Exception as e:
+            _warn("雲マット白黒変換に失敗 %s: %s" % (f, e))
+    _log("雲マット白黒変換: %d フレーム" % n)
+    return n
+
+
+def apply_cloud_black(path, cloud_path):
+    """画像の雲領域を黒に落とす: img' = img × (1 − 雲α)。Normal(RGB) と
+    Depth(8bit RGB / 16bit I;16 グレー) に対応（EXR 生cm は 0=カメラ位置になり
+    意味が壊れるため呼ばないこと）。cloud_path は α のままの CloudMatte
+    （白黒変換前）であること。"""
+    if not (_HAS_NUMPY and _HAS_PIL):
+        raise RuntimeError("numpy/Pillow がありません（雲抜きに必要）")
+    cm = _PILImage.open(cloud_path)
+    if cm.mode != "RGBA":
+        raise RuntimeError("CloudMatte にαがありません（mode=%s）" % cm.mode)
+    im = _PILImage.open(path)
+    if cm.size != im.size:
+        cm = cm.resize(im.size)
+    ca = _np.asarray(cm)[:, :, 3].astype(_np.float32) / 255.0
+    if im.mode in ("I;16", "I"):
+        arr = _np.asarray(im).astype(_np.float32) / 65535.0
+        _write_png_u16_gray(path, arr * (1.0 - ca))
+    else:
+        # sRGB 値に直接 (1−α) を掛けるとリニア換算 (1−α)^2.2 で二重に濃くなる
+        # （雲マットのαは正しいのに Normal だけ濃く見える実測 2026-08-26 AV024
+        # take020）。リニア化して乗算するが、純リニア(m=1)は薄く感じるとの
+        # 目視評価により、強さは _CLOUD_MUL_POW で連続調整する（(1−α)^m）
+        arr = _np.asarray(im.convert("RGB")).astype(_np.float32) / 255.0
+        keep = _np.power(_np.clip(1.0 - ca, 0.0, 1.0), _CLOUD_MUL_POW)
+        lin = _np.power(arr, 2.2) * keep[:, :, None]
+        out = (_np.power(_np.clip(lin, 0.0, 1.0), 1.0 / 2.2) * 255.0 + 0.5
+               ).astype(_np.uint8)
+        _PILImage.fromarray(out, "RGB").save(path)
+
+
+def apply_cloud_black_to_pass_frames(output_dir, name_body, take_str, pass_name):
+    """<pass_name> 連番の各フレームへ同フレームの CloudMatte α を乗算して
+    雲領域を黒にする。処理したフレーム数を返す（CloudMatte 側が α のままの
+    状態で呼ぶこと）。"""
+    prefix = "%s_%s_%s." % (name_body, pass_name, take_str)
+    n = 0
+    for f in sorted(os.listdir(output_dir)):
+        if not (f.startswith(prefix) and f.endswith(".png")):
+            continue
+        frame = f[len(prefix):-4]
+        cf = os.path.join(output_dir,
+                          "%s_CloudMatte_%s.%s.png" % (name_body, take_str, frame))
+        if not os.path.isfile(cf):
+            continue
+        try:
+            apply_cloud_black(os.path.join(output_dir, f), cf)
+            n += 1
+        except Exception as e:
+            _warn("%s の雲抜きに失敗 %s: %s" % (pass_name, f, e))
+    _log("%s の雲抜き: %d フレーム" % (pass_name, n))
+    return n
+
+
+def _read_linear_gray(path, ffmpeg):
+    """レンダ出力を線形 float 配列で読む。EXR は同梱 ffmpeg で G チャンネルを
+    そのまま PFM(float32) に抜いて読む（extractplanes＝色変換なし・クリップなしの
+    ビット一致を実測。PIZ 圧縮対応・OpenEXR 依存を増やさない）。
+    PNG(I;16/L) は直接読む。"""
+    if not (_HAS_NUMPY and _HAS_PIL):
+        return None
+    import subprocess as _subprocess
+    p = path
+    tmp = None
+    if path.lower().endswith(".exr"):
+        if not ffmpeg:
+            _warn("バッキング: ffmpeg が見つからず EXR を読めません")
+            return None
+        tmp = path + "._g.pfm"
+        # creationflags: コンソールウインドウを出さない（フレーム毎の起動で
+        # ウインドウが連続開閉してエディタの UI 操作を奪う・ユーザー報告）
+        r = _subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", path,
+                             "-vf", "format=gbrpf32le,extractplanes=g", tmp],
+                            capture_output=True, creationflags=0x08000000)
+        if r.returncode != 0 or not os.path.isfile(tmp):
+            _warn("バッキング: EXR 変換失敗 %s: %s" % (path, r.stderr.decode(errors="replace")[-200:]))
+            return None
+        p = tmp
+    try:
+        im = _PILImage.open(p)
+        a = _np.asarray(im).astype(_np.float32)
+        if im.mode in ("I;16", "I"):
+            a = a / 65535.0
+        elif im.mode != "F":
+            a = a / 255.0
+        if a.ndim == 3:
+            a = a.mean(axis=-1)
+        return a
+    except Exception as e:
+        # 例外を呼び出し側の連番ループへ漏らさない（1フレームの破損で
+        # 後続フレーム処理と EXR 掃除が丸ごと飛ぶのを防ぐ）
+        _warn("バッキング: 画像読み込み失敗 %s: %s" % (p, e))
+        return None
+    finally:
+        if tmp:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+
+
+def _backing_t_from_array(w, scale=None):
+    """白バッキング1レンダの輝度配列から透過率 T (0..1) と正規化スケールを返す。
+    scale = 素の板(遮蔽なし)の輝度レベル。フレーム間で固定したい場合は指定する。"""
+    if scale is None:
+        pos = w[w > max(float(w.max()), 1e-6) * 0.05]
+        if pos.size == 0:
+            return None, None
+        scale = float(_np.percentile(pos, 99.5))
+    if scale <= 1e-6:
+        return None, None
+    return _np.clip(w / scale, 0.0, 1.0), scale
+
+
+def _read_linear_alpha(path, ffmpeg):
+    """EXR の α チャンネルを線形 float 配列で読む（_read_linear_gray の α 版）。"""
+    if not (_HAS_NUMPY and _HAS_PIL):
+        return None
+    import subprocess as _subprocess
+    if not path.lower().endswith(".exr"):
+        try:
+            im = _PILImage.open(path)
+            if im.mode == "RGBA":
+                return _np.asarray(im)[:, :, 3].astype(_np.float32) / 255.0
+        except Exception:
+            pass
+        return None
+    if not ffmpeg:
+        _warn("可視雲: ffmpeg が見つからず EXR αを読めません")
+        return None
+    tmp = path + "._a.pfm"
+    r = _subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", path,
+                         "-vf", "format=gbrapf32le,extractplanes=a", tmp],
+                        capture_output=True, creationflags=0x08000000)
+    if r.returncode != 0 or not os.path.isfile(tmp):
+        _warn("可視雲: EXR α抽出失敗 %s: %s"
+              % (path, r.stderr.decode(errors="replace")[-200:]))
+        return None
+    try:
+        return _np.asarray(_PILImage.open(tmp)).astype(_np.float32)
+    except Exception as e:
+        _warn("可視雲: α読み込み失敗 %s: %s" % (tmp, e))
+        return None
+    finally:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+
+
+# 可視雲のジオメトリ画素に掛ける飽和ゲイン（1−e^(−G·x) 正規化）。上げるほど
+# 雲の中身が早く不透明になる（輪郭・貫通の筋は輝度≈0のため影響が小さい）
+_VIS_CLOUD_GAIN = 7.0
+
+
+# --- H5 知覚モデル（静止画の可視雲。2026-08-26 frame84 でユーザー目視確定） ---
+# per = V/(V + K·T·Bg): V=黒バッキング素照明のベール輝度 / T=白バッキング透過率 /
+# Bg=雲なしBeautyのリニア背景輝度。日照ブースト 1−(1−per)(1−S·V^P) →
+# カーブ 1−e^(−G·x) → 全体の濃度は透明度ガンマ (1−(1−vis)^γ) で調整する。
+_VIS_CLOUD_K = 0.7          # コントラスト項の背景寄与（小さいほど全体が濃い）
+_VIS_CLOUD_CURVE_G = 2.0    # 飽和カーブ
+_VIS_SUN_BOOST_S = 0.8      # 日照（高ベール輝度）画素の不透明化強さ
+_VIS_SUN_BOOST_P = 1.0      # 日照ブーストの集中度（2で最明部限定）
+_VIS_DENSE_GAMMA = 1.5      # 全体の濃さ（1=素・1.5=一段濃い・2.2=二段濃い）
+_CLOUD_MUL_POW = 2.2        # Normal/Depth 雲抜きの乗算強さ（リニア空間で (1−α)^m。
+                            # 1.0=リニア正確=薄め / 2.2=旧sRGB直乗算相当=濃い）
+
+
+def vis_cloud_gain_tag():
+    """雲マット/雲抜き出力のファイル名タグ（例 'H5d1.5'）。濃度設定の識別用。"""
+    return "H5d%g" % _VIS_DENSE_GAMMA
+
+
+def compose_visible_cloud(w_exr, geomask_exr, out_rgba_png, ffmpeg=None, scale=None):
+    """可視雲マット合成（黒バッキング方式）: 全ジオメトリを黒アンリット材で
+    レンダした EXR（RGB=雲の散乱輝度 L・α=全投影雲α）と GeoMask（ジオメトリ有=白）
+    から「見えている雲量」を α に持つ RGBA PNG を書く。
+    L は遮蔽考慮（黒い物体が手前なら 0）の知覚的カバレッジ。空画素は α が正確な
+    ので、空の雲画素で scale=median(α/L) を自己較正してジオメトリ画素へ L×scale を
+    適用する（白バッキングの 1−T は物理透過率で Beauty の見た目より薄い実測
+    2026-08-26 → 知覚合わせの輝度方式へ変更）。
+    戻り値 (out_path, scale)。失敗時 (None, None)。"""
+    if not (_HAS_NUMPY and _HAS_PIL):
+        return None, None
+    L = _read_linear_gray(w_exr, ffmpeg)
+    a = _read_linear_alpha(w_exr, ffmpeg)
+    g = _read_linear_gray(geomask_exr, ffmpeg) if geomask_exr else None
+    if L is None or a is None:
+        _warn("可視雲: 入力を読めません (L=%s α=%s)"
+              % (L is not None, a is not None))
+        return None, None
+    # UE のシーンリニア EXR は α を「1−カバレッジ」で格納する（空=1・不透明=0。
+    # AV024 実測 2026-08-26。PNG 出力は MRQ が標準向きへ反転して書く）
+    a = 1.0 - _np.clip(a, 0.0, 1.0)
+    if g is None:
+        _warn("可視雲: GeoMask なし＝空画素αのみで合成（遮蔽は反映されない）")
+        vis = a
+        scale = scale or 1.0
+    else:
+        if scale is None:
+            sel = (g < 0.5) & (a > 0.15) & (L > 1e-6)
+            if sel.sum() >= 100:
+                scale = float(_np.median(a[sel] / L[sel]))
+            else:
+                # 空に雲が無い構図: 輝度の高位パーセンタイルで代用
+                lv = L[L > 1e-6]
+                scale = (1.0 / max(float(_np.percentile(lv, 99)), 1e-6)
+                         if lv.size else 1.0)
+                _warn("可視雲: 空の雲画素が少なく scale=%.4f を輝度から推定" % scale)
+        # ジオメトリ画素: 雲の消衰で内部ほど輝度が落ち「輪郭は合うが中身が薄い」
+        # マットになる（フレーム84実測）。飽和カーブ 1−e^(−G·x) で中身を不透明側へ
+        # 押し上げる（柱の筋など輝度≈0はカーブ後もほぼ0のままで貫通表現は保たれる）
+        G = _VIS_CLOUD_GAIN
+        x = _np.clip(L * scale, 0.0, None)
+        vis_geo = (1.0 - _np.exp(-G * x)) / (1.0 - _np.exp(-G))
+        vis = _np.where(g > 0.5, _np.clip(vis_geo, 0.0, 1.0), a)
+    vis8 = (_np.clip(vis, 0.0, 1.0) * 255.0 + 0.5).astype(_np.uint8)
+    z = _np.zeros_like(vis8)
+    _PILImage.merge("RGBA", tuple(_PILImage.fromarray(c) for c in (z, z, z, vis8))
+                    ).save(out_rgba_png)
+    _log("可視雲マット合成: %s (scale=%.4f)" % (out_rgba_png, scale))
+    return out_rgba_png, scale
+
+
+def compose_visible_cloud_sequence(output_dir, name_body, take_str, ffmpeg=None):
+    """映像用: CloudMatte(EXR W+α) + GeoMask(EXR) 連番から可視雲 RGBA PNG 連番を作る。
+    正規化スケールは最初の成功フレームで固定（チラつき防止）。使用済み EXR は削除。
+    書いたフレーム数を返す。"""
+    pat = re.compile(re.escape("%s_CloudMatte_%s." % (name_body, take_str))
+                     + r"(\d+)\.exr$")
+    frames = {}
+    for f in os.listdir(output_dir):
+        m = pat.match(f)
+        if m:
+            frames[m.group(1)] = f
+    n = 0
+    scale = None
+    for fr in sorted(frames):
+        wp = os.path.join(output_dir, frames[fr])
+        gp = os.path.join(output_dir,
+                          "%s_GeoMask_%s.%s.exr" % (name_body, take_str, fr))
+        op = os.path.join(output_dir,
+                          "%s_CloudMatte_%s.%s.png" % (name_body, take_str, fr))
+        r, sc = compose_visible_cloud(wp, gp if os.path.isfile(gp) else None,
+                                      op, ffmpeg=ffmpeg, scale=scale)
+        if r:
+            n += 1
+            if scale is None:
+                scale = sc
+    # EXR は後段（PNG合成・MP4）で不要なので全て削除
+    for f in list(os.listdir(output_dir)):
+        if (pat.match(f) or f.startswith("%s_GeoMask_%s." % (name_body, take_str))
+                and f.endswith(".exr")):
+            try:
+                os.remove(os.path.join(output_dir, f))
+            except Exception:
+                pass
+    _log("可視雲マット: %d フレーム合成" % n)
+    return n
+
+
+def compose_visible_cloud_h5(w_exr, geomask_exr, veil_exr, bg_png,
+                             out_rgba_png, ffmpeg=None, veil_none_exr=None,
+                             norm=None):
+    """H5 知覚モデルの可視雲マット合成（静止画）。
+    w_exr=白バッキング（RGB=T×素板・α=全投影雲α）/ geomask_exr=ジオメトリ有無 /
+    veil_exr=黒バッキング素照明（RGB=雲ベール輝度）/ bg_png=雲なしBeauty。
+    veil_none_exr を渡すと4レンダのペア方式: V = VeilAll − VeilNone（大気・雲ON
+    ベール同士の差分）。UDS 雲レイヤー/フォグ板の雲も V に乗り、空のグラデと
+    大気ヘイズは正確に相殺される（HV だけの旧3レンダ方式は中距離の層雲を
+    取りこぼす実測 2026-08-26）。空領域はαではなく T=1 の同式で合成する。
+    出力: α=可視雲量の RGBA PNG。パラメータは _VIS_CLOUD_K ほか（モジュール定数）。
+    norm に dict を渡すと正規化値（plate/v99）を共有する: キーが有れば使い、
+    無ければ計算して書き込む（映像でフレーム毎に正規化が揺れてチラつくのを防ぐ）。
+    戻り値: 出力パス（失敗時 None）。"""
+    if not (_HAS_NUMPY and _HAS_PIL):
+        return None
+    W = _read_linear_gray(w_exr, ffmpeg)
+    A = _read_linear_alpha(w_exr, ffmpeg)
+    Gm = _read_linear_gray(geomask_exr, ffmpeg) if geomask_exr else None
+    V = _read_linear_gray(veil_exr, ffmpeg) if veil_exr else None
+    Vn0 = (_read_linear_gray(veil_none_exr, ffmpeg)
+           if veil_none_exr else None)
+    if W is None or A is None:
+        _warn("可視雲H5: 白バッキング入力を読めません")
+        return None
+    A = 1.0 - _np.clip(A, 0.0, 1.0)   # UE の EXR α は 1−カバレッジ格納
+    if Gm is None or V is None:
+        _warn("可視雲H5: GeoMask/Veil が無いためαのみで合成（遮蔽なし）")
+        vis = A
+    else:
+        geo = Gm > 0.5
+        if norm is not None and "plate" in norm:
+            plate = float(norm["plate"])
+        else:
+            plate = float(_np.percentile(W[geo], 99)) if geo.sum() else 0.0
+            if norm is not None and plate > 1e-6:
+                norm["plate"] = plate
+        if plate <= 1e-6:
+            _warn("可視雲H5: 素板レベルを推定できません")
+            return None
+        T = _np.clip(W / plate, 0.0, 1.0)
+        if Vn0 is not None:
+            V = _np.clip(V - Vn0, 0.0, None)   # ペア差分＝純粋な雲ベール輝度
+            T = _np.where(geo, T, 1.0)         # 空は「明るい背景」として同式で扱う
+        if norm is not None and "v99" in norm:
+            v99 = float(norm["v99"])
+        else:
+            vv = V[V > 1e-6]
+            v99 = float(_np.percentile(vv, 99)) if vv.size else 1.0
+            if norm is not None and v99 > 1e-6:
+                norm["v99"] = v99
+        V = _np.clip(V / max(v99, 1e-6), 0.0, 1.0)
+        try:
+            bg_im = _PILImage.open(bg_png).convert("L")
+            if bg_im.size != (W.shape[1], W.shape[0]):
+                bg_im = bg_im.resize((W.shape[1], W.shape[0]))
+            Bg = _np.power(_np.asarray(bg_im).astype(_np.float32) / 255.0, 2.2)
+        except Exception as e:
+            _warn("可視雲H5: 雲なしBeautyを読めません（背景=0.5固定で続行）: %s" % e)
+            Bg = _np.full_like(W, 0.5)
+        per = V / (V + _VIS_CLOUD_K * T * Bg + 1e-6)
+        boosted = 1.0 - (1.0 - _np.clip(per, 0.0, 1.0)) \
+            * (1.0 - _VIS_SUN_BOOST_S * _np.power(V, _VIS_SUN_BOOST_P))
+        G = _VIS_CLOUD_CURVE_G
+        visg = (1.0 - _np.exp(-G * _np.clip(boosted, 0.0, 1.0))) \
+            / (1.0 - _np.exp(-G))
+        if Vn0 is not None:
+            # ペア方式: 空領域も同式（大気ONの W はαが使えないため）
+            vis = _np.clip(visg, 0.0, 1.0)
+        else:
+            vis = _np.where(geo, _np.clip(visg, 0.0, 1.0), A)
+    vis = 1.0 - _np.power(1.0 - _np.clip(vis, 0.0, 1.0), _VIS_DENSE_GAMMA)
+    vis8 = (_np.clip(vis, 0.0, 1.0) * 255.0 + 0.5).astype(_np.uint8)
+    z = _np.zeros_like(vis8)
+    _PILImage.merge("RGBA", tuple(_PILImage.fromarray(c) for c in (z, z, z, vis8))
+                    ).save(out_rgba_png)
+    _log("可視雲H5合成: %s (K=%g G=%g S=%g P=%g γ=%g)"
+         % (out_rgba_png, _VIS_CLOUD_K, _VIS_CLOUD_CURVE_G,
+            _VIS_SUN_BOOST_S, _VIS_SUN_BOOST_P, _VIS_DENSE_GAMMA))
+    return out_rgba_png
+
+
+def compose_visible_cloud_h5_sequence(output_dir, name_body, take_str,
+                                      ffmpeg=None):
+    """映像用: H5 ペア方式の4レンダ連番（CloudMatte=白W+GeoMask / CloudVeil /
+    CloudVeil0 / CloudBG）から可視雲 RGBA PNG 連番を作る。正規化（素板レベル・
+    ベールp99）は最初の成功フレームで固定（フレーム間のチラつき防止）。
+    使用済みの EXR と CloudBG PNG は削除する。書いたフレーム数を返す。"""
+    pat = re.compile(re.escape("%s_CloudMatte_%s." % (name_body, take_str))
+                     + r"(\d+)\.exr$")
+    frames = {}
+    for f in os.listdir(output_dir):
+        m = pat.match(f)
+        if m:
+            frames[m.group(1)] = f
+    n = 0
+    norm = {}
+    for fr in sorted(frames):
+        wp = os.path.join(output_dir, frames[fr])
+        gp = os.path.join(output_dir,
+                          "%s_GeoMask_%s.%s.exr" % (name_body, take_str, fr))
+        vp = os.path.join(output_dir,
+                          "%s_CloudVeil_%s.%s.exr" % (name_body, take_str, fr))
+        v0 = os.path.join(output_dir,
+                          "%s_CloudVeil0_%s.%s.exr" % (name_body, take_str, fr))
+        bg = os.path.join(output_dir,
+                          "%s_CloudBG_%s.%s.png" % (name_body, take_str, fr))
+        op = os.path.join(output_dir,
+                          "%s_CloudMatte_%s.%s.png" % (name_body, take_str, fr))
+        r = compose_visible_cloud_h5(
+            wp, gp if os.path.isfile(gp) else None,
+            vp if os.path.isfile(vp) else None,
+            bg, op, ffmpeg=ffmpeg,
+            veil_none_exr=v0 if os.path.isfile(v0) else None,
+            norm=norm)
+        if r:
+            n += 1
+    # 中間素材は後段（PNG合成・MP4）で不要なので削除
+    for f in list(os.listdir(output_dir)):
+        drop = False
+        for tag in ("CloudMatte", "GeoMask", "CloudVeil", "CloudVeil0"):
+            if (f.startswith("%s_%s_%s." % (name_body, tag, take_str))
+                    and f.endswith(".exr")):
+                drop = True
+        if (f.startswith("%s_CloudBG_%s." % (name_body, take_str))
+                and f.endswith(".png")):
+            drop = True
+        if drop:
+            try:
+                os.remove(os.path.join(output_dir, f))
+            except Exception:
+                pass
+    _log("可視雲H5マット(ペア方式): %d フレーム合成" % n)
+    return n
+
+
+def backing_t_png(white_path, out_path, ffmpeg=None, scale=None):
+    """白(発光100)バッキング1レンダから「板より手前の透過率T」16bit グレー PNG を書く。
+    W = 手前の発光C + T×100×露出 で C/100 は無視できるため T ≈ W/素板レベル。
+    板の後ろの内容は不透明な板に遮られて写らないため、板の後ろの雲は T に
+    影響しない（=他オブジェクトと同じ前後関係の挙動）。
+    戻り値 (out_path, scale)。失敗時 (None, None)。"""
+    w = _read_linear_gray(white_path, ffmpeg)
+    if w is None:
+        _warn("バッキング: 入力を読めません（%s）" % white_path)
+        return None, None
+    t, scale = _backing_t_from_array(w, scale)
+    if t is None:
+        _warn("バッキング: 素の板領域が見つからず正規化できません")
+        return None, None
+    _write_png_u16_gray(out_path, t)
+    _log("バッキングT: %s (scale=%.4f)" % (out_path, scale))
+    return out_path, scale
+
+
+def backing_t_sequence(output_dir, name_body, take_str, start, end, ffmpeg):
+    """映像用: BackingW の EXR 連番から %s_BackingT_%s.NNNN.png 連番を作る。
+    正規化スケールは最初のフレームで決めて全フレームに固定（フレーム間のチラつき防止）。
+    使用後の EXR は範囲外も含め全て削除する。書いたフレーム数を返す。"""
+    pat_w = re.compile(re.escape("%s_BackingW_%s." % (name_body, take_str)) + r"(\d+)\.exr$")
+    frames = {}
+    for f in os.listdir(output_dir):
+        m = pat_w.match(f)
+        if m:
+            frames[m.group(1)] = f
+    n = 0
+    scale = None
+    for fr in sorted(frames):
+        if not (int(start) <= int(fr) <= int(end)):
+            continue
+        wp = os.path.join(output_dir, frames[fr])
+        op = os.path.join(output_dir, "%s_BackingT_%s.%s.png" % (name_body, take_str, fr))
+        r, sc = backing_t_png(wp, op, ffmpeg=ffmpeg, scale=scale)
+        if r:
+            n += 1
+            if scale is None:
+                scale = sc      # 失敗フレームで固定スケールを潰さない（チラつき防止）
+    prefix = "%s_BackingW_%s." % (name_body, take_str)
+    for f in os.listdir(output_dir):
+        if f.startswith(prefix) and f.endswith(".exr"):
+            try:
+                os.remove(os.path.join(output_dir, f))
+            except Exception:
+                pass
+    _log("バッキングT: %d フレーム出力" % n)
+    return n
+
+
+def merge_backing_t_into_matte(matte_path, t_png, out_path):
+    """Matte マスク（選択=黒/周囲=白）へバッキング差分の透過率Tを統合する。
+    mask' = 255 − (255−mask) × T ＝「板の穴は、手前の内容(雲・半透明)の透過率の分
+    だけしか開かない」。板領域外は mask=255 なので T の値に関わらず不変
+    （領域判定が不要になるのがこの式の要点）。出力パスを返す。"""
+    if not (_HAS_NUMPY and _HAS_PIL):
+        return None
+    if not (matte_path and os.path.isfile(matte_path)):
+        _warn("merge_backing_t: 板の Matte マスクがありません: %s" % matte_path)
+        return None
+    if not (t_png and os.path.isfile(t_png)):
+        _warn("merge_backing_t: T 画像がありません: %s" % t_png)
+        return None
+    mask = _np.asarray(_PILImage.open(matte_path).convert("L"), dtype=_np.float32)
+    tim = _PILImage.open(t_png)
+    t = _np.asarray(tim).astype(_np.float32) / (65535.0 if tim.mode in ("I;16", "I") else 255.0)
+    if t.shape != mask.shape:
+        _warn("merge_backing_t: 解像度不一致 %s vs %s" % (t.shape, mask.shape))
+        return None
+    merged = 255.0 - (255.0 - mask) * t
+    _write_png_u8(out_path, merged)
+    _log("Matte マスクへバッキングTを合成: %s" % out_path)
+    return out_path
+
+
+def merge_cloud_objid(objid_png, manifest_path, cloud_entries, threshold=0.5):
+    """ObjectID 静止画へ雲のIDを合成する。cloud_entries = [(label, cloud_png_path)]。
+    各雲は CloudMatte のα >= threshold の画素を専用色で塗る（後勝ち）。
+    色相は既存マニフェストのエントリ数から黄金角で継続。JSON も更新する。"""
+    import colorsys
+    import json as _json
+    if not (_HAS_NUMPY and _HAS_PIL):
+        return None
+    if not (objid_png and os.path.isfile(objid_png)):
+        _warn("merge_cloud_objid: ObjectID 画像がありません: %s" % objid_png)
+        return None
+    img = _np.asarray(_PILImage.open(objid_png).convert("RGB")).astype(_np.float32)
+    man = {}
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            man = _json.load(f)
+    except Exception:
+        pass
+    idx = len(man)
+    n = 0
+    for label, cpath in cloud_entries:
+        if not (cpath and os.path.isfile(cpath)):
+            _warn("merge_cloud_objid: %s のCloudMatteがありません" % label)
+            continue
+        im = _PILImage.open(cpath)
+        if im.mode != "RGBA":
+            continue
+        ca = _np.asarray(im)[:, :, 3].astype(_np.float32) / 255.0
+        if ca.shape != img.shape[:2]:
+            ca = _np.asarray(_PILImage.fromarray((ca * 255).astype(_np.uint8))
+                             .resize((img.shape[1], img.shape[0])),
+                             dtype=_np.float32) / 255.0
+        vis = ca >= float(threshold)
+        if not bool(vis.any()):
+            continue
+        # 既存マニフェスト（メッシュ側パレット）と偶然同色になったらずらす
+        for _ in range(64):
+            hue = (idx * 0.6180339887498949) % 1.0
+            sat = 0.75 + 0.20 * ((idx // 6) % 2)
+            val = 1.0 - 0.20 * ((idx // 3) % 2)
+            idx += 1
+            r, g, b = colorsys.hsv_to_rgb(hue, sat, val)
+            col = _np.array([r, g, b], dtype=_np.float32) * 255.0
+            key = "#%02X%02X%02X" % (int(col[0]), int(col[1]), int(col[2]))
+            if key not in man:
+                break
+        img[vis] = col
+        man[key] = label
+        n += 1
+    _write_png_u8(objid_png, img)
+    try:
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            _json.dump(man, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        _warn("merge_cloud_objid: JSON 更新に失敗: %s" % e)
+    _log("ObjectID へ雲ID %d 件を合成: %s" % (n, objid_png))
+    return objid_png
 
 
 def blend_with_beauty(beauty_path, matte_path=None, objid_path=None,
@@ -1402,6 +2325,153 @@ def _mx_get_or_create_pp_material(name):
         "blendable_location",
         unreal.BlendableLocation.BL_SCENE_COLOR_AFTER_TONEMAPPING)
     unreal.MaterialEditingLibrary.delete_all_material_expressions(mat)
+    return mat
+
+
+_TMP_SKYBLACK_NAME = "M_UE5Cap_SkyBlack"
+
+
+def delete_temp_sky_black_material():
+    _delete_temp_material(_TMP_SKYBLACK_NAME, "SkyBlack")
+
+
+def get_or_create_sky_black_material():
+    """空マット用の黒スカイドーム材（Unlit/Opaque/TwoSided/is_sky=True）。
+    is_sky=True で空気遠近(aerial perspective)を受けない＝純黒が保たれる
+    （ue-sky-matte-capture スキルで実証済みの構成）。"""
+    full = _TMP_MAT_PKG + "/" + _TMP_SKYBLACK_NAME
+    mat = None
+    if unreal.EditorAssetLibrary.does_asset_exist(full):
+        mat = unreal.EditorAssetLibrary.load_asset(full)
+    if mat is None:
+        at = unreal.AssetToolsHelpers.get_asset_tools()
+        mat = at.create_asset(_TMP_SKYBLACK_NAME, _TMP_MAT_PKG,
+                              unreal.Material, unreal.MaterialFactoryNew())
+    if mat is None:
+        raise RuntimeError("SkyBlack マテリアルの生成に失敗しました。")
+    MEL = unreal.MaterialEditingLibrary
+    mat.set_editor_property("shading_model", unreal.MaterialShadingModel.MSM_UNLIT)
+    mat.set_editor_property("blend_mode", unreal.BlendMode.BLEND_OPAQUE)
+    mat.set_editor_property("two_sided", True)
+    mat.set_editor_property("is_sky", True)
+    MEL.delete_all_material_expressions(mat)
+    c = MEL.create_material_expression(mat, unreal.MaterialExpressionConstant, -300, 0)
+    c.set_editor_property("r", 0.0)
+    MEL.connect_material_property(c, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+    MEL.recompile_material(mat)
+    _log("一時 SkyBlack マテリアル生成")
+    return mat
+
+
+_TMP_NORMAL_NAME = "M_UE5Cap_Normal"
+
+
+def delete_temp_normal_material():
+    _delete_temp_material(_TMP_NORMAL_NAME, "Normal")
+
+
+# カメラ法線の軸符号（ビュー空間 → 「正対=+Z青 / 右=+X赤 / 上=+Y緑」の規約合わせ）。
+# UE5.7 のビュー空間は X=右 / Y=上 / Z=奥（2026-08-25 実測）なので Z のみ反転する。
+_NORMAL_VIEW_FLIP = (1.0, 1.0, -1.0)
+
+
+def create_temp_normal_material(camera_space=True):
+    """法線を RGB に出す PostProcess マテリアルを用意して返す。
+    camera_space=True で GBuffer WorldNormal をビュー空間へ変換（カメラ法線。
+    正対面が青になる V-Ray SamplerInfo 等の規約）。False はワールド法線そのまま。
+    いずれも -1..1 を *0.5+0.5 で 0..1 に詰める（法線マップ規約）。
+    注意: MRQ 経由の PNG/MP4 は表示用エンコード（sRGB）で書かれるため、
+    データとして使う場合はリニア化してから -1..1 へ戻すこと（8bit Depth と同じ制約）。"""
+    mat = _mx_get_or_create_pp_material(_TMP_NORMAL_NAME)
+    st = _mx_expr(mat, unreal.MaterialExpressionSceneTexture, -1050, 0)
+    st.set_editor_property("scene_texture_id", unreal.SceneTextureId.PPI_WORLD_NORMAL)
+    m = _mx_expr(mat, unreal.MaterialExpressionComponentMask, -880, 0)
+    m.set_editor_property("r", True)
+    m.set_editor_property("g", True)
+    m.set_editor_property("b", True)
+    m.set_editor_property("a", False)
+    _mx_conn(st, "Color", m, "")
+    src = m
+    if camera_space:
+        tr = _mx_expr(mat, unreal.MaterialExpressionTransform, -730, 0)
+        tr.set_editor_property(
+            "transform_source_type",
+            unreal.MaterialVectorCoordTransformSource.TRANSFORMSOURCE_WORLD)
+        tr.set_editor_property(
+            "transform_type", unreal.MaterialVectorCoordTransform.TRANSFORM_VIEW)
+        _mx_conn(m, "", tr, "")
+        flip = _mx_expr(mat, unreal.MaterialExpressionConstant3Vector, -730, 220)
+        flip.set_editor_property("constant", unreal.LinearColor(
+            _NORMAL_VIEW_FLIP[0], _NORMAL_VIEW_FLIP[1], _NORMAL_VIEW_FLIP[2], 0.0))
+        mulf = _mx_expr(mat, unreal.MaterialExpressionMultiply, -560, 0)
+        _mx_conn(tr, "", mulf, "A")
+        _mx_conn(flip, "", mulf, "B")
+        src = mulf
+    c_half = _mx_const(mat, 0.5, -560, 220)
+    mul = _mx_expr(mat, unreal.MaterialExpressionMultiply, -400, 0)
+    _mx_conn(src, "", mul, "A")
+    _mx_conn(c_half, "", mul, "B")
+    add = _mx_expr(mat, unreal.MaterialExpressionAdd, -250, 0)
+    _mx_conn(mul, "", add, "A")
+    _mx_conn(c_half, "", add, "B")
+    # 非描画領域（空=ファープレーン）はGBuffer法線がクリア値のまま乗るので、
+    # SceneDepth < 1e7 の valid 判定（Matte 材と同じしきい値）で黒に落とす
+    d = _mx_expr(mat, unreal.MaterialExpressionSceneDepth, -560, 420)
+    c_thresh = _mx_const(mat, 1.0e7, -560, 560)
+    subv = _mx_expr(mat, unreal.MaterialExpressionSubtract, -400, 480)
+    _mx_conn(c_thresh, "", subv, "A")
+    _mx_conn(d, "", subv, "B")
+    c_k = _mx_const(mat, 1.0e-2, -400, 620)
+    mulv = _mx_expr(mat, unreal.MaterialExpressionMultiply, -250, 480)
+    _mx_conn(subv, "", mulv, "A")
+    _mx_conn(c_k, "", mulv, "B")
+    clampv = _mx_expr(mat, unreal.MaterialExpressionClamp, -120, 480)
+    _mx_conn(mulv, "", clampv, "")
+    outm = _mx_expr(mat, unreal.MaterialExpressionMultiply, -60, 100)
+    _mx_conn(add, "", outm, "A")
+    _mx_conn(clampv, "", outm, "B")
+    unreal.MaterialEditingLibrary.connect_material_property(
+        outm, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+    unreal.MaterialEditingLibrary.recompile_material(mat)
+    try:
+        unreal.EditorAssetLibrary.save_loaded_asset(mat)
+    except Exception as e:
+        _warn("一時法線マテリアルの保存に失敗（未保存のまま続行）: %s" % e)
+    _log("一時法線マテリアル生成 (%s*0.5+0.5)"
+         % ("ViewNormal" if camera_space else "WorldNormal"))
+    return mat
+
+
+_TMP_GEOMASK_NAME = "M_UE5Cap_GeoMask"
+
+
+def delete_temp_geomask_material():
+    _delete_temp_material(_TMP_GEOMASK_NAME, "GeoMask")
+
+
+def create_temp_geomask_material():
+    """SceneDepth < 1e7（ジオメトリ有）の画素を白(1)にする PostProcess マテリアル。
+    可視雲マットの「ジオメトリ画素は 1−T / 空画素は α」の分岐マスクに使う。"""
+    mat = _mx_get_or_create_pp_material(_TMP_GEOMASK_NAME)
+    d = _mx_expr(mat, unreal.MaterialExpressionSceneDepth, -700, 0)
+    c_thresh = _mx_const(mat, 1.0e7, -700, 160)
+    sub = _mx_expr(mat, unreal.MaterialExpressionSubtract, -550, 60)
+    _mx_conn(c_thresh, "", sub, "A")
+    _mx_conn(d, "", sub, "B")
+    c_k = _mx_const(mat, 1.0e-2, -550, 220)
+    mul = _mx_expr(mat, unreal.MaterialExpressionMultiply, -400, 100)
+    _mx_conn(sub, "", mul, "A")
+    _mx_conn(c_k, "", mul, "B")
+    clamp = _mx_expr(mat, unreal.MaterialExpressionClamp, -250, 100)
+    _mx_conn(mul, "", clamp, "")
+    unreal.MaterialEditingLibrary.connect_material_property(
+        clamp, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+    unreal.MaterialEditingLibrary.recompile_material(mat)
+    try:
+        unreal.EditorAssetLibrary.save_loaded_asset(mat)
+    except Exception as e:
+        _warn("一時 GeoMask マテリアルの保存に失敗（未保存のまま続行）: %s" % e)
+    _log("一時 GeoMask マテリアル生成 (SceneDepth<1e7)")
     return mat
 
 
