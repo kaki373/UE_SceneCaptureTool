@@ -220,7 +220,8 @@ def render_beauty(camera_actor, output_dir, width, height,
                   cloud_matte_actors=None, cloud_visible=False,
                   cloud_backing=None, cloud_sources_off=False,
                   geomask_material=None,
-                  backing_actors=None, backing_white=False, sky_matte=False):
+                  backing_actors=None, backing_white=False, sky_matte=False,
+                  pp_materials_off=False):
     """対象カメラを MRQ で Beauty レンダリング（非同期）。executor を返す。
     cloud_visible=True（要 cloud_matte_actors）は可視雲モード: 何も隠さず PIE 側で
     全ジオメトリを白発光材へ差し替え、EXR の RGB=W(=T×素板レベル)・α=全投影雲αを
@@ -336,7 +337,8 @@ def render_beauty(camera_actor, output_dir, width, height,
                              cloud_visible=cloud_visible,
                              cloud_sources_off=cloud_sources_off,
                              geomask_material=geomask_material,
-                             backing=bool(backing_actors), sky_matte=sky_matte)
+                             backing=bool(backing_actors), sky_matte=sky_matte,
+                             pp_materials_off=pp_materials_off)
     except Exception:
         # 起動に失敗したら状態を巻き戻す（次回レンダを塞がない）
         _restore_scene()
@@ -361,7 +363,7 @@ def _start_render(sub, camera_actor, output_dir, width, height,
                   light_pass=False, light_direct=False, cloud_matte=False,
                   cloud_visible=False, cloud_sources_off=False,
                   geomask_material=None,
-                  backing=False, sky_matte=False):
+                  backing=False, sky_matte=False, pp_materials_off=False):
     seq, seq_path = _create_temp_sequence(camera_actor,
                                           scene_sequence=scene_sequence,
                                           scene_frame=scene_frame)
@@ -513,6 +515,12 @@ def _start_render(sub, camera_actor, output_dir, width, height,
         pairs += [("ShowFlag.PostProcessMaterial", 0), ("r.BloomQuality", 0),
                   ("ShowFlag.Atmosphere", 1), ("ShowFlag.Cloud", 1)]
         _log("sky matte (PPマテリアルOFF / ブルームOFF / 大気・雲ON)")
+    if pp_materials_off and not sky_matte:
+        # レベルのスタイライズPPマテリアル(桑原フィルタ等)を切る。MRQ の追加
+        # PP パス(Normal/Depth 等)は AdditionalPostProcessMaterials 経由なので
+        # この ShowFlag の影響を受けない（AV024 実測 2026-08-27）
+        pairs.append(("ShowFlag.PostProcessMaterial", 0))
+        _log("PPマテリアル OFF")
     if backing or cloud_visible:
         # 露出適応は白板に反応して画面全体を沈める（-18%実測）ため、適応と
         # ローカル露出をジョブ内で無効化。白板は発光100なのでブルームと
@@ -1270,7 +1278,7 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
                     cloud_backing=None, cloud_sources_off=False,
                     geomask_material=None,
                     backing_actors=None, backing_white=False, use_exr=False,
-                    sky_matte=False):
+                    sky_matte=False, pp_materials_off=False):
     """開いている/指定の LevelSequence を MRQ でレンダリング（非同期）。
     一時シーケンスは作らず job.sequence に直接指定し、カメラはシーケンスの
     カメラカットトラックに従う。fps はシーケンスの Display Rate。
@@ -1401,7 +1409,8 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
                                       cloud_sources_off=cloud_sources_off,
                                       geomask_material=geomask_material,
                                       backing=bool(backing_actors), use_exr=use_exr,
-                                      sky_matte=sky_matte)
+                                      sky_matte=sky_matte,
+                                      pp_materials_off=pp_materials_off)
     except Exception:
         _restore_scene()
         if near_clip_cm is not None:
@@ -1425,7 +1434,8 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
                            light_label="RawLightingFull", cloud_matte=False,
                            cloud_visible=False, cloud_sources_off=False,
                            geomask_material=None,
-                           backing=False, use_exr=False, sky_matte=False):
+                           backing=False, use_exr=False, sky_matte=False,
+                           pp_materials_off=False):
     queue = sub.get_queue()
     for j in list(queue.get_jobs()):
         queue.delete_job(j)
@@ -1562,6 +1572,12 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
         pairs += [("ShowFlag.PostProcessMaterial", 0), ("r.BloomQuality", 0),
                   ("ShowFlag.Atmosphere", 1), ("ShowFlag.Cloud", 1)]
         _log("sky matte (PPマテリアルOFF / ブルームOFF / 大気・雲ON)")
+    if pp_materials_off and not sky_matte:
+        # レベルのスタイライズPPマテリアル(桑原フィルタ等)を切る。MRQ の追加
+        # PP パス(Normal/Depth 等)は AdditionalPostProcessMaterials 経由なので
+        # この ShowFlag の影響を受けない（AV024 実測 2026-08-27）
+        pairs.append(("ShowFlag.PostProcessMaterial", 0))
+        _log("PPマテリアル OFF")
     if backing or cloud_visible:
         # 露出適応は白板に反応して画面全体を沈める（-18%実測）ため、適応と
         # ローカル露出をジョブ内で無効化。白板は発光100なのでブルームと
