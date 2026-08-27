@@ -1818,7 +1818,8 @@ def compose_visible_cloud_sequence(output_dir, name_body, take_str, ffmpeg=None)
 
 
 def compose_visible_cloud_h5(w_exr, geomask_exr, veil_exr, bg_png,
-                             out_rgba_png, ffmpeg=None, veil_none_exr=None):
+                             out_rgba_png, ffmpeg=None, veil_none_exr=None,
+                             norm=None):
     """H5 知覚モデルの可視雲マット合成（静止画）。
     w_exr=白バッキング（RGB=T×素板・α=全投影雲α）/ geomask_exr=ジオメトリ有無 /
     veil_exr=黒バッキング素照明（RGB=雲ベール輝度）/ bg_png=雲なしBeauty。
@@ -1827,6 +1828,8 @@ def compose_visible_cloud_h5(w_exr, geomask_exr, veil_exr, bg_png,
     大気ヘイズは正確に相殺される（HV だけの旧3レンダ方式は中距離の層雲を
     取りこぼす実測 2026-08-26）。空領域はαではなく T=1 の同式で合成する。
     出力: α=可視雲量の RGBA PNG。パラメータは _VIS_CLOUD_K ほか（モジュール定数）。
+    norm に dict を渡すと正規化値（plate/v99）を共有する: キーが有れば使い、
+    無ければ計算して書き込む（映像でフレーム毎に正規化が揺れてチラつくのを防ぐ）。
     戻り値: 出力パス（失敗時 None）。"""
     if not (_HAS_NUMPY and _HAS_PIL):
         return None
@@ -1845,7 +1848,12 @@ def compose_visible_cloud_h5(w_exr, geomask_exr, veil_exr, bg_png,
         vis = A
     else:
         geo = Gm > 0.5
-        plate = float(_np.percentile(W[geo], 99)) if geo.sum() else 0.0
+        if norm is not None and "plate" in norm:
+            plate = float(norm["plate"])
+        else:
+            plate = float(_np.percentile(W[geo], 99)) if geo.sum() else 0.0
+            if norm is not None and plate > 1e-6:
+                norm["plate"] = plate
         if plate <= 1e-6:
             _warn("可視雲H5: 素板レベルを推定できません")
             return None
@@ -1853,9 +1861,14 @@ def compose_visible_cloud_h5(w_exr, geomask_exr, veil_exr, bg_png,
         if Vn0 is not None:
             V = _np.clip(V - Vn0, 0.0, None)   # ペア差分＝純粋な雲ベール輝度
             T = _np.where(geo, T, 1.0)         # 空は「明るい背景」として同式で扱う
-        vv = V[V > 1e-6]
-        V = _np.clip(V / max(float(_np.percentile(vv, 99)) if vv.size else 1.0,
-                             1e-6), 0.0, 1.0)
+        if norm is not None and "v99" in norm:
+            v99 = float(norm["v99"])
+        else:
+            vv = V[V > 1e-6]
+            v99 = float(_np.percentile(vv, 99)) if vv.size else 1.0
+            if norm is not None and v99 > 1e-6:
+                norm["v99"] = v99
+        V = _np.clip(V / max(v99, 1e-6), 0.0, 1.0)
         try:
             bg_im = _PILImage.open(bg_png).convert("L")
             if bg_im.size != (W.shape[1], W.shape[0]):
@@ -1884,6 +1897,60 @@ def compose_visible_cloud_h5(w_exr, geomask_exr, veil_exr, bg_png,
          % (out_rgba_png, _VIS_CLOUD_K, _VIS_CLOUD_CURVE_G,
             _VIS_SUN_BOOST_S, _VIS_SUN_BOOST_P, _VIS_DENSE_GAMMA))
     return out_rgba_png
+
+
+def compose_visible_cloud_h5_sequence(output_dir, name_body, take_str,
+                                      ffmpeg=None):
+    """映像用: H5 ペア方式の4レンダ連番（CloudMatte=白W+GeoMask / CloudVeil /
+    CloudVeil0 / CloudBG）から可視雲 RGBA PNG 連番を作る。正規化（素板レベル・
+    ベールp99）は最初の成功フレームで固定（フレーム間のチラつき防止）。
+    使用済みの EXR と CloudBG PNG は削除する。書いたフレーム数を返す。"""
+    pat = re.compile(re.escape("%s_CloudMatte_%s." % (name_body, take_str))
+                     + r"(\d+)\.exr$")
+    frames = {}
+    for f in os.listdir(output_dir):
+        m = pat.match(f)
+        if m:
+            frames[m.group(1)] = f
+    n = 0
+    norm = {}
+    for fr in sorted(frames):
+        wp = os.path.join(output_dir, frames[fr])
+        gp = os.path.join(output_dir,
+                          "%s_GeoMask_%s.%s.exr" % (name_body, take_str, fr))
+        vp = os.path.join(output_dir,
+                          "%s_CloudVeil_%s.%s.exr" % (name_body, take_str, fr))
+        v0 = os.path.join(output_dir,
+                          "%s_CloudVeil0_%s.%s.exr" % (name_body, take_str, fr))
+        bg = os.path.join(output_dir,
+                          "%s_CloudBG_%s.%s.png" % (name_body, take_str, fr))
+        op = os.path.join(output_dir,
+                          "%s_CloudMatte_%s.%s.png" % (name_body, take_str, fr))
+        r = compose_visible_cloud_h5(
+            wp, gp if os.path.isfile(gp) else None,
+            vp if os.path.isfile(vp) else None,
+            bg, op, ffmpeg=ffmpeg,
+            veil_none_exr=v0 if os.path.isfile(v0) else None,
+            norm=norm)
+        if r:
+            n += 1
+    # 中間素材は後段（PNG合成・MP4）で不要なので削除
+    for f in list(os.listdir(output_dir)):
+        drop = False
+        for tag in ("CloudMatte", "GeoMask", "CloudVeil", "CloudVeil0"):
+            if (f.startswith("%s_%s_%s." % (name_body, tag, take_str))
+                    and f.endswith(".exr")):
+                drop = True
+        if (f.startswith("%s_CloudBG_%s." % (name_body, take_str))
+                and f.endswith(".png")):
+            drop = True
+        if drop:
+            try:
+                os.remove(os.path.join(output_dir, f))
+            except Exception:
+                pass
+    _log("可視雲H5マット(ペア方式): %d フレーム合成" % n)
+    return n
 
 
 def backing_t_png(white_path, out_path, ffmpeg=None, scale=None):

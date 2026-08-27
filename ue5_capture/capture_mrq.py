@@ -1267,6 +1267,7 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
                     light_pass=False, light_direct=False,
                     light_label="RawLightingFull",
                     cloud_matte_actors=None, cloud_visible=False,
+                    cloud_backing=None, cloud_sources_off=False,
                     geomask_material=None,
                     backing_actors=None, backing_white=False, use_exr=False,
                     sky_matte=False):
@@ -1333,9 +1334,19 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
         saved_objid = _set_objid_render_mode(objid_actors)
     saved_vis = None
     if cloud_matte_actors and cloud_visible:
-        # 可視雲モード: 何も隠さず PIE 側で白バッキング化（深度順序が保たれる）
-        saved_vis = {"pie": _start_pie_backing_white(cloud_matte_actors),
-                     "fills": _spawn_cloud_fill_lights(20.0)}
+        # 可視雲モード: 何も隠さず PIE 側でバッキング材化（深度順序が保たれる）。
+        # cloud_backing は静止画タブと同義: "white"=T測定(白発光100+微弱fill) /
+        # "black"=ベール輝度(純黒+fillなし) / None=従来の黒+20lux（旧L方式）
+        white = (cloud_backing == "white")
+        fills = (5.0 if cloud_backing == "white"
+                 else 0.0 if cloud_backing == "black" else 20.0)
+        saved_vis = {"pie": _start_pie_backing_white(cloud_matte_actors,
+                                                     white=white),
+                     "fills": _spawn_cloud_fill_lights(fills)}
+        if cloud_sources_off:
+            # 雲なしベール（CloudVeil0）: UDS の雲内フォグ板も PIE 側で隠す
+            # （HV は hidden_actors・雲レイヤーは ShowFlag.Cloud 0 が受け持つ）
+            saved_vis["plane_hider"] = _start_pie_udsplane_hider()
     elif cloud_matte_actors:
         # 分離モード固定（render_beauty 側の注記参照。holdout は UE5.7 で出力が壊れている）
         saved_cloud = _set_cloud_matte_mode(cloud_matte_actors, use_holdout=False)
@@ -1387,6 +1398,7 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
                                       light_pass, light_direct, light_label,
                                       cloud_matte=bool(cloud_matte_actors),
                                       cloud_visible=cloud_visible,
+                                      cloud_sources_off=cloud_sources_off,
                                       geomask_material=geomask_material,
                                       backing=bool(backing_actors), use_exr=use_exr,
                                       sky_matte=sky_matte)
@@ -1411,7 +1423,8 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
                            near_clip_cm, beauty_label, fog_off, restore_scene, on_done,
                            light_pass=False, light_direct=False,
                            light_label="RawLightingFull", cloud_matte=False,
-                           cloud_visible=False, geomask_material=None,
+                           cloud_visible=False, cloud_sources_off=False,
+                           geomask_material=None,
                            backing=False, use_exr=False, sky_matte=False):
     queue = sub.get_queue()
     for j in list(queue.get_jobs()):
@@ -1529,11 +1542,20 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
         pairs += list(_DIRECT_ONLY_CVARS)
         _log("direct lighting only (GI/Sky/AO off)")
     if cloud_matte:
-        # ShowFlag.Cloud は HV も巻き込むため不使用（render_beauty 側の注記参照）
+        # ShowFlag.Cloud は HV も巻き込むため通常は不使用（render_beauty 側の注記参照）
         pairs += [("r.PostProcessing.PropagateAlpha", 1),
-                  ("ShowFlag.Atmosphere", 0), ("ShowFlag.Fog", 0),
-                  ("ShowFlag.VolumetricFog", 0)]
-        _log("cloud matte (alpha / atmosphere+fog off)")
+                  ("ShowFlag.Fog", 0), ("ShowFlag.VolumetricFog", 0)]
+        if cloud_visible:
+            # 可視雲(H5ペア)系は大気・雲レイヤーを生かす（静止画タブと同じ）。
+            # CloudVeil0 だけ ShowFlag.Cloud 0 でレイヤーを消す（HV は
+            # hidden_actors・フォグ板は PIE ウォッチャが受け持つ）。
+            if cloud_sources_off:
+                pairs.append(("ShowFlag.Cloud", 0))
+            _log("cloud matte (visible / atmosphere on / fog off%s)"
+                 % (" / cloud-layer off" if cloud_sources_off else ""))
+        else:
+            pairs.append(("ShowFlag.Atmosphere", 0))
+            _log("cloud matte (alpha / atmosphere+fog off)")
     if sky_matte:
         # 空マット: PPマテリアル(スタイライズ等)とブルームを切る。大気・雲は
         # ShowFlag で明示的に ON（環境光と雲の維持。ue-sky-matte-capture 実証）

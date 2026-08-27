@@ -1763,9 +1763,10 @@ class CaptureWindow(object):
                 _after_encode(True)
 
         def _run_cloud_matte(ok, od):
-            """雲(HV)マットの専用ジョブ。Matteの前と共用のときは従来の分離モードα
-            （遮蔽なし全投影）、雲マット/Normal 用の単独ジョブなら可視雲モード
-            （白バッキング化＝深度順序どおり。雲を貫く物体はマットに乗らない）。
+            """雲マットの専用ジョブ群。Matteの前と共用のときは従来の分離モードα
+            （遮蔽なし全投影・1ジョブ）、雲マット/Normal 用の単独出力なら静止画タブと
+            同じ H5 ペア方式（白W+GeoMask → ベールAll → ベールNone → 雲なしBG の
+            4ジョブ・UDS雲レイヤー/フォグ板の雲も拾う・深度順序どおり）。
             失敗してもメイン素材の後処理は完走する（注記のみ）。"""
             if not (ok and cloud_seq["run"]):
                 _run_backing_w(ok, od)
@@ -1778,45 +1779,94 @@ class CaptureWindow(object):
                 except Exception:
                     seq_notes.append("雲マット: GeoMask 生成失敗（遮蔽反映なしで続行）")
 
-            def _cloud_done(cok, cod):
-                if not cok:
-                    cloud_seq["run"] = False
-                    seq_notes.append("雲マット: レンダ失敗")
-                elif vis_mode:
-                    n = core.compose_visible_cloud_sequence(
-                        out, name_body, take_str,
-                        ffmpeg=core.find_ffmpeg(getattr(self, "_ffmpeg_hint", None)))
-                    if n <= 0:
-                        cloud_seq["run"] = False
-                        seq_notes.append("雲マット: 可視雲合成失敗")
+            def _cleanup_geo():
                 if geo_mat is not None:
                     core.delete_temp_geomask_material()
+
+            def _abort(note, od):
+                cloud_seq["run"] = False
+                seq_notes.append(note)
+                _cleanup_geo()
                 _run_backing_w(True, od)
 
-            self.status_var.set("雲マット(CloudMatte)をレンダ中… (%s)"
-                                % ("可視雲=白バッキング" if vis_mode else "分離モードα"))
-            self.root.update()
-            try:
-                capture_mrq.render_sequence(
-                    seq, out, W, H, name_body, take_str,
-                    do_png=True, do_mp4=False,
-                    # αのみのパスは TS=1 固定（TS>1 は空サブフレーム平均でαが
-                    # 1/TS に希釈される・実測）。モーションブラーは付かないが
-                    # 雲はソフトエッジなので Beauty とのエッジ差は許容範囲。
-                    temporal_samples=1, warmup=warm,
-                    custom_start=cs, custom_end=ce,
-                    cloud_matte_actors=cloud_vols_job,
-                    cloud_visible=vis_mode, geomask_material=geo_mat,
-                    use_exr=vis_mode,
-                    beauty_label="CloudMatte",
-                    fog_off=self.seq_fog_var.get(), on_done=_cloud_done)
-            except Exception as e:
-                cloud_seq["run"] = False
-                seq_notes.append("雲マット: 起動失敗")
-                self.status_var.set("雲マット起動失敗: %s" % e)
-                if geo_mat is not None:
-                    core.delete_temp_geomask_material()
+            # αのみ/バッキング系パスは TS=1 固定（TS>1 は空サブフレーム平均でαが
+            # 1/TS に希釈される・実測）。モーションブラーは付かないが雲はソフト
+            # エッジなので Beauty とのエッジ差は許容範囲。
+            def _render(label, cb, **kw):
+                self.status_var.set("雲マット: %s をレンダ中…" % label)
+                self.root.update()
+                try:
+                    capture_mrq.render_sequence(
+                        seq, out, W, H, name_body, take_str,
+                        do_png=True, do_mp4=False,
+                        temporal_samples=1, warmup=warm,
+                        custom_start=cs, custom_end=ce,
+                        fog_off=self.seq_fog_var.get(), on_done=cb, **kw)
+                except Exception as e:
+                    self.status_var.set("雲マット起動失敗: %s" % e)
+                    _abort("雲マット: 起動失敗 (%s)" % label, od)
+
+            if not vis_mode:
+                # 従来の分離モードα（Matteの前の合成と共用・意味を変えない）
+                def _cloud_done(cok, cod):
+                    if not cok:
+                        cloud_seq["run"] = False
+                        seq_notes.append("雲マット: レンダ失敗")
+                    _cleanup_geo()
+                    _run_backing_w(True, od)
+                _render("CloudMatte(分離α)", _cloud_done,
+                        cloud_matte_actors=cloud_vols_job,
+                        beauty_label="CloudMatte")
+                return
+
+            # H5 ペア方式 4ジョブチェーン（静止画タブの cloudvis/cloudveil/
+            # CloudVeil0/CloudBG と同構成）
+            def _bg_done(cok, cod):
+                if not cok:
+                    _abort("雲マット: CloudBG レンダ失敗", od)
+                    return
+                n = core.compose_visible_cloud_h5_sequence(
+                    out, name_body, take_str,
+                    ffmpeg=core.find_ffmpeg(getattr(self, "_ffmpeg_hint", None)))
+                if n <= 0:
+                    _abort("雲マット: H5合成失敗", od)
+                    return
+                _cleanup_geo()
                 _run_backing_w(True, od)
+
+            def _veil0_done(cok, cod):
+                if not cok:
+                    _abort("雲マット: CloudVeil0 レンダ失敗", od)
+                    return
+                _render("CloudBG(雲なし背景)", _bg_done,
+                        hidden_actors=list(cloud_vols_job),
+                        beauty_label="CloudBG")
+
+            def _veil_done(cok, cod):
+                if not cok:
+                    _abort("雲マット: CloudVeil レンダ失敗", od)
+                    return
+                _render("CloudVeil0(雲なしベール)", _veil0_done,
+                        cloud_matte_actors=cloud_vols_job,
+                        cloud_visible=True, cloud_backing="black",
+                        cloud_sources_off=True,
+                        hidden_actors=list(cloud_vols_job),
+                        use_exr=True, beauty_label="CloudVeil0")
+
+            def _w_done(cok, cod):
+                if not cok:
+                    _abort("雲マット: CloudMatte(白) レンダ失敗", od)
+                    return
+                _render("CloudVeil(ベール)", _veil_done,
+                        cloud_matte_actors=cloud_vols_job,
+                        cloud_visible=True, cloud_backing="black",
+                        use_exr=True, beauty_label="CloudVeil")
+
+            _render("CloudMatte(白バッキングT)", _w_done,
+                    cloud_matte_actors=cloud_vols_job,
+                    cloud_visible=True, cloud_backing="white",
+                    geomask_material=geo_mat,
+                    use_exr=True, beauty_label="CloudMatte")
 
         def _run_backing_w(ok, od):
             """バッキングレンダ（板=白発光100・露出固定・EXR・TS=1・何も隠さない）。
