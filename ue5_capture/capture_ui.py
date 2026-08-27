@@ -1191,7 +1191,12 @@ class CaptureWindow(object):
                                           temporal_samples=(1 if (j.get("cloud_kind")
                                                                   or j.get("ts1"))
                                                             else ts),
-                                          warmup=warm,
+                                          # 雲ヘルパー系は露出固定・適応なしなので
+                                          # ウォームアップ 8 で足りる（固定費削減）
+                                          warmup=(min(warm, 8)
+                                                  if (j.get("cloud_kind")
+                                                      or j.get("ts1"))
+                                                  else warm),
                                           file_basename=j["base"],
                                           hidden_actors=j.get("hidden"),
                                           near_clip_cm=j.get("near_clip"),
@@ -1792,14 +1797,21 @@ class CaptureWindow(object):
             # αのみ/バッキング系パスは TS=1 固定（TS>1 は空サブフレーム平均でαが
             # 1/TS に希釈される・実測）。モーションブラーは付かないが雲はソフト
             # エッジなので Beauty とのエッジ差は許容範囲。
-            def _render(label, cb, **kw):
+            # ウォームアップは 8 にキャップ（露出固定・適応なしのパスで長い
+            # ウォームアップは不要。ヘルパー4本×24フレーム分の固定費を削る）。
+            def _render(label, cb, half_res=False, **kw):
                 self.status_var.set("雲マット: %s をレンダ中…" % label)
                 self.root.update()
+                rw, rh = (W, H)
+                if half_res:
+                    # CloudBG は H5 式の分母（なだらかな背景輝度）専用。合成側が
+                    # 自動リサイズするので半分解像度で画素コスト 1/4 に
+                    rw, rh = max(W // 2, 2) & ~1, max(H // 2, 2) & ~1
                 try:
                     capture_mrq.render_sequence(
-                        seq, out, W, H, name_body, take_str,
+                        seq, out, rw, rh, name_body, take_str,
                         do_png=True, do_mp4=False,
-                        temporal_samples=1, warmup=warm,
+                        temporal_samples=1, warmup=min(warm, 8),
                         custom_start=cs, custom_end=ce,
                         fog_off=self.seq_fog_var.get(), on_done=cb, **kw)
                 except Exception as e:
@@ -1838,7 +1850,7 @@ class CaptureWindow(object):
                 if not cok:
                     _abort("雲マット: CloudVeil0 レンダ失敗", od)
                     return
-                _render("CloudBG(雲なし背景)", _bg_done,
+                _render("CloudBG(雲なし背景)", _bg_done, half_res=True,
                         hidden_actors=list(cloud_vols_job),
                         beauty_label="CloudBG")
 
