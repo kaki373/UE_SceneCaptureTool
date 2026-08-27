@@ -713,8 +713,17 @@ def _capture_depth(world, settings, cam, w, h, ts, spawned):
         hidden = _resolve_target_actors(settings.matte_actors, settings.matte_actor_names)
         if hidden:
             _log("Depth: Matte 対象 %d 個を深度から除外" % len(hidden))
-    depth = _render_depth_r(world, cam, w * aa, h * aa, spawned, hidden_actors=hidden)
-    depth = _downscale(depth, aa)  # cm 単位の距離（空/未ヒットは half 最大 ~65504）
+    # RGBA32F で撮る: 16F だと空/未ヒットと 655m 超が half 最大 65504cm に飽和し、
+    # far>655m のとき空が「far より手前」扱いでグレーに残る（far=700m で空 6.4%
+    # グレーの実測 2026-08-27）。32F が定数値（R32F 系バグ該当）なら 16F へ退避
+    depth = _render_depth_r(world, cam, w * aa, h * aa, spawned,
+                            hidden_actors=hidden,
+                            fmt=unreal.TextureRenderTargetFormat.RTF_RGBA32F)
+    if depth is not None and float(_np.ptp(depth)) < 1e-3:
+        _warn("Depth: RGBA32F が定数値 → RGBA16F で再取得（655m 超と空は飽和）")
+        depth = _render_depth_r(world, cam, w * aa, h * aa, spawned,
+                                hidden_actors=hidden)
+    depth = _downscale(depth, aa)  # cm 単位の距離（空/未ヒットは 1e8 オーダー）
 
     near, far = settings.depth_near, settings.depth_far
 
