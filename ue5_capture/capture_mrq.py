@@ -163,9 +163,16 @@ def _lighting_only_class():
 
 
 def _cv_entries(pairs):
-    """(name, value) の並びを MoviePipelineConsoleVariableEntry 配列にする。"""
-    out = []
+    """(name, value) の並びを MoviePipelineConsoleVariableEntry 配列にする。
+    同名が複数入ると MRQ が「適用前の値」を entry ごとに記録するため、2個目は
+    1個目を適用した後の値を元の値だと誤認し、レンダ後の復元でその値がグローバルに
+    残ってしまう（例: Fogなし＋バッキングで r.BloomQuality が二重登録になり、
+    レンダ後もブルームが切れたままになる）。後勝ちで重複を潰してから渡す。"""
+    uniq = {}
     for name, val in pairs:
+        uniq[name] = val            # dict は挿入順を保つ。値だけ後勝ちで上書き
+    out = []
+    for name, val in uniq.items():
         e = unreal.MoviePipelineConsoleVariableEntry()
         e.set_editor_property("name", name)
         e.set_editor_property("value", float(val))
@@ -480,9 +487,17 @@ def _start_render(sub, camera_actor, output_dir, width, height,
     pairs = list(_HQ_CVARS) + [("r.MotionBlurQuality", 0)]   # 静止画はブラー無し
     if matte_material is not None:
         pairs.append(("r.CustomDepth", 3))   # ステンシル書き込みに必要（自動復元）
-    if fog_off:
-        pairs += [("r.Fog", 0), ("r.VolumetricFog", 0)]
-        _log("fog off")
+    if fog_off == "bloom":
+        # グローだけ落としてフォグは残す。fog_off は非同期チェーンを位置引数で
+        # 何段も渡るため、引数を増やさず値で分岐させている（"bloom" は truthy
+        # なので、下の真偽判定より必ず先に見ること）
+        pairs.append(("r.BloomQuality", 0))
+        _log("bloom off (fog kept)")
+    elif fog_off:
+        # 「Fogなし」はポスプロのグロー(ブルーム)も同時に落とす（UI 上も同じ
+        # チェック1個に束ねている。ユーザー指定 2026-08-30）
+        pairs += [("r.Fog", 0), ("r.VolumetricFog", 0), ("r.BloomQuality", 0)]
+        _log("fog off (+bloom off)")
     if light_direct:
         # 直射のみ: LightingOnly が「直接光の落ち影+シェーディングのみ・影は完全な黒」になる。
         pairs += list(_DIRECT_ONLY_CVARS)
@@ -1545,9 +1560,17 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
         # CustomDepth ステンシル書き込みには r.CustomDepth=3 が必要
         # （ObjectID の色分けも Matte/MatteSil のステンシル判定も使う）
         pairs.append(("r.CustomDepth", 3))
-    if fog_off:
-        pairs += [("r.Fog", 0), ("r.VolumetricFog", 0)]
-        _log("fog off")
+    if fog_off == "bloom":
+        # グローだけ落としてフォグは残す。fog_off は非同期チェーンを位置引数で
+        # 何段も渡るため、引数を増やさず値で分岐させている（"bloom" は truthy
+        # なので、下の真偽判定より必ず先に見ること）
+        pairs.append(("r.BloomQuality", 0))
+        _log("bloom off (fog kept)")
+    elif fog_off:
+        # 「Fogなし」はポスプロのグロー(ブルーム)も同時に落とす（UI 上も同じ
+        # チェック1個に束ねている。ユーザー指定 2026-08-30）
+        pairs += [("r.Fog", 0), ("r.VolumetricFog", 0), ("r.BloomQuality", 0)]
+        _log("fog off (+bloom off)")
     if light_direct:
         pairs += list(_DIRECT_ONLY_CVARS)
         _log("direct lighting only (GI/Sky/AO off)")

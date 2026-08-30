@@ -241,11 +241,12 @@ _EDITOR_ONLY_SHOW_FLAGS = [
 
 def _apply_game_show_flags(comp, fog_off=False):
     """キャプチャコンポーネントのエディタ専用表示を OFF にする（ゲーム表示相当）。
-    fog_off=True なら Fog / 大気 / ボリューメトリックフォグ も OFF にする。"""
+    fog_off=True なら Fog / 大気 / ボリューメトリックフォグ に加え、ポスプロの
+    グロー(Bloom) も OFF にする（UI の「Fogなし」1個に束ねている）。"""
     try:
         names = list(_EDITOR_ONLY_SHOW_FLAGS)
         if fog_off:
-            names += ["Fog", "AtmosphericFog", "VolumetricFog"]
+            names += ["Fog", "AtmosphericFog", "VolumetricFog", "Bloom"]
         settings = []
         for name in names:
             try:
@@ -365,7 +366,12 @@ def _read_rt_raw_r(world, rt, width, height):
 
 
 # 深度の「空/未ヒット」判定しきい値。RGBA16F(half) の未ヒット値 ~65504 を検出する。
+# ⚠️ これは同時に「600m より遠い実ジオメトリも空とみなす」ことを意味する。
+# RGBA16F は 65504cm(655m) で飽和するので 16F ではこれ以上は分離できない。
 _DEPTH_FAR_CM = 60000.0
+# RGBA32F で撮ったときの「空/ファープレーン」しきい値（measure_depth_range と同値）。
+# 32F なら 655m を超える実ジオメトリと空を区別できる。
+_DEPTH_FAR_32F = 1.0e7
 
 
 def _visible_mask(target_depth, full_depth):
@@ -1396,15 +1402,34 @@ def composite_behind_sequence(output_dir, name_body, take_str):
 
 
 def matte_near_clip_cm(actors, cam):
-    """カメラからマット代表点までの『視線方向』距離(cm)を返す。MRQ の r.SetNearClipPlane 用
-    （fronto-parallel 近似の behind-matte）。マット面がほぼ正対している前提。"""
-    cam_loc = cam["transform"].translation
-    fwd = cam["transform"].rotation.rotator().get_forward_vector()
-    a = min(actors, key=lambda x: (x.get_actor_location() - cam_loc).length())
-    base = a.get_actor_location()
-    to = unreal.Vector(base.x - cam_loc.x, base.y - cam_loc.y, base.z - cam_loc.z)
-    dist = to.x * fwd.x + to.y * fwd.y + to.z * fwd.z
-    return max(1.0, float(dist))
+    """マット対象が実際に画面に写っている画素のうち、視線方向いちばん手前の距離(cm)。
+    低解像度の show-only 深度を1枚撮って実測する。
+    バウンズ8隅の射影だと視錐台の外まで数えるので、寝た板では桁が変わる（実測
+    2026-08-30 matPlane6: 隅の最大 1001m に対し画面内の実測最近は 361m。1001m で
+    クリップすると板の裏に見えるべき背景を 640m 分削り、プレートに穴が開く）。
+    r.SetNearClipPlane は視線に垂直な平面しか作れないため、傾いた板ではどのスカラー
+    を選んでも誤差は残る。ここでは『正しい背景を消さない』側＝最近距離を採る
+    （手前の遮蔽物が少し残るほうが、板の裏に穴が開くより軽い）。
+    ⚠️ 厳密には斜めクリップ面が要る。SceneCapture2D は clip_plane_base/normal で
+    対応済みだが MRQ には手段が無い。cam は fov を含む get_camera_settings() の戻り値。"""
+    if not _HAS_NUMPY:
+        raise RuntimeError("numpy がありません（near-clip 実測に必要）")
+    world = _get_editor_world()
+    tmp = []
+    try:
+        d = _render_depth_r(world, cam, 480, 270, tmp, show_only_actors=actors,
+                            fmt=unreal.TextureRenderTargetFormat.RTF_RGBA32F)
+        far = _DEPTH_FAR_32F
+        if d is not None and float(_np.ptp(d)) < 1e-3:
+            # 32F が定数値（UE5.7 の深度RTバグ）→ 16F へ退避（655m 超は測れない）
+            d = _render_depth_r(world, cam, 480, 270, tmp, show_only_actors=actors)
+            far = _DEPTH_FAR_CM
+    finally:
+        _destroy_actors(tmp)
+    v = d[(d > 1.0) & (d < far)] if d is not None else None
+    if v is None or v.size < 16:
+        raise RuntimeError("マット対象が画面内に見当たりません（near-clip 測定不能）")
+    return max(1.0, float(v.min()))
 
 
 def render_matte_sil_sequence(output_dir, name_body, take_str, start, end,
@@ -1425,6 +1450,7 @@ def render_matte_sil_sequence(output_dir, name_body, take_str, start, end,
     except Exception:
         t0 = None
     n = 0
+    use32 = True          # 1フレーム目で 32F が使えるか判定し、以降は使い回す
     try:
         for fr in range(int(start), int(end) + 1):
             cam_actor = camera_for_frame(fr)
@@ -1434,11 +1460,30 @@ def render_matte_sil_sequence(output_dir, name_body, take_str, start, end,
             cam = get_camera_settings(cam_actor)
             tmp = []
             try:
-                d = _render_depth_r(world, cam, width * aa, height * aa, tmp,
-                                    show_only_actors=actors)
+                # RGBA32F で撮る。既定の RGBA16F は 65504cm(655m) で飽和するため、
+                # _DEPTH_FAR_CM(600m) より遠いマット面が「未ヒット＝空」と同じ値に
+                # なり、シルエットから白く抜け落ちる。抜けた側は合成で Beauty が
+                # 選ばれるので、映像に「マットの手前」が出る（実測 2026-08-30
+                # AV003A take015: 板が視線方向 545〜1156m に跨り、600m の等距離線
+                # x≒1008 を境に Behind が左右で前後に割れた）。
+                if use32:
+                    d = _render_depth_r(
+                        world, cam, width * aa, height * aa, tmp,
+                        show_only_actors=actors,
+                        fmt=unreal.TextureRenderTargetFormat.RTF_RGBA32F)
+                    if d is not None and float(_np.ptp(d)) < 1e-3:
+                        # 32F が全画素一定（UE5.7 の深度RTバグ該当）→ 以降 16F。
+                        # この場合 655m 超のマット面は救えない
+                        _warn("MatteSil: RGBA32F が定数値のため RGBA16F へ退避"
+                              "（655m 超のマット面はシルエットから抜けます）")
+                        use32 = False
+                if not use32:
+                    d = _render_depth_r(world, cam, width * aa, height * aa, tmp,
+                                        show_only_actors=actors)
             finally:
                 _destroy_actors(tmp)
-            sil = _downscale((d < _DEPTH_FAR_CM).astype(_np.float32) * 255.0, aa)
+            far = _DEPTH_FAR_32F if use32 else _DEPTH_FAR_CM
+            sil = _downscale((d < far).astype(_np.float32) * 255.0, aa)
             out = os.path.join(output_dir,
                                "%s_MatteSil_%s.%04d.png" % (name_body, take_str, fr))
             _write_png_u8(out, 255.0 - sil)     # 選択=黒 / 周囲=白
@@ -1671,6 +1716,53 @@ def apply_cloud_black_to_pass_frames(output_dir, name_body, take_str, pass_name)
         except Exception as e:
             _warn("%s の雲抜きに失敗 %s: %s" % (pass_name, f, e))
     _log("%s の雲抜き: %d フレーム" % (pass_name, n))
+    return n
+
+
+def apply_matte_black(path, matte_path):
+    """画像のマット対象領域を黒に落とす: img' = img × (Matte/255)。
+    matte_path は Matte 連番（選択=黒 / それ以外=白 の可視性マスク）。
+    遮蔽考慮済みなので、マットより手前のキャラ等は白のまま＝黒く塗られない。
+    全投影シルエットの MatteSil を使うと手前のキャラまで潰れるので使わないこと。
+    Normal(RGB) と Depth(8bit RGB / 16bit I;16 グレー) に対応。
+    マスクはほぼ二値なので、雲αで必要だったリニア空間での乗算補正は要らない
+    （効くのは縁の中間画素だけで、しかも黒へ寄せる方向）。
+    ⚠️ Depth の EXR 生cm は 0=カメラ位置になり意味が壊れるため呼ばないこと。"""
+    if not (_HAS_NUMPY and _HAS_PIL):
+        raise RuntimeError("numpy/Pillow がありません（マット黒塗りに必要）")
+    mm = _PILImage.open(matte_path).convert("L")
+    im = _PILImage.open(path)
+    if mm.size != im.size:
+        mm = mm.resize(im.size)
+    keep = _np.asarray(mm).astype(_np.float32) / 255.0
+    if im.mode in ("I;16", "I"):
+        arr = _np.asarray(im).astype(_np.float32) / 65535.0
+        _write_png_u16_gray(path, arr * keep)
+    else:
+        arr = _np.asarray(im.convert("RGB")).astype(_np.float32)
+        out = (_np.clip(arr * keep[:, :, None], 0.0, 255.0) + 0.5).astype(_np.uint8)
+        _PILImage.fromarray(out, "RGB").save(path)
+
+
+def apply_matte_black_to_pass_frames(output_dir, name_body, take_str, pass_name):
+    """<pass_name> 連番の各フレームへ同フレームの Matte を乗算し、マット対象が
+    写っている画素を黒にする。処理したフレーム数を返す（Matte 連番が無ければ 0）。"""
+    prefix = "%s_%s_%s." % (name_body, pass_name, take_str)
+    n = 0
+    for f in sorted(os.listdir(output_dir)):
+        if not (f.startswith(prefix) and f.endswith(".png")):
+            continue
+        frame = f[len(prefix):-4]
+        mf = os.path.join(output_dir,
+                          "%s_Matte_%s.%s.png" % (name_body, take_str, frame))
+        if not os.path.isfile(mf):
+            continue
+        try:
+            apply_matte_black(os.path.join(output_dir, f), mf)
+            n += 1
+        except Exception as e:
+            _warn("%s のマット黒塗りに失敗 %s: %s" % (pass_name, f, e))
+    _log("%s のマット黒塗り: %d フレーム" % (pass_name, n))
     return n
 
 

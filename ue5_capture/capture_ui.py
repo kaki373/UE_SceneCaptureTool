@@ -258,7 +258,7 @@ class CaptureWindow(object):
         ttk.Checkbutton(mrqf2, text="カメラのアスペクト",
                         variable=self.mrq_camasp_var).pack(side="left")
         self.fog_off_var = tk.BooleanVar(master=self.root, value=False)
-        ttk.Checkbutton(mrqf2, text="Fogなし", variable=self.fog_off_var).pack(
+        ttk.Checkbutton(mrqf2, text="Fog/グローなし", variable=self.fog_off_var).pack(
             side="left", padx=(8, 0))
         # VDB雲モード: Auto=レベルに HV(VDB雲) があれば自動で雲対応（バッキングT/
         # 雲ObjectID/Behindの手前雲hide）。ON=検出に関わらず強制有効。
@@ -451,7 +451,7 @@ class CaptureWindow(object):
         row += 1
         seqf2 = ttk.Frame(frm)
         self.seq_fog_var = tk.BooleanVar(master=self.root, value=False)
-        ttk.Checkbutton(seqf2, text="Fogなし", variable=self.seq_fog_var).pack(side="left")
+        ttk.Checkbutton(seqf2, text="Fog/グローなし", variable=self.seq_fog_var).pack(side="left")
         ttk.Label(seqf2, text="VDB雲:").pack(side="left", padx=(8, 0))
         ttk.Combobox(seqf2, textvariable=self.vdb_var, width=5, state="readonly",
                      values=("Auto", "ON", "OFF")).pack(side="left")
@@ -1035,6 +1035,18 @@ class CaptureWindow(object):
                     except Exception as e:
                         skip_notes.append("%s: 雲抜き失敗" % _lbl)
                         self.status_var.set("%s 雲抜き失敗: %s" % (_lbl, e))
+            # Normal のマット対象を黒に落とす。板マスク単体（Beauty_Matte）を使う:
+            # 雲は直前の雲抜きが _CLOUD_MUL_POW の強度込みで担当しているので、
+            # 雲αを統合した merged を掛けると雲領域が純黒に上書きされてしまう。
+            _mesh_matte = os.path.join(out, _name("Beauty") + "_Matte.png")
+            _normal_png = os.path.join(out, _name("Normal") + ".png")
+            if (normal_pp_mat is not None and os.path.isfile(_mesh_matte)
+                    and os.path.isfile(_normal_png)):
+                try:
+                    core.apply_matte_black(_normal_png, _mesh_matte)
+                except Exception as e:
+                    skip_notes.append("Normal: マット黒塗り失敗")
+                    self.status_var.set("Normal マット黒塗り失敗: %s" % e)
             # 雲マット独立出力: α のまま残っている CloudMatte を白黒マスク（雲=黒）へ
             # 変換して残す
             if want_cloudmatte and os.path.isfile(cm_png):
@@ -1772,6 +1784,12 @@ class CaptureWindow(object):
                     if depth_needed:
                         core.apply_cloud_black_to_pass_frames(
                             out, name_body, take_str, "Depth")
+                if normal_needed and matte_prims:
+                    # Normal のマット対象を黒に。MatteSil(全投影シルエット)ではなく
+                    # 遮蔽考慮の Matte を使うので、マットより手前のキャラは残る。
+                    if core.apply_matte_black_to_pass_frames(
+                            out, name_body, take_str, "Normal") <= 0:
+                        seq_notes.append("Normal のマット黒塗り: Matte 連番が無く未適用")
                 if cloudmatte_needed and cloud_seq["run"]:
                     # 雲マット独立出力: α連番を白黒マスク連番（雲=黒）へ変換
                     # （MP4 エンコード可能に）。Matteの前の合成が α を使い終わってから。
@@ -2091,12 +2109,14 @@ class CaptureWindow(object):
                         ca = None
                     if ca is None:
                         continue
-                    c = {"transform": ca.get_actor_transform()}
+                    c = core.get_camera_settings(ca)
                     if cs_cam is None:
                         cs_cam = c
                     ncs.append(core.matte_near_clip_cm(matte_prims, c))
                 if not ncs:
                     raise RuntimeError("シーケンスカメラを特定できません")
+                # 各フレームの実測最近距離のうち最小＝どのフレームでも背景を
+                # 削らない値。⚠ サンプルは先頭/中間/末尾の3フレームのみ。
                 nc = min(ncs)
                 # HV(雲)は near-clip を無視して写り込むため手前の雲はアクター単位で隠す
                 front_vols = core.volumetrics_nearer_than(nc, cs_cam) if vdb else []
