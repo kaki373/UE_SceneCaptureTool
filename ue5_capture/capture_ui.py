@@ -1690,6 +1690,7 @@ class CaptureWindow(object):
         # 雲マット: 板あり＝バッキング差分（何も隠さない・遮蔽正確）/
         # 板なし（雲のみ対象）＝従来の分離モード（CloudMatte ジョブ）
         backing_seq = {"run": vdb and bool(matte_prims) and _need("mfront")}
+        behind_seq = {"nc": None}   # Behind プレートの near clip（MatteSil の遮蔽判定に流用）
         mfront_cloud = (vdb and bool(matte_vols) and not matte_prims
                         and _need("mfront"))
         # 雲マット独立出力: 対象はレベル内の全VDB雲。Matteの前の雲ジョブと重なる場合は
@@ -1771,7 +1772,8 @@ class CaptureWindow(object):
                 if _need("behind"):
                     ns = core.render_matte_sil_sequence(
                         out, name_body, take_str, cs_eff, ce_eff, matte_prims, W, H,
-                        camera_for_frame=lambda f: self._sequence_camera_at(seq, f))
+                        camera_for_frame=lambda f: self._sequence_camera_at(seq, f),
+                        near_clip_cm=behind_seq["nc"])
                     if ns > 0:
                         core.composite_behind_sequence(out, name_body, take_str)
                     else:
@@ -1827,6 +1829,7 @@ class CaptureWindow(object):
                     drop.append("Matte")
                 if _need("behind"):
                     drop.append("MatteSil")
+                    drop.append("BehindOcc")
                 if rldir_needed:
                     drop.append("DirectPlate")       # 直射ジョブの Beauty（内部素材）
                 for key, _label, pass_name in _SEQ_OUTPUTS:
@@ -2118,6 +2121,7 @@ class CaptureWindow(object):
                 # 各フレームの実測最近距離のうち最小＝どのフレームでも背景を
                 # 削らない値。⚠ サンプルは先頭/中間/末尾の3フレームのみ。
                 nc = min(ncs)
+                behind_seq["nc"] = nc
                 # HV(雲)は near-clip を無視して写り込むため手前の雲はアクター単位で隠す
                 front_vols = core.volumetrics_nearer_than(nc, cs_cam) if vdb else []
             except Exception as e:

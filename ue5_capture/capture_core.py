@@ -382,17 +382,19 @@ def _visible_mask(target_depth, full_depth):
 
 
 def _render_depth_r(world, cam, w, h, spawned, show_only_actors=None,
-                    hidden_actors=None, fmt=None):
+                    hidden_actors=None, fmt=None, clip_base=None, clip_normal=None):
     """SCS_SCENE_DEPTH を1枚撮り、R チャンネル（cm 距離）を float32 (H,W) で返す。
     UE5.7: SceneDepth を R32F へ撮ると全画素一定値になる不具合があるため既定は
     RGBA16F（⚠️ FP16 上限 65504cm≈655m で飽和する）。fmt=RTF_RGBA32F を渡すと
-    655m 超も測れる（4ch 32F は R32F バグの対象外か要実測）。"""
+    655m 超も測れる（4ch 32F は R32F バグの対象外か要実測）。
+    clip_base/clip_normal で描画時クリップ面（_spawn_capture と同じ）。"""
     rt = _make_render_target(world, w, h,
                              fmt or unreal.TextureRenderTargetFormat.RTF_RGBA16F,
                              True)
     actor = _spawn_capture(world, cam["transform"], cam["fov"], rt,
                            unreal.SceneCaptureSource.SCS_SCENE_DEPTH,
-                           show_only_actors=show_only_actors, hidden_actors=hidden_actors)
+                           show_only_actors=show_only_actors, hidden_actors=hidden_actors,
+                           clip_base=clip_base, clip_normal=clip_normal)
     spawned.append(actor)
     return _read_rt_raw_r(world, rt, w, h)
 
@@ -1368,7 +1370,8 @@ def objid_stencil_color(stencil):
     return (_c(h), _c(h - 1.0 / 3.0), _c(h - 2.0 / 3.0))
 
 
-def composite_behind_sequence(output_dir, name_body, take_str):
+def composite_behind_sequence(output_dir, name_body, take_str,
+                              plate_label="BehindPlate", out_label="Behind"):
     """シーケンスレンダの behind 合成。各フレームで MatteSil（マット対象の全投影
     シルエット・選択=黒・遮蔽非依存）をマスクに、黒い部分は BehindPlate、白い部分は
     Beauty を合成した Behind 連番を書く。可視性マスク（Matte）は使わない：マットより
@@ -1378,12 +1381,13 @@ def composite_behind_sequence(output_dir, name_body, take_str):
         return 0
     pat = re.compile(re.escape("%s_Beauty_%s." % (name_body, take_str)) + r"(\d+)\.png$")
     n = 0
+    n_occ = 0
     for f in sorted(os.listdir(output_dir)):
         m = pat.match(f)
         if not m:
             continue
         fr = m.group(1)
-        plate_p = os.path.join(output_dir, "%s_BehindPlate_%s.%s.png" % (name_body, take_str, fr))
+        plate_p = os.path.join(output_dir, "%s_%s_%s.%s.png" % (name_body, plate_label, take_str, fr))
         matte_p = os.path.join(output_dir, "%s_MatteSil_%s.%s.png" % (name_body, take_str, fr))
         if not (os.path.isfile(plate_p) and os.path.isfile(matte_p)):
             _warn("behind 合成: フレーム %s の素材が不足（plate/mattesil）" % fr)
@@ -1394,10 +1398,19 @@ def composite_behind_sequence(output_dir, name_body, take_str):
         matte = _np.asarray(_PILImage.open(matte_p).convert("L"), dtype=_np.float32) / 255.0
         w_plate = (1.0 - matte)[:, :, None]     # Matte は 選択=黒（黒い所ほどプレート）
         comp = plate * w_plate + beauty * (1.0 - w_plate)
-        out = os.path.join(output_dir, "%s_Behind_%s.%s.png" % (name_body, take_str, fr))
+        # BehindOcc（render_matte_sil_sequence の occlusion）: マット面より手前の
+        # ジオメトリが写っている画素は「板の奥」ではないので黒にする。
+        # near clip はマットの最近点1枚なので、傾いた板ではここでしか消せない。
+        occ_p = os.path.join(output_dir, "%s_BehindOcc_%s.%s.png" % (name_body, take_str, fr))
+        if os.path.isfile(occ_p):
+            occ = _np.asarray(_PILImage.open(occ_p).convert("L"), dtype=_np.float32) / 255.0
+            comp = comp * (1.0 - occ * (1.0 - matte))[:, :, None]
+            n_occ += 1
+        out = os.path.join(output_dir, "%s_%s_%s.%s.png" % (name_body, out_label, take_str, fr))
         _write_png_u8(out, _np.clip(comp, 0, 255))
         n += 1
-    _log("behind 合成: %d フレーム出力" % n)
+    _log("behind 合成(%s): %d フレーム出力（手前遮蔽の黒塗り %d フレーム）"
+         % (out_label, n, n_occ))
     return n
 
 
@@ -1433,13 +1446,21 @@ def matte_near_clip_cm(actors, cam):
 
 
 def render_matte_sil_sequence(output_dir, name_body, take_str, start, end,
-                              actors, width, height, camera_for_frame, aa=2):
+                              actors, width, height, camera_for_frame, aa=2,
+                              occlusion=True, near_clip_cm=None):
     """映像 Behind 用: 各フレームをシーケンサーでスクラブ評価し、マット対象の
     全投影シルエット（選択=黒/周囲=白）を show-only 深度から MatteSil 連番として
     書く（静止画側の composite_behind_in_matte と同一手法）。
     メインジョブの MatteSil PP パスは使わない: ObjectID 対象のステンシルが
     「板より手前」の画素でシルエットを上書きして穴を開け、合成が Beauty 側
     （手前オブジェクト入り）を選んでしまう（実測 2026-07-24）。
+    occlusion=True なら同じフレームで「マットを隠した全シーン深度」も撮り、
+    マット面より手前にある画素（白=手前）を BehindOcc 連番として書く。
+    プレートは r.SetNearClipPlane（視線に垂直な1枚）でしか手前を消せないので、
+    傾いた板では『最近点より遠く・板より手前』の物がプレートに残る（実測
+    2026-09-29 AV024 take035: 板 447〜921m・near clip 447m で画面の 3%、左半分に
+    集中）。composite_behind_sequence がこのマスクで該当画素を黒にする。
+    深度を書かない HV(VDB雲)/半透明は判定できない（従来どおりアクター単位で隠す）。
     camera_for_frame(frame) はスクラブ込みでそのフレームのカメラアクターを返す。
     書いたフレーム数を返す。"""
     if not (_HAS_NUMPY and _HAS_PIL):
@@ -1480,6 +1501,27 @@ def render_matte_sil_sequence(output_dir, name_body, take_str, start, end,
                 if not use32:
                     d = _render_depth_r(world, cam, width * aa, height * aa, tmp,
                                         show_only_actors=actors)
+                fmt = (unreal.TextureRenderTargetFormat.RTF_RGBA32F if use32
+                       else unreal.TextureRenderTargetFormat.RTF_RGBA16F)
+                sd = None
+                if occlusion:
+                    # プレートと同じ near clip（r.SetNearClipPlane）を立てて撮る。
+                    # これより手前はプレートでも消えて奥が露出しているので、遮蔽物
+                    # として数えてはいけない（数えると露出した奥まで黒くなる。実測
+                    # 2026-09-29 AV024 take036）。SceneCapture2D の clip_plane は
+                    # プロジェクトの Global Clip Plane が無効だと効かない（同日実測）
+                    # ため、MRQ と同じ cvar を使う。SceneCapture も GNearClippingPlane
+                    # に従う。
+                    if near_clip_cm:
+                        unreal.SystemLibrary.execute_console_command(
+                            world, "r.SetNearClipPlane %f" % float(near_clip_cm))
+                    try:
+                        sd = _render_depth_r(world, cam, width * aa, height * aa, tmp,
+                                             hidden_actors=actors, fmt=fmt)
+                    finally:
+                        if near_clip_cm:
+                            unreal.SystemLibrary.execute_console_command(
+                                world, "r.SetNearClipPlane 10")
             finally:
                 _destroy_actors(tmp)
             far = _DEPTH_FAR_32F if use32 else _DEPTH_FAR_CM
@@ -1487,6 +1529,17 @@ def render_matte_sil_sequence(output_dir, name_body, take_str, start, end,
             out = os.path.join(output_dir,
                                "%s_MatteSil_%s.%04d.png" % (name_body, take_str, fr))
             _write_png_u8(out, 255.0 - sil)     # 選択=黒 / 周囲=白
+            if sd is not None:
+                # マット面より手前（1% + 20cm より手前）にジオメトリがある画素。
+                # 空/未ヒットは「奥」扱い。near clip より手前はクリップ面が効かなかった
+                # 場合の保険として除外（プレート側では消えている）。
+                occ = (d < far) & (sd < far) & (sd < d * 0.99 - 20.0)
+                if near_clip_cm:
+                    occ &= sd > float(near_clip_cm)
+                occ_img = _downscale(occ.astype(_np.float32) * 255.0, aa)
+                _write_png_u8(os.path.join(
+                    output_dir, "%s_BehindOcc_%s.%04d.png" % (name_body, take_str, fr)),
+                    occ_img)                     # 手前=白
             n += 1
     finally:
         if t0 is not None:
