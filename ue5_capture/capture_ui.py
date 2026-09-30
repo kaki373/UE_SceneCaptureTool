@@ -945,7 +945,9 @@ class CaptureWindow(object):
                 front_vols = core.volumetrics_nearer_than(nc, cs_cam) if vdb else []
                 # 凍結静止画のプレートは TS=1 固定（TS>1 は無意味なうえ、クリップの
                 # サブフレーム片効きで手前が半透明ゴースト化する素地になる）
-                jobs.append(dict(hidden=list(mt_p) + front_vols,
+                # 傾いた板の手前（near clip より奥）に残る物もアクター単位で隠す
+                front = core.actors_in_front_of_matte(mt_p, [cs_cam])
+                jobs.append(dict(hidden=list(mt_p) + front_vols + front,
                                  base=_name("BehindPlate"), ts1=True,
                                  near_clip=nc, composite=True, matte=mt_p))
                 if mt_v:
@@ -1690,7 +1692,8 @@ class CaptureWindow(object):
         # 雲マット: 板あり＝バッキング差分（何も隠さない・遮蔽正確）/
         # 板なし（雲のみ対象）＝従来の分離モード（CloudMatte ジョブ）
         backing_seq = {"run": vdb and bool(matte_prims) and _need("mfront")}
-        behind_seq = {"nc": None}   # Behind プレートの near clip（MatteSil の遮蔽判定に流用）
+        # Behind プレートの near clip と隠した手前アクター（MatteSil の遮蔽判定に流用）
+        behind_seq = {"nc": None, "front": []}
         mfront_cloud = (vdb and bool(matte_vols) and not matte_prims
                         and _need("mfront"))
         # 雲マット独立出力: 対象はレベル内の全VDB雲。Matteの前の雲ジョブと重なる場合は
@@ -1773,7 +1776,8 @@ class CaptureWindow(object):
                     ns = core.render_matte_sil_sequence(
                         out, name_body, take_str, cs_eff, ce_eff, matte_prims, W, H,
                         camera_for_frame=lambda f: self._sequence_camera_at(seq, f),
-                        near_clip_cm=behind_seq["nc"])
+                        near_clip_cm=behind_seq["nc"],
+                        hidden_front=behind_seq["front"])
                     if ns > 0:
                         core.composite_behind_sequence(out, name_body, take_str)
                     else:
@@ -2103,6 +2107,7 @@ class CaptureWindow(object):
             # 数フレームをサンプリングした最小距離を使う（fronto-parallel 近似）
             try:
                 ncs = []
+                cams = []
                 cs_cam = None
                 for f in sorted({cs_eff, (cs_eff + ce_eff) // 2,
                                  max(cs_eff, ce_eff - 1)}):
@@ -2115,6 +2120,7 @@ class CaptureWindow(object):
                     c = core.get_camera_settings(ca)
                     if cs_cam is None:
                         cs_cam = c
+                    cams.append(c)
                     ncs.append(core.matte_near_clip_cm(matte_prims, c))
                 if not ncs:
                     raise RuntimeError("シーケンスカメラを特定できません")
@@ -2124,6 +2130,10 @@ class CaptureWindow(object):
                 behind_seq["nc"] = nc
                 # HV(雲)は near-clip を無視して写り込むため手前の雲はアクター単位で隠す
                 front_vols = core.volumetrics_nearer_than(nc, cs_cam) if vdb else []
+                # near clip は視線に垂直な1枚なので、傾いた板の手前に残る物は
+                # アクター単位で隠す（MatteSil の遮蔽判定からも同じ物を外す）
+                front = core.actors_in_front_of_matte(matte_prims, cams)
+                behind_seq["front"] = front
             except Exception as e:
                 # Behind だけ諦めて、レンダ済みのメイン素材の後処理は続行する
                 seq_notes.append("Matteの奥: near-clip 計算失敗のためスキップ")
@@ -2139,7 +2149,8 @@ class CaptureWindow(object):
                     do_png=True, do_mp4=False,
                     temporal_samples=ts, warmup=warm,
                     custom_start=cs, custom_end=ce,
-                    hidden_actors=list(matte_prims) + front_vols, near_clip_cm=nc,
+                    hidden_actors=list(matte_prims) + front_vols + front,
+                    near_clip_cm=nc,
                     beauty_label="BehindPlate",
                     fog_off=self.seq_fog_var.get(), on_done=_run_direct)
             except Exception as e:

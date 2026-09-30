@@ -1447,7 +1447,7 @@ def matte_near_clip_cm(actors, cam):
 
 def render_matte_sil_sequence(output_dir, name_body, take_str, start, end,
                               actors, width, height, camera_for_frame, aa=2,
-                              occlusion=True, near_clip_cm=None):
+                              occlusion=True, near_clip_cm=None, hidden_front=None):
     """映像 Behind 用: 各フレームをシーケンサーでスクラブ評価し、マット対象の
     全投影シルエット（選択=黒/周囲=白）を show-only 深度から MatteSil 連番として
     書く（静止画側の composite_behind_in_matte と同一手法）。
@@ -1461,6 +1461,8 @@ def render_matte_sil_sequence(output_dir, name_body, take_str, start, end,
     2026-09-29 AV024 take035: 板 447〜921m・near clip 447m で画面の 3%、左半分に
     集中）。composite_behind_sequence がこのマスクで該当画素を黒にする。
     深度を書かない HV(VDB雲)/半透明は判定できない（従来どおりアクター単位で隠す）。
+    hidden_front はプレートで隠したアクター（actors_in_front_of_matte）。プレートに
+    写っていないので遮蔽物からも外す（外さないと隠した物の形に黒が残る）。
     camera_for_frame(frame) はスクラブ込みでそのフレームのカメラアクターを返す。
     書いたフレーム数を返す。"""
     if not (_HAS_NUMPY and _HAS_PIL):
@@ -1517,7 +1519,8 @@ def render_matte_sil_sequence(output_dir, name_body, take_str, start, end,
                             world, "r.SetNearClipPlane %f" % float(near_clip_cm))
                     try:
                         sd = _render_depth_r(world, cam, width * aa, height * aa, tmp,
-                                             hidden_actors=actors, fmt=fmt)
+                                             hidden_actors=list(actors) + list(hidden_front or []),
+                                             fmt=fmt)
                     finally:
                         if near_clip_cm:
                             unreal.SystemLibrary.execute_console_command(
@@ -1577,6 +1580,83 @@ def volumetrics_nearer_than(dist_cm, cam):
              + (origin.z - cam_loc.z) * fwd.z)
         d_near = d - (abs(ext.x * fwd.x) + abs(ext.y * fwd.y) + abs(ext.z * fwd.z))
         if d_near < float(dist_cm):
+            out.append(a)
+    return out
+
+
+def _box_in_front_of_planes(origin, ext, planes, cam_locs):
+    """AABB(origin±ext) の8隅すべてが、全ての平面 (base, normal) について、全ての
+    カメラ位置と同じ側にあるか。タプル (x, y, z) の純計算（unreal 非依存）。"""
+    corners = [(origin[0] + sx * ext[0], origin[1] + sy * ext[1], origin[2] + sz * ext[2])
+               for sx in (-1, 1) for sy in (-1, 1) for sz in (-1, 1)]
+
+    def _side(p, base, n):
+        return (p[0] - base[0]) * n[0] + (p[1] - base[1]) * n[1] + (p[2] - base[2]) * n[2]
+
+    for base, n in planes:
+        for c in cam_locs:
+            s = _side(c, base, n)
+            if s == 0.0:
+                return False
+            sign = 1.0 if s > 0.0 else -1.0
+            if any(_side(p, base, n) * sign <= 0.0 for p in corners):
+                return False
+    return True
+
+
+assert _box_in_front_of_planes((0, 0, 5), (1, 1, 1), [((0, 0, 0), (0, 0, 1))], [(0, 0, 9)])
+assert not _box_in_front_of_planes((0, 0, .5), (1, 1, 1), [((0, 0, 0), (0, 0, 1))], [(0, 0, 9)])
+assert not _box_in_front_of_planes((0, 0, -5), (1, 1, 1), [((0, 0, 0), (0, 0, 1))], [(0, 0, 9)])
+
+
+def actors_in_front_of_matte(matte_actors, cams):
+    """バウンズ全体がマット板よりカメラ側にあるメッシュアクターを返す。
+    Matteの奥のプレートではこれらをアクター単位で隠す: r.SetNearClipPlane は視線に
+    垂直な1枚なので、傾いた板では『near clip より遠く・板より手前』の物がプレートに
+    残る（実測 2026-09-29 AV024: 板 447〜921m で手前の柱・アーチが残留。BehindOcc で
+    黒く塗ると黒いシルエットとして残るだけで、その奥は写らない）。
+    板は _matte_clip_plane と同じく『位置 + up ベクトル』の平面とみなす。cams は
+    get_camera_settings() のリスト（動くカメラは複数フレーム分。全てで手前のものだけ）。
+    ⚠ 簡易判定の上限: 板を跨ぐアクターは隠さない（near clip と BehindOcc の黒塗りが
+    受け持つ）。板が複数なら全ての板平面より手前のものだけ。ISM はコンポーネント
+    単位でなくアクターのバウンズで判定。厳密にやるなら画素単位の斜めクリップが要る。"""
+    planes = []
+    for m in matte_actors or []:
+        n = m.get_actor_up_vector()
+        if n.length() < 1e-3:
+            n = m.get_actor_forward_vector()
+        n = n.normal()
+        b = m.get_actor_location()
+        planes.append(((b.x, b.y, b.z), (n.x, n.y, n.z)))
+    cam_locs = []
+    for c in cams or []:
+        t = c["transform"].translation
+        cam_locs.append((t.x, t.y, t.z))
+    if not planes or not cam_locs:
+        return []
+    skip = set(matte_actors)
+    out = []
+    # get_all_level_actors() は LevelInstance の中身を返さない（AV024 の柱は全てそこ）
+    for a in unreal.GameplayStatics.get_all_actors_of_class(
+            _get_editor_world(), unreal.Actor):
+        if a in skip:
+            continue
+        try:
+            # 見えているメッシュを持つ通常アクターだけ。ライト持ち（UDS 等）は隠すと
+            # 照明が変わる。カメラはレンダ視点、HV は volumetrics_nearer_than が受け持つ
+            if (isinstance(a, unreal.CameraActor) or is_volumetric_actor(a)
+                    or not any(c.is_visible() for c in
+                               a.get_components_by_class(unreal.MeshComponent))
+                    or a.get_components_by_class(unreal.LightComponentBase)
+                    or a.is_hidden_ed() or a.get_editor_property("hidden")):
+                continue
+            origin, ext = a.get_actor_bounds(False)
+        except Exception:
+            continue
+        if max(ext.x, ext.y, ext.z) <= 0.0:
+            continue
+        if _box_in_front_of_planes((origin.x, origin.y, origin.z),
+                                   (ext.x, ext.y, ext.z), planes, cam_locs):
             out.append(a)
     return out
 

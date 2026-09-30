@@ -276,6 +276,7 @@ def render_beauty(camera_actor, output_dir, width, height,
                 restore.append(a)
             except Exception:
                 pass
+    pie_hider = _start_pie_actor_hider(restore) if restore else None
     saved_matte = None
     if matte_material is not None:
         saved_matte = _set_matte_render_mode(matte_actors)
@@ -314,6 +315,8 @@ def render_beauty(camera_actor, output_dir, width, height,
         _log("カメラのアスペクト拘束を一時解除（静止画）")
 
     def _restore_scene():
+        if pie_hider:
+            pie_hider["stop"]()
         for a in restore:
             try:
                 a.set_actor_hidden_in_game(False)
@@ -925,6 +928,67 @@ def _start_pie_udsplane_hider():
     return state
 
 
+def _actor_pos_key(a):
+    loc = a.get_actor_location()
+    return (a.get_class().get_name(), round(loc.x), round(loc.y), round(loc.z))
+
+
+def _start_pie_actor_hider(actors):
+    """hidden_actors を PIE ワールド側でも隠すウォッチャ。LevelInstance 内包アクターは
+    PIE で資産から再生成されるため、エディタ側の set_actor_hidden_in_game が伝搬しない
+    （_start_pie_cloud_hider と同じ事情。AV024 の柱・橋は全て LevelInstance 内）。
+    名前は再生成で変わりうるので『クラス名 + ワールド位置(cm丸め)』で照合する。
+    毎 tick 冪等（ストリーミングの遅延流入も拾う）。PIE は破棄されるので復元不要。"""
+    keys = set()
+    for a in actors or []:
+        try:
+            keys.add(_actor_pos_key(a))
+        except Exception:
+            pass
+    state = {"h": None, "done": set(), "seen": False}
+
+    def _stop():
+        h = state.pop("h", None)
+        if h is not None:
+            try:
+                unreal.unregister_slate_post_tick_callback(h)
+            except Exception:
+                pass
+
+    def _tick(dt):
+        try:
+            pie = unreal.get_editor_subsystem(
+                unreal.UnrealEditorSubsystem).get_game_world()
+        except Exception:
+            pie = None
+        if pie is None:
+            if state["seen"]:
+                _stop()        # PIE が終わった → 監視終了
+            return
+        state["seen"] = True
+        n = 0
+        try:
+            for a in unreal.GameplayStatics.get_all_actors_of_class(pie, unreal.Actor):
+                try:
+                    p = a.get_path_name()
+                    if p in state["done"]:
+                        continue
+                    if _actor_pos_key(a) in keys:
+                        a.set_actor_hidden_in_game(True)
+                        state["done"].add(p)
+                        n += 1
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        if n:
+            _log("hidden_actors: PIE 側で %d アクターを非表示（指定 %d）" % (n, len(keys)))
+
+    state["h"] = unreal.register_slate_post_tick_callback(_tick)
+    state["stop"] = _stop
+    return state
+
+
 def _start_pie_cloud_hider(vol_targets):
     """PIE ワールド側で雲以外の描画アクターを隠すウォッチャを開始する。
     LevelInstance 内包アクターは PIE で資産から再生成されるため、エディタ側の
@@ -1353,6 +1417,7 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
                 hidden.append(a)
             except Exception:
                 pass
+    pie_hider = _start_pie_actor_hider(hidden) if hidden else None
     if objid_material is not None:
         saved_objid = _set_objid_render_mode(objid_actors)
     saved_vis = None
@@ -1402,6 +1467,8 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
             _restore_backing_materials(saved_backing)
         if saved_sky:
             _restore_sky_matte_mode(saved_sky)
+        if pie_hider:
+            pie_hider["stop"]()
         for a in hidden:
             try:
                 a.set_actor_hidden_in_game(False)
