@@ -71,7 +71,7 @@ NNN は出力フォルダ内の通し番号）。素材名（クリーン名）�
 ## 主な設定
 - **露出**：MRQ が実カメラの物理露出+PostProcessVolume で描くのでビューポート/ゲームと一致。
   （SceneCapture 単発は eye-adaptation が収束せず暗くなるため Color パスは廃止。露出 UI も無し。）
-- **Resolution**：`Use Camera Setting`（カメラのアスペクトを表示・幅から高さ算出）/ `Override`（W×H、
+- **Resolution**：`カメラ設定`（カメラのアスペクトを表示・幅から高さ算出）/ `指定`（W×H、
   `アスペクト維持` で幅⇄高さ自動）。
 - **Overscan**：ON で元フレームを中央に保ったまま周囲に余白を追加。`%`（一律）/ `px`（**X,Y 別**）。
   実装はカメラ **filmback の sensor 幅/高さを一時拡大→FOV を縦横独立に広げ→レンダ後復元**、解像度も ×(1+f)。
