@@ -51,6 +51,21 @@ def on_open_panel():
                 pass
         try:
             import importlib
+            # レンダ中の reload/UI再構築は、実行中ジョブの executor と
+            # シーン復元コールバックを破壊する（アクターが隠れたまま残る事故の
+            # 実測あり 2026-07-24）。ジョブチェーンの合間も _KEEP で検出して中止。
+            try:
+                busy = unreal.get_editor_subsystem(
+                    unreal.MoviePipelineQueueSubsystem).is_rendering()
+                _m = sys.modules.get("capture_mrq")
+                busy = busy or bool(_m and _m._KEEP.get("executor") is not None)
+            except Exception:
+                busy = False
+            if busy:
+                unreal.log_warning(
+                    "[SceneCapture] レンダリング中のためパネルの再構築を中止しました。"
+                    "完了後にもう一度開いてください。")
+                return
             import capture_core
             import capture_ui
             importlib.reload(capture_core)
