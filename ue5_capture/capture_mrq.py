@@ -145,6 +145,13 @@ _HQ_CVARS = [
 ]
 
 
+def _job_cvars():
+    """全ジョブ共通の cvar。パネルの「露出固定」やスクリプトが unreal モジュール属性
+    `_ue5capture_extra_cvars` に置いた追加分（例 [("r.EyeAdaptationQuality", 0)]）を
+    ジョブ生成時に合流させる。属性は reload をまたいで残る。"""
+    return list(_HQ_CVARS) + list(getattr(unreal, "_ue5capture_extra_cvars", None) or [])
+
+
 # Raw Lighting Direct 用: GI/スカイライト/AO を切って直接光のみにする ShowFlag cvar
 # （cvar なのでレンダ後にエンジンが自動復元。静止画/シーケンスの両ジョブで共用）
 _DIRECT_ONLY_CVARS = [
@@ -487,7 +494,7 @@ def _start_render(sub, camera_actor, output_dir, width, height,
     except Exception:
         pass
 
-    pairs = list(_HQ_CVARS) + [("r.MotionBlurQuality", 0)]   # 静止画はブラー無し
+    pairs = _job_cvars() + [("r.MotionBlurQuality", 0)]   # 静止画はブラー無し
     if matte_material is not None:
         pairs.append(("r.CustomDepth", 3))   # ステンシル書き込みに必要（自動復元）
     if fog_off == "bloom":
@@ -1621,7 +1628,7 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
 
     # モーションブラーは切らない（切ると 24fps でストロボ状の動きになり、
     # MRQ のテンポラルサンプル蓄積ブラーも効かなくなる）→ _HQ_CVARS に含めていない。
-    pairs = list(_HQ_CVARS)
+    pairs = _job_cvars()
     if (objid_material is not None or matte_material is not None
             or matte_sil_material is not None):
         # CustomDepth ステンシル書き込みには r.CustomDepth=3 が必要

@@ -1584,9 +1584,12 @@ def volumetrics_nearer_than(dist_cm, cam):
     return out
 
 
-def _box_in_front_of_planes(origin, ext, planes, cam_locs):
-    """AABB(origin±ext) の8隅すべてが、全ての平面 (base, normal) について、全ての
-    カメラ位置と同じ側にあるか。タプル (x, y, z) の純計算（unreal 非依存）。"""
+def _box_in_front_of_planes(origin, ext, planes, cam_locs, straddle_ratio=0.0):
+    """AABB(origin±ext) が、全ての平面 (base, normal) について、全てのカメラ位置と
+    同じ側にあるか。タプル (x, y, z) の純計算（unreal 非依存）。
+    straddle_ratio>0 なら板を跨ぐ箱も、奥側へはみ出す奥行きが箱の全奥行きの
+    その割合以下（＝大半がカメラ側）なら手前扱いにする。板を跨ぐ細い柱を
+    BehindOcc の黒塗りに回すと黒いシルエットが残るため（AV024 mat_Plane 2026-10-07）。"""
     corners = [(origin[0] + sx * ext[0], origin[1] + sy * ext[1], origin[2] + sz * ext[2])
                for sx in (-1, 1) for sy in (-1, 1) for sz in (-1, 1)]
 
@@ -1599,7 +1602,13 @@ def _box_in_front_of_planes(origin, ext, planes, cam_locs):
             if s == 0.0:
                 return False
             sign = 1.0 if s > 0.0 else -1.0
-            if any(_side(p, base, n) * sign <= 0.0 for p in corners):
+            d = [_side(p, base, n) * sign for p in corners]   # 正=カメラ側
+            dmin, dmax = min(d), max(d)
+            if dmin > 0.0:
+                continue
+            if dmax <= 0.0 or straddle_ratio <= 0.0:
+                return False
+            if -dmin > straddle_ratio * (dmax - dmin):
                 return False
     return True
 
@@ -1607,10 +1616,16 @@ def _box_in_front_of_planes(origin, ext, planes, cam_locs):
 assert _box_in_front_of_planes((0, 0, 5), (1, 1, 1), [((0, 0, 0), (0, 0, 1))], [(0, 0, 9)])
 assert not _box_in_front_of_planes((0, 0, .5), (1, 1, 1), [((0, 0, 0), (0, 0, 1))], [(0, 0, 9)])
 assert not _box_in_front_of_planes((0, 0, -5), (1, 1, 1), [((0, 0, 0), (0, 0, 1))], [(0, 0, 9)])
+# 跨ぎ: 奥へ 0.5 / 全奥行き 2 = 25% → ratio 0.5 なら手前扱い、ratio 0.2 なら跨ぎのまま
+assert _box_in_front_of_planes((0, 0, .5), (1, 1, 1), [((0, 0, 0), (0, 0, 1))], [(0, 0, 9)], 0.5)
+assert not _box_in_front_of_planes((0, 0, .5), (1, 1, 1), [((0, 0, 0), (0, 0, 1))], [(0, 0, 9)], 0.2)
+assert not _box_in_front_of_planes((0, 0, -.5), (1, 1, 1), [((0, 0, 0), (0, 0, 1))], [(0, 0, 9)], 0.5)
 
 
-def actors_in_front_of_matte(matte_actors, cams):
+def actors_in_front_of_matte(matte_actors, cams, straddle_ratio=0.5):
     """バウンズ全体がマット板よりカメラ側にあるメッシュアクターを返す。
+    板を跨ぐアクターも、奥側へのはみ出しが全奥行きの straddle_ratio 以下（大半が
+    手前）なら含める（黒塗りで残る黒い柱対策。0 で従来どおり完全手前のみ）。
     Matteの奥のプレートではこれらをアクター単位で隠す: r.SetNearClipPlane は視線に
     垂直な1枚なので、傾いた板では『near clip より遠く・板より手前』の物がプレートに
     残る（実測 2026-09-29 AV024: 板 447〜921m で手前の柱・アーチが残留。BehindOcc で
@@ -1656,7 +1671,8 @@ def actors_in_front_of_matte(matte_actors, cams):
         if max(ext.x, ext.y, ext.z) <= 0.0:
             continue
         if _box_in_front_of_planes((origin.x, origin.y, origin.z),
-                                   (ext.x, ext.y, ext.z), planes, cam_locs):
+                                   (ext.x, ext.y, ext.z), planes, cam_locs,
+                                   straddle_ratio):
             out.append(a)
     return out
 

@@ -37,6 +37,19 @@ except Exception:
 
 
 # 映像タブの出力素材: (キー, UI ラベル, ファイル素材名)
+# 「露出固定」: 自動露出(Eye Adaptation)をレンダ中だけ切る。MRQ ジョブ内 cvar なので
+# レンダ後にエンジンが復元し、PPV/カメラは変更しない。固定値は適応が収束した明るさに
+# ほぼ一致する（AV024 実測 ±2 L*）。チェーンの全ジョブ（Behind/空マット/雲ヘルパー）に効く。
+_EXPOSURE_LOCK_CVARS = [("r.EyeAdaptationQuality", 0)]
+_EXPOSURE_LOCK_TIP = ("自動露出(Eye Adaptation)をレンダ中だけ切り、フレーム間の明るさの揺れを止める。"
+                      "PPV/カメラは変更せずレンダ後に復元")
+
+
+def _apply_exposure_lock(on):
+    """capture_mrq が全ジョブに合流させる追加 cvar（reload をまたいで残る属性）を設定。"""
+    unreal._ue5capture_extra_cvars = list(_EXPOSURE_LOCK_CVARS) if on else []
+
+
 _SEQ_OUTPUTS = [
     ("beauty", "Beauty", "Beauty"),
     ("depth", "Z-Depth", "Depth"),
@@ -426,6 +439,9 @@ class CaptureWindow(object):
         self._check(r, "Fog/グローなし", self.fog_off_var,
                     "フォグとポスプロのグロー(ブルーム)を切ってレンダする").pack(
             side="left", padx=(14, 0))
+        self.exposure_lock_var = tk.BooleanVar(master=self.root, value=False)
+        self._check(r, "露出固定", self.exposure_lock_var, _EXPOSURE_LOCK_TIP).pack(
+            side="left", padx=(8, 0))
 
         self._group(matf, "基本")
         self.beauty_var = tk.BooleanVar(master=self.root, value=True)
@@ -633,6 +649,9 @@ class CaptureWindow(object):
         self._check(r, "Fog/グローなし", self.seq_fog_var,
                     "フォグとポスプロのグロー(ブルーム)を切ってレンダする").pack(
             side="left", padx=(14, 0))
+        self.seq_exposure_lock_var = tk.BooleanVar(master=self.root, value=False)
+        self._check(r, "露出固定", self.seq_exposure_lock_var, _EXPOSURE_LOCK_TIP).pack(
+            side="left", padx=(8, 0))
 
         mtx = ttk.Frame(matf)
         mtx.pack(fill="x", pady=(4, 0))
@@ -733,6 +752,7 @@ class CaptureWindow(object):
         self.seq_far_var.set(self.far_var.get())
         self.seq_normal_space_var.set(self.normal_space_var.get())
         self.seq_fog_var.set(self.fog_off_var.get())
+        self.seq_exposure_lock_var.set(self.exposure_lock_var.get())
         self.status_var.set("画像キャプチャの設定を映像タブへ転送しました")
 
     # ------------------------------------------------------------- handlers
@@ -805,6 +825,7 @@ class CaptureWindow(object):
             self.status_var.set("MRQ は既にレンダリング中です。完了までお待ちください。")
             return
         importlib.reload(capture_mrq)
+        _apply_exposure_lock(self.exposure_lock_var.get())
         cam = self._current_camera()
         if cam is None:
             self.status_var.set("MRQ: カメラが選択されていません")
@@ -1620,6 +1641,7 @@ class CaptureWindow(object):
             self.status_var.set("MRQ は既にレンダリング中です。完了までお待ちください。")
             return
         importlib.reload(capture_mrq)
+        _apply_exposure_lock(self.seq_exposure_lock_var.get())
         seq = self._current_sequence()
         if seq is None:
             self.status_var.set("シーケンスレンダ: Sequencer でシーケンスを開いてください")
@@ -2299,7 +2321,10 @@ class CaptureWindow(object):
                 wants["behind"] = (False, False)
                 _run_direct(True, od)
                 return
-            self.status_var.set("Matteの奥プレートをレンダ中… (near-clip %.0fcm)" % nc)
+            # 「空マット」も選ばれていれば奥プレートも空黒で撮る（Matteの奥＝空黒版。
+            # 空マットと同じく fog/PPマテリアル/ブルームは強制 OFF）。ユーザー指定 2026-10-07
+            self.status_var.set("Matteの奥プレートをレンダ中… (near-clip %.0fcm%s)"
+                                % (nc, " / 空黒" if skymatte_needed else ""))
             self.root.update()
             try:
                 capture_mrq.render_sequence(
@@ -2310,7 +2335,9 @@ class CaptureWindow(object):
                     hidden_actors=list(matte_prims) + front_vols + front,
                     near_clip_cm=nc,
                     beauty_label="BehindPlate",
-                    fog_off=self.seq_fog_var.get(), on_done=_run_direct)
+                    sky_matte=skymatte_needed,
+                    fog_off=True if skymatte_needed else self.seq_fog_var.get(),
+                    on_done=_run_direct)
             except Exception as e:
                 seq_notes.append("Matteの奥: プレート起動失敗のためスキップ")
                 self.status_var.set("Matteの奥プレート起動失敗: %s" % e)
@@ -2675,6 +2702,7 @@ class CaptureWindow(object):
                 "beauty_fmt": self.beauty_fmt_var.get(),
                 "mrq_camasp": self.mrq_camasp_var.get(),
                 "fog_off": self.fog_off_var.get(),
+                "exposure_lock": self.exposure_lock_var.get(),
                 "vdb_mode": self.vdb_var.get(),
                 "seq_range_mode": self.seq_range_mode.get(),
                 "seq_start": self.seq_start_var.get(),
@@ -2689,6 +2717,7 @@ class CaptureWindow(object):
                 "seq_camasp": self.seq_camasp_var.get(),
                 "seq_warm": self.seq_warm_var.get(), "seq_ts": self.seq_ts_var.get(),
                 "seq_fog": self.seq_fog_var.get(),
+                "seq_exposure_lock": self.seq_exposure_lock_var.get(),
                 "seq_out": self.seq_out_var.get(),
                 "seq_usecustom": self.seq_usecustom_var.get(),
                 "seq_custom": self.seq_custom_var.get(),
@@ -2778,6 +2807,7 @@ class CaptureWindow(object):
             self.beauty_fmt_var.set(st["beauty_fmt"])
         _setvar(self.mrq_camasp_var, "mrq_camasp")
         _setvar(self.fog_off_var, "fog_off")
+        _setvar(self.exposure_lock_var, "exposure_lock")
         _v = st.get("vdb_mode")
         if _v in ("Auto", "ON", "OFF"):
             self.vdb_var.set(_v)
@@ -2804,6 +2834,7 @@ class CaptureWindow(object):
         _setvar(self.seq_camasp_var, "seq_camasp")
         _setvar(self.seq_warm_var, "seq_warm"); _setvar(self.seq_ts_var, "seq_ts")
         _setvar(self.seq_fog_var, "seq_fog")
+        _setvar(self.seq_exposure_lock_var, "seq_exposure_lock")
         _setvar(self.seq_out_var, "seq_out")
         _setvar(self.seq_usecustom_var, "seq_usecustom")
         _setvar(self.seq_custom_var, "seq_custom")
