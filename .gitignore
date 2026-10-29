@@ -3,3 +3,6 @@ __pycache__/
 *.pyo
 .DS_Store
 Thumbs.db
+
+# build_dist.ps1 output
+dist/

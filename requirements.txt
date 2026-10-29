@@ -1,25 +1,30 @@
 # UE Scene Capture Tool - Python dependencies
 #
-# Install into Unreal Engine 5.7's bundled Python, NOT the OS Python:
-#   "<UE_5.7>/Engine/Binaries/ThirdParty/Python3/Win64/python.exe" -m pip install -r requirements.txt
-#
-# Or from inside the editor (Output Log console set to "Python"):
-#   import subprocess, sys
-#   subprocess.check_call([sys.executable, "-m", "pip", "install", "numpy", "pillow"])
+# Install.bat installs exactly these (keep its PACKAGES list in sync).
+# Target: the Python bundled with Unreal Engine 5.7 / 5.8 (3.11), NOT the OS Python:
+#   "<UE_5.x>/Engine/Binaries/ThirdParty/Python3/Win64/python.exe" -m pip install -r requirements.txt
+# pip needs internet access. For offline PCs build the zip with
+#   build_dist.ps1 -Wheels
+# which puts the wheels next to Install.bat; Install.bat then installs from them.
 
 # --- Required ---
-numpy
-Pillow
+numpy>=1.24
+Pillow>=10.0
 
-# --- Optional: only needed to output Z-Depth as EXR (float). ---
-# Any one of these enables EXR; without them, 16bit depth falls back to 16bit PNG.
-# imageio
+# --- Optional (the tool starts without them) ---
+# Z-Depth as EXR (float). Without it 16bit depth falls back to 16bit PNG.
+imageio>=2.31
+# ffmpeg binary for MP4 encoding (otherwise ffmpeg must be on PATH).
+imageio-ffmpeg>=0.4.9
+
+# --- Alternatives for EXR, not installed by Install.bat ---
 # OpenEXR
 # Imath
 # opencv-python
 
 # --- Not pip-installable (environment requirements) ---
-# - Unreal Engine 5.7 (editor + bundled Python, Python Editor Script Plugin)
-# - Movie Render Queue plugin enabled (required for Beauty / Behind matte)
-# - tkinter / tcl-tk: ships with most Python builds; only needed for the GUI
+# - Unreal Engine 5.7 or 5.8 (editor + bundled Python)
+# - Plugins enabled in the project: PythonScriptPlugin, MovieRenderPipeline
+#   (Install.bat adds both to the .uproject)
+# - tkinter / tcl-tk: ships with the engine's Python; only needed for the GUI
 #   (falls back to CONFIG/CUI mode if absent)

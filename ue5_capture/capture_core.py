@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-capture_core.py  --  UE5.7 Scene Capture core logic
+capture_core.py  --  UE5.7/5.8 Scene Capture core logic
 
 SceneCaptureComponent2D + TextureRenderTarget2D をランタイムで Spawn / 生成し、
 Color / Z-Depth / Matte Alpha の各パスをキャプチャしてディスクへ書き出す。
@@ -57,6 +57,24 @@ def _warn(msg):
 
 def _err(msg):
     unreal.log_error(_TAG + str(msg))
+
+
+# ----------------------------------------------------------------------------
+# エンジンバージョン差の吸収（UE5.7 / 5.8）
+#   ツールが使う API は 5.7 と 5.8 で同名・同シグネチャ（2026-10-29 リフレクション
+#   全数比較）。差分は 5.8 で増えた API の有無だけなので、ここに集約して hasattr で分岐する。
+# ----------------------------------------------------------------------------
+def ensure_preset_config_mode(job):
+    """MRQ ジョブを従来の Preset 構成（job.get_configuration() の設定群）で描かせる。
+    5.8 でジョブに Preset/Graph/Basic の構成モードが入り、Preset 以外では
+    get_configuration() に足した設定が使われない。allocate_new_job の既定は Preset だが、
+    エディタ既定（Basic）に寄せた変更が入っても黙って設定が無視されないよう明示する。
+    5.7 には構成モードが無いので何もしない。"""
+    mode_enum = getattr(unreal, "MoviePipelineConfigMode", None)
+    if mode_enum is None or not hasattr(job, "set_config_mode"):
+        return
+    if job.get_config_mode() != mode_enum.PRESET:
+        job.set_config_mode(mode_enum.PRESET)
 
 
 # ----------------------------------------------------------------------------
@@ -135,7 +153,7 @@ class CaptureSettings(object):
 
 
 # ----------------------------------------------------------------------------
-# エディタ / アクター取得ヘルパ（UE5.7 サブシステム API）
+# エディタ / アクター取得ヘルパ（UE5.7/5.8 共通のサブシステム API）
 # ----------------------------------------------------------------------------
 def _get_editor_world():
     ues = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem)
@@ -549,7 +567,9 @@ def _write_png_u8(path, arr):
 def _write_png_u16_gray(path, arr01):
     """0..1 正規化済み配列を 16bit グレースケール PNG で書く。"""
     a = _np.clip(_np.rint(arr01 * 65535.0), 0, 65535).astype(_np.uint16)
-    _PILImage.fromarray(a, "I;16").save(path)
+    # uint16 の 2D 配列は mode 指定なしで I;16 になる。mode="I;16" の明示は
+    # Pillow 13 で廃止（ValueError: Invalid mode for data type）。
+    _PILImage.fromarray(a).save(path)
 
 
 def _write_exr_gray(path, arr):

@@ -1,0 +1,14 @@
+﻿UE Scene Capture Tool  （Unreal Engine 5.7 / 5.8 用）
+
+【入れ方】
+1. この zip を、消さない場所にフォルダごと展開する（ツールはこの場所から直接読み込まれる）
+2. 使いたいプロジェクトの .uproject を Install.bat にドラッグ＆ドロップする
+3. 最後に「終了コード: 0（成功）」と出れば完了。Unreal Editor を開き直す
+
+【使い方】
+メニューバーの [SceneCapture] > Panel...（またはツールバー右端の SceneCapture ボタン）から開く。
+
+【注意】
+- 初回はライブラリのダウンロードにインターネット接続が必要（wheels フォルダ入りの zip は不要）
+- フォルダを移動したら、移動先の Install.bat をもう一度実行する
+- 外すときは Install.bat --uninstall

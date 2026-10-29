@@ -39,7 +39,7 @@ UE 同梱 Python に入れる（OS 側シェルから。`<UE>/Engine/Binaries/Th
 ## 実行（GUI）
 UE の Output Log を Python に切替えて：
 ```
-py "D:/webui/ClaudeCode/UE_capture/ue5_capture/capture_tool.py"
+py "<install dir>/ue5_capture/capture_tool.py"
 ```
 ウィンドウ「**Scene Capture Tool (UE5.7) ★Beauty版★**」が開く。設定後、唯一のボタン
 **▶ Capture (Beauty + Depth/Matte/ObjectID)** を押すと、データ系を出力 → MRQ Beauty（PIE に入る）→

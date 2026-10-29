@@ -1,6 +1,6 @@
 # UE5 Scene Capture Tool - シーケンスレンダリング機能 仕様書
 
-対象: `D:/webui/ClaudeCode/UE_capture/ue5_capture/` (capture_core.py / capture_mrq.py / capture_ui.py)
+対象: `<install dir>/ue5_capture/` (capture_core.py / capture_mrq.py / capture_ui.py)
 対象エンジン: Unreal Engine 5.7 (エディタ内 Python)
 ステータス: **実装済み (as-built)**。ライブレンダ (2 フレーム、PNG 連番 + MP4 + Depth AOV、
 テイクサブフォルダ) で動作検証済み。本書は実装後の最終設計に同期している。

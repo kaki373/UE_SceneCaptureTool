@@ -20,7 +20,7 @@ import os
 import unreal
 
 from capture_core import (MATTE_STENCIL, _HV_COMP_CLASS, _is_hv_comp,
-                          is_volumetric_actor)
+                          is_volumetric_actor, ensure_preset_config_mode)
 
 _TAG = "[SceneCapture/MRQ] "
 def _log(m): unreal.log(_TAG + str(m))
@@ -389,6 +389,7 @@ def _start_render(sub, camera_actor, output_dir, width, height,
     for j in list(queue.get_jobs()):
         queue.delete_job(j)
     job = queue.allocate_new_job(unreal.MoviePipelineExecutorJob)
+    ensure_preset_config_mode(job)
     job.job_name = "UE5Capture_Beauty"
     job.map = unreal.SoftObjectPath(_current_map_softpath())
     job.sequence = unreal.SoftObjectPath(seq_path)
@@ -1529,6 +1530,7 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
     for j in list(queue.get_jobs()):
         queue.delete_job(j)
     job = queue.allocate_new_job(unreal.MoviePipelineExecutorJob)
+    ensure_preset_config_mode(job)
     job.job_name = "UE5Capture_Sequence"
     job.map = unreal.SoftObjectPath(_current_map_softpath())
     job.sequence = unreal.SoftObjectPath(level_sequence.get_path_name())

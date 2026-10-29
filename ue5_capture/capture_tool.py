@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-capture_tool.py  --  UE5.7 Scene Capture Tool エントリポイント
+capture_tool.py  --  UE5.7/5.8 Scene Capture Tool エントリポイント
 
 UE5 エディタの Output Log / Python コンソールから:
 

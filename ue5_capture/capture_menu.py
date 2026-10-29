@@ -6,7 +6,7 @@ capture_menu.py  --  メニューバー「SceneCapture」メニュー + ツー�
   Project Settings > Plugins > Python > Startup Scripts の「+Add」に
   このファイルのパスを追加してエディタを再起動する:
 
-      D:/webui/ClaudeCode/UE_capture/ue5_capture/capture_menu.py
+      <install dir>/ue5_capture/capture_menu.py
 
 一度きりの手動実行（再起動なし）:
   Output Log の Python コンソールから  py "<このファイルのパス>"

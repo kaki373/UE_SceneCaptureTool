@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-capture_ui.py  --  UE5.7 Scene Capture GUI (tkinter)
+capture_ui.py  --  UE5.7/5.8 Scene Capture GUI (tkinter)
 
 Python 標準の tkinter でウィンドウを描画する。tkinter の mainloop は UE の
 メインスレッドをブロックするため使わず、register_slate_post_tick_callback で
