@@ -19,6 +19,7 @@ SceneCapture2D では CineCamera の物理露出やシーケンサ相当の品�
 import os
 import unreal
 
+import capture_core as _core
 from capture_core import (MATTE_STENCIL, _HV_COMP_CLASS, _is_hv_comp,
                           is_volumetric_actor, ensure_preset_config_mode)
 
@@ -30,8 +31,92 @@ def _err(m): unreal.log_error(_TAG + str(m))
 _TMP_PKG = "/Game/_UE5Capture_Tmp"
 _TMP_NAME = "MRQ_TempSeq"
 
-# GC 防止（executor / queue を保持）
+# GC 防止（executor / queue を保持）。レンダ中は "restore"（シーン復元）と
+# "queue_backup"（ユーザーの MRQ キューの退避）も置く（force_reset が使う）。
+# ⚠️ UE5.8 では render_queue_with_executor_instance の実行中に
+# MoviePipelineQueueSubsystem.is_rendering() が False を返すことがある（実測）。
+# 5.7 でもジョブチェーンの合間は False になる。レンダ中判定は必ず
+# `is_rendering() or _KEEP.get("executor") is not None` の両方で行うこと。
 _KEEP = {}
+
+
+def _default_near_clip_cm():
+    """r.SetNearClipPlane の戻し先（プロジェクト設定の Near Clip Plane）。
+    capture_core 側に無い/読めない場合はエンジン既定の 10cm。"""
+    try:
+        return float(_core.default_near_clip_cm())
+    except Exception:
+        return 10.0
+
+
+def _reset_near_clip():
+    # near clip はコマンドでグローバルに残る（cvar と違い MRQ が自動復元しない）
+    try:
+        unreal.SystemLibrary.execute_console_command(
+            _editor_world(), "r.SetNearClipPlane %g" % _default_near_clip_cm())
+    except Exception as e:
+        _warn("near clip の復元に失敗: %s" % e)
+
+
+def _backup_and_clear_queue(queue):
+    """MRQ キュー（エディタの Movie Render Queue ウィンドウと共有）を退避してから
+    空にする。退避先は _KEEP["queue_backup"]、レンダ後に _restore_queue が戻す。
+    copy_from が使えない場合は警告を出して従来どおり削除する。"""
+    jobs = list(queue.get_jobs())
+    if jobs:
+        try:
+            backup = unreal.new_object(unreal.MoviePipelineQueue)
+            backup.copy_from(queue)
+            _KEEP["queue_backup"] = backup
+            _log("MRQ キューの既存ジョブ %d 件を退避（レンダ後に戻す）" % len(jobs))
+        except Exception as e:
+            _warn("MRQ キューの既存ジョブ %d 件を退避できないため削除します: %s"
+                  % (len(jobs), e))
+    for j in jobs:
+        queue.delete_job(j)
+
+
+def _restore_queue():
+    backup = _KEEP.pop("queue_backup", None)
+    if backup is None:
+        return
+    try:
+        q = unreal.get_editor_subsystem(unreal.MoviePipelineQueueSubsystem).get_queue()
+        q.copy_from(backup)
+        _log("MRQ キューの退避ジョブ %d 件を復元" % len(list(q.get_jobs())))
+    except Exception as e:
+        _warn("MRQ キューの退避ジョブの復元に失敗: %s" % e)
+
+
+def force_reset():
+    """レンダ状態の強制リセット（メニュー「強制リセット」）。PIE executor が
+    finished を発火しなかった・復元途中で落ちた等で _KEEP が残り、ツールが
+    「レンダ中」のまま固まったときの逃げ道。保持中のシーン復元・near clip・
+    MRQ キュー・一時シーケンスを戻して _KEEP を消す。
+    実際にレンダ中（is_rendering() または PIE 実行中）なら何もせず False。"""
+    sub = unreal.get_editor_subsystem(unreal.MoviePipelineQueueSubsystem)
+    pie = None
+    try:
+        pie = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_game_world()
+    except Exception:
+        pass
+    if sub.is_rendering() or pie is not None:
+        _warn("強制リセット: レンダ中（PIE 実行中）のため中止しました")
+        return False
+    restore = _KEEP.get("restore")
+    if restore is not None:
+        try:
+            restore()
+            _log("強制リセット: シーン状態を復元しました")
+        except Exception as e:
+            _warn("強制リセット: シーン復元でエラー: %s" % e)
+    _reset_near_clip()
+    _restore_queue()
+    _delete_temp_sequence()
+    had = sorted(_KEEP.keys())
+    _KEEP.clear()
+    _log("強制リセット完了（解放: %s）" % (", ".join(had) or "なし"))
+    return True
 
 
 def _editor_world():
@@ -44,12 +129,33 @@ def _current_map_softpath():
 
 
 def _delete_temp_sequence():
+    """一時シーケンスを削除する。参照が残っていると delete_asset は False を返す
+    ため GC 後に1回だけ再試行する。消えていれば True。"""
     full = _TMP_PKG + "/" + _TMP_NAME
     try:
-        if unreal.EditorAssetLibrary.does_asset_exist(full):
-            unreal.EditorAssetLibrary.delete_asset(full)
+        eal = unreal.EditorAssetLibrary
+        if not eal.does_asset_exist(full):
+            return True
+        if eal.delete_asset(full):
+            return True
+        unreal.SystemLibrary.collect_garbage()
+        if eal.delete_asset(full) or not eal.does_asset_exist(full):
+            return True
+        _warn("一時シーケンスを削除できません（参照が残っています）: %s" % full)
     except Exception as e:
         _warn("一時シーケンス削除に失敗: %s" % e)
+    return False
+
+
+def _clear_sequence(seq):
+    """再利用する一時シーケンスのトラック（カメラカット含む）とバインディングを全消去。"""
+    ext = unreal.MovieSceneSequenceExtensions
+    for tr in list(ext.get_tracks(seq) or []):
+        ext.remove_track(seq, tr)
+    for tr in list(ext.find_tracks_by_exact_type(seq, unreal.MovieSceneCameraCutTrack) or []):
+        ext.remove_track(seq, tr)
+    for b in list(ext.get_bindings(seq) or []):
+        b.remove()
 
 
 def _create_temp_sequence(camera_actor, fps=24, scene_sequence=None, scene_frame=None):
@@ -63,10 +169,17 @@ def _create_temp_sequence(camera_actor, fps=24, scene_sequence=None, scene_frame
     カメラカットはこの一時シーケンス（ルート）側のみ＝ツールで選んだカメラが使われる
     （ルートのカメラカットはサブシーケンス内のカメラカットより優先される）。"""
     ext = unreal.MovieSceneSequenceExtensions
-    _delete_temp_sequence()
-    at = unreal.AssetToolsHelpers.get_asset_tools()
-    seq = at.create_asset(_TMP_NAME, _TMP_PKG, unreal.LevelSequence,
-                          unreal.LevelSequenceFactoryNew())
+    if _delete_temp_sequence():
+        at = unreal.AssetToolsHelpers.get_asset_tools()
+        seq = at.create_asset(_TMP_NAME, _TMP_PKG, unreal.LevelSequence,
+                              unreal.LevelSequenceFactoryNew())
+    else:
+        # 削除できない（前回ジョブ/undo の参照）→ 同名 create_asset は失敗するので
+        # 既存アセットを中身を空にして再利用する
+        seq = unreal.EditorAssetLibrary.load_asset(_TMP_PKG + "/" + _TMP_NAME)
+        if seq is not None:
+            _clear_sequence(seq)
+            _log("一時シーケンスを再利用（削除できなかったため中身を消去）")
     if seq is None:
         raise RuntimeError("一時 LevelSequence の生成に失敗しました。")
     if scene_sequence is not None and scene_frame is not None:
@@ -98,14 +211,16 @@ def _create_temp_sequence(camera_actor, fps=24, scene_sequence=None, scene_frame
             # 画がズレる（実測: 1080 高で 14px / 2159 高で 28px）。
             tick = ext.get_tick_resolution(scene_sequence)
             disp = ext.get_display_rate(scene_sequence)
-            tpf = int(round((tick.numerator * disp.denominator)
-                            / float(tick.denominator * disp.numerator)))
+            # 1フレームの tick 数は 29.97/59.94fps で非整数（24000/29.97=800.8）なので
+            # 整数 tpf に丸めてから掛けず、有理数のまま計算して最後に1回だけ丸める
+            offset = int(round((n - inner_start) * tick.numerator * disp.denominator
+                               / float(tick.denominator * disp.numerator)))
             params = sub_sec.get_editor_property("parameters")
             tw = params.get_editor_property("time_scale")
             tw.set_fixed_play_rate(0.0)
             params.set_editor_property("time_scale", tw)
             params.set_editor_property(
-                "start_frame_offset", unreal.FrameNumber((n - inner_start) * tpf))
+                "start_frame_offset", unreal.FrameNumber(offset))
             sub_sec.set_editor_property("parameters", params)
             sub_sec.set_range(0, 1)
             frozen = True
@@ -169,6 +284,32 @@ def _lighting_only_class():
     return cls
 
 
+def _jpg_output_class():
+    cls = getattr(unreal, "MoviePipelineImageSequenceOutput_JPG", None)
+    if cls is None:
+        raise RuntimeError("この UE には JPG 出力 (MoviePipelineImageSequenceOutput_JPG) がありません。")
+    return cls
+
+
+def _set_write_alpha(fmt_setting, on, required=False):
+    """PNG 出力の write_alpha。雲マット（α が成果物そのもの）で設定できなければ
+    α無し PNG を黙って出さず raise する。それ以外は警告のみ。"""
+    try:
+        fmt_setting.set_editor_property("write_alpha", bool(on))
+    except Exception as e:
+        if required:
+            raise RuntimeError("PNG の write_alpha を設定できません（雲マットのαが出ない）: %s" % e)
+        _warn("PNG の write_alpha を設定できません: %s" % e)
+
+
+def _set_texture_streaming_full(go):
+    try:
+        go.set_editor_property("texture_streaming",
+                               unreal.MoviePipelineTextureStreamingMethod.FULLY_LOAD)
+    except Exception as e:
+        _warn("texture_streaming=FULLY_LOAD を設定できません（テクスチャがぼける恐れ）: %s" % e)
+
+
 def _cv_entries(pairs):
     """(name, value) の並びを MoviePipelineConsoleVariableEntry 配列にする。
     同名が複数入ると MRQ が「適用前の値」を entry ごとに記録するため、2個目は
@@ -222,6 +363,99 @@ def _restore_autoplay_players(saved):
             pass
 
 
+def _hide_actors(actors):
+    """hidden_actors をエディタ側で Hidden in Game にする。元々 hidden のものは
+    触らず記録しない（復元で表示に戻してシーンを変えないため）。変更したリストを返す。"""
+    changed = []
+    for a in actors or []:
+        try:
+            if a.get_editor_property("hidden"):
+                continue
+            a.set_actor_hidden_in_game(True)
+            changed.append(a)
+        except Exception:
+            pass
+    return changed
+
+
+def _restore_saved_scene(st):
+    """render_* がセットアップ中に st へ逐次積んだ変更を戻す。未設定のキーは飛ばし、
+    1項目の失敗で残りの復元を止めない（途中失敗でもシーンを残さない）。"""
+    def _run(label, fn):
+        try:
+            fn()
+        except Exception as e:
+            _warn("シーン復元に失敗 (%s): %s" % (label, e))
+
+    def _unhide():
+        for a in st.get("hidden") or []:
+            try:
+                a.set_actor_hidden_in_game(False)
+            except Exception:
+                pass
+
+    if st.get("pie_hider"):
+        _run("pie_hider", st["pie_hider"]["stop"])
+    _run("hidden", _unhide)
+    if st.get("matte"):
+        _run("matte", lambda: _restore_matte_render_mode(st["matte"]))
+    if st.get("objid"):
+        _run("objid", lambda: _restore_objid_render_mode(st["objid"]))
+    if st.get("cloud"):
+        _run("cloud", lambda: _restore_cloud_matte_mode(st["cloud"]))
+    if st.get("vis"):
+        _run("vis", lambda: _restore_visible_cloud_mode(st["vis"]))
+    if st.get("backing"):
+        _run("backing", lambda: _restore_backing_materials(st["backing"]))
+    if st.get("sky"):
+        _run("sky", lambda: _restore_sky_matte_mode(st["sky"]))
+    if st.get("players"):
+        _run("players", lambda: _restore_autoplay_players(st["players"]))
+    if st.get("cam"):
+        _run("cam", lambda: _restore_cameras_aspect(st["cam"]))
+
+
+def _start_visible_cloud_mode(st, cloud_matte_actors, cloud_backing, cloud_sources_off):
+    """可視雲モード: 何も隠さず PIE 側でバッキング材化（深度順序が保たれる）。
+    cloud_backing: "white"=透過率T測定(白発光100+微弱fill) /
+    "black"=素照明ベール輝度測定(純黒+fillなし) /
+    None=従来の黒+20lux（映像タブの単一ジョブ方式）。st["vis"] に逐次積む。"""
+    white = (cloud_backing == "white")
+    fills = (5.0 if cloud_backing == "white"
+             else 0.0 if cloud_backing == "black" else 20.0)
+    st["vis"] = {"pie": _start_pie_backing_white(cloud_matte_actors, white=white)}
+    st["vis"]["fills"] = _spawn_cloud_fill_lights(fills)
+    if cloud_sources_off:
+        # 雲なしベール（VeilNone/CloudVeil0）: UDS の雲内フォグ板も PIE 側で隠す
+        # （HV は hidden_actors・雲レイヤーは ShowFlag.Cloud 0 が受け持つ）
+        st["vis"]["plane_hider"] = _start_pie_udsplane_hider()
+
+
+def _warn_if_spawnable_camera(camera_actor):
+    """Sequencer スポーナブル（エディタ上のプレビュー用 transient 実体）のカメラは
+    一時シーケンスで possess しても PIE 側で束縛されず、Beauty が既定視点になり得る
+    （SceneCapture 系マスクとの食い違い）。検出したら警告だけ出す。
+    transient 判定は get_all_level_actors() がエンジン側で transient アクターを
+    除外する性質を使う（LevelInstance 内のカメラも除外されるので誤検出はあり得る）。"""
+    try:
+        path = camera_actor.get_path_name()
+        # 未保存レベル（Untitled）はワールドごと /Temp/ に居るので、その場合は見ない
+        spawnable = ("/Temp/" in path
+                     and not _editor_world().get_path_name().startswith("/Temp/"))
+        if not spawnable:
+            listed = set(a.get_path_name() for a in unreal.get_editor_subsystem(
+                unreal.EditorActorSubsystem).get_all_level_actors())
+            spawnable = path not in listed
+        if spawnable:
+            _warn("カメラ %s は Sequencer のスポーナブル（transient）の可能性があります。"
+                  "PIE の Beauty がこのカメラに追従しないことがあります"
+                  "（マスク系と画角がズレたら映像タブで撮ってください）"
+                  % camera_actor.get_actor_label())
+        return spawnable
+    except Exception:
+        return False
+
+
 def render_beauty(camera_actor, output_dir, width, height,
                   use_exr=False, image_format=None, also_png=False,
                   spatial_samples=1, temporal_samples=8,
@@ -265,84 +499,52 @@ def render_beauty(camera_actor, output_dir, width, height,
     if not os.path.isdir(output_dir):
         os.makedirs(output_dir)
 
-    # 多重起動防止: 既に MRQ レンダ中なら弾く（PIE 衝突で破損 PNG が出るのを防ぐ）
+    # 多重起動防止: 既に MRQ レンダ中なら弾く（PIE 衝突で破損 PNG が出るのを防ぐ）。
+    # is_rendering() は 5.8 のレンダ中/チェーンの合間に False になり得るので _KEEP も見る
     sub = unreal.get_editor_subsystem(unreal.MoviePipelineQueueSubsystem)
     if sub.is_rendering() or _KEEP.get("executor") is not None:
         raise RuntimeError("MRQ は既にレンダリング中です。完了までお待ちください（多重起動防止）。")
     if matte_material is not None and not matte_actors:
         raise RuntimeError("Matte パスには対象アクターが必要です。")
+    _warn_if_spawnable_camera(camera_actor)
 
     # シーン状態の変更（レンダ後・起動失敗時に必ず復元）: 非表示指定 / マットレンダ
     # モード / auto-play プレイヤー停止（PIE 中に勝手に再生されるとカメラ・シーンが
-    # 動く）/ カメラのアスペクト拘束解除（出力アスペクト≠filmback のときの黒帯防止）
-    restore = []
-    if hidden_actors:
-        for a in hidden_actors:
-            try:
-                a.set_actor_hidden_in_game(True)
-                restore.append(a)
-            except Exception:
-                pass
-    pie_hider = _start_pie_actor_hider(restore) if restore else None
-    saved_matte = None
-    if matte_material is not None:
-        saved_matte = _set_matte_render_mode(matte_actors)
-    saved_cloud = None
-    saved_vis = None
-    if cloud_matte_actors and cloud_visible:
-        # 可視雲モード: 何も隠さず PIE 側でバッキング材化（深度順序が保たれる）。
-        # cloud_backing: "white"=透過率T測定(白発光100+微弱fill) /
-        # "black"=素照明ベール輝度測定(純黒+fillなし) /
-        # None=従来の黒+20lux（映像タブの単一ジョブ方式）
-        white = (cloud_backing == "white")
-        fills = (5.0 if cloud_backing == "white"
-                 else 0.0 if cloud_backing == "black" else 20.0)
-        saved_vis = {"pie": _start_pie_backing_white(cloud_matte_actors,
-                                                     white=white),
-                     "fills": _spawn_cloud_fill_lights(fills)}
-        if cloud_sources_off:
-            # 雲なしベール（VeilNone）: UDS の雲内フォグ板も PIE 側で隠す
-            # （HV は hidden_actors・雲レイヤーは ShowFlag.Cloud 0 が受け持つ）
-            saved_vis["plane_hider"] = _start_pie_udsplane_hider()
-    elif cloud_matte_actors:
-        # UE5.7 は holdout 方式のα出力が実質壊れている（cvarペア有効でも最大2/255・
-        # 2026-07-24実測）ため分離モード固定。エンジン修正後に
-        # use_holdout=cloud_matte_holdout_ready() へ戻す。
-        saved_cloud = _set_cloud_matte_mode(cloud_matte_actors, use_holdout=False)
-    saved_backing = None
-    if backing_actors:
-        saved_backing = _set_backing_materials(backing_actors, backing_white)
-    saved_sky = None
-    if sky_matte:
-        saved_sky = _set_sky_matte_mode(camera_actor)
-    saved_players = _suppress_autoplay_players()
-    saved_cam = [c for c in (_fill_aspect_comp(camera_actor, width, height),)
-                 if c is not None]
-    if saved_cam:
-        _log("カメラのアスペクト拘束を一時解除（静止画）")
+    # 動く）/ カメラのアスペクト拘束解除（出力アスペクト≠filmback のときの黒帯防止）。
+    # 復元クロージャを先に作り、変更は st に逐次積む（セットアップ途中の例外でも
+    # それまでの変更だけを戻せる。未設定のキーは _restore_saved_scene が飛ばす）。
+    st = {}
 
     def _restore_scene():
-        if pie_hider:
-            pie_hider["stop"]()
-        for a in restore:
-            try:
-                a.set_actor_hidden_in_game(False)
-            except Exception:
-                pass
-        if saved_matte:
-            _restore_matte_render_mode(saved_matte)
-        if saved_cloud:
-            _restore_cloud_matte_mode(saved_cloud)
-        if saved_vis:
-            _restore_visible_cloud_mode(saved_vis)
-        if saved_backing:
-            _restore_backing_materials(saved_backing)
-        if saved_sky:
-            _restore_sky_matte_mode(saved_sky)
-        _restore_autoplay_players(saved_players)
-        _restore_cameras_aspect(saved_cam)
+        _restore_saved_scene(st)
 
+    _KEEP["restore"] = _restore_scene
     try:
+        if hidden_actors:
+            st["hidden"] = _hide_actors(hidden_actors)
+            # PIE 側は元々 hidden だったものも含めて全指定を隠す（LevelInstance 内は
+            # PIE でアセットから読み直されエディタ側の hidden が伝わらないため）
+            st["pie_hider"] = _start_pie_actor_hider(hidden_actors)
+        if matte_material is not None:
+            st["matte"] = _set_matte_render_mode(matte_actors)
+        if cloud_matte_actors and cloud_visible:
+            _start_visible_cloud_mode(st, cloud_matte_actors, cloud_backing,
+                                      cloud_sources_off)
+        elif cloud_matte_actors:
+            # UE5.7 は holdout 方式のα出力が実質壊れている（cvarペア有効でも最大2/255・
+            # 2026-07-24実測）ため分離モード固定。エンジン修正後に
+            # use_holdout=cloud_matte_holdout_ready() へ戻す。
+            st["cloud"] = _set_cloud_matte_mode(cloud_matte_actors, use_holdout=False)
+        if backing_actors:
+            st["backing"] = _set_backing_materials(backing_actors, backing_white)
+        if sky_matte:
+            st["sky"] = _set_sky_matte_mode(camera_actor)
+        st["players"] = _suppress_autoplay_players()
+        st["cam"] = [c for c in (_fill_aspect_comp(camera_actor, width, height),)
+                     if c is not None]
+        if st["cam"]:
+            _log("カメラのアスペクト拘束を一時解除（静止画）")
+
         return _start_render(sub, camera_actor, output_dir, width, height,
                              use_exr, image_format, also_png,
                              spatial_samples, temporal_samples, warmup,
@@ -357,15 +559,12 @@ def render_beauty(camera_actor, output_dir, width, height,
                              backing=bool(backing_actors), sky_matte=sky_matte,
                              pp_materials_off=pp_materials_off)
     except Exception:
-        # 起動に失敗したら状態を巻き戻す（次回レンダを塞がない）
+        # セットアップ/起動に失敗したら状態を巻き戻す（次回レンダを塞がない）
         _restore_scene()
         if near_clip_cm is not None:
             # 起動前にグローバル適用済みの near clip を戻す
-            try:
-                unreal.SystemLibrary.execute_console_command(
-                    _editor_world(), "r.SetNearClipPlane 10")
-            except Exception:
-                pass
+            _reset_near_clip()
+        _restore_queue()
         _delete_temp_sequence()
         _KEEP.clear()
         raise
@@ -386,8 +585,7 @@ def _start_render(sub, camera_actor, output_dir, width, height,
                                           scene_frame=scene_frame)
 
     queue = sub.get_queue()
-    for j in list(queue.get_jobs()):
-        queue.delete_job(j)
+    _backup_and_clear_queue(queue)
     job = queue.allocate_new_job(unreal.MoviePipelineExecutorJob)
     ensure_preset_config_mode(job)
     job.job_name = "UE5Capture_Beauty"
@@ -423,28 +621,22 @@ def _start_render(sub, camera_actor, output_dir, width, height,
     # image_format: "png"（既定）/ "jpg" / "exr"。exr のとき also_png=True で
     # PNG も同時出力する（Matte 系合成が PIL で読める画像を必要とするため）。
     fmt = (image_format or ("exr" if use_exr else "png")).lower()
+    # jpg も also_png=True なら PNG を同時出力する（UI の Depth/Normal/Matte 系の
+    # 後処理は .png を探すため。JPG 単独だとそれらの PP パスが拾われない）。
     if fmt == "exr":
         exr_out = cfg.find_or_add_setting_by_class(unreal.MoviePipelineImageSequenceOutput_EXR)
-        if light_pass or cloud_visible:
-            # マルチレイヤ EXR だと LightingOnly/追加PPパスが別ファイルにならないため分割
+        if extra_passes or light_pass or cloud_visible:
+            # マルチレイヤ EXR だと LightingOnly/追加PPパスが別ファイルにならず、
+            # {render_pass} トークンも空になってリネームに乗らないため分割
             exr_out.set_editor_property("multilayer", False)
-        if also_png:
-            png_fmt = cfg.find_or_add_setting_by_class(unreal.MoviePipelineImageSequenceOutput_PNG)
-            try:
-                png_fmt.set_editor_property("write_alpha", False)
-            except Exception:
-                pass
     elif fmt == "jpg":
-        jpg_cls = getattr(unreal, "MoviePipelineImageSequenceOutput_JPG", None)
-        if jpg_cls is None:
-            raise RuntimeError("この UE には JPG 出力 (MoviePipelineImageSequenceOutput_JPG) がありません。")
-        cfg.find_or_add_setting_by_class(jpg_cls)
+        cfg.find_or_add_setting_by_class(_jpg_output_class())
     else:
         out_fmt = cfg.find_or_add_setting_by_class(unreal.MoviePipelineImageSequenceOutput_PNG)
-        try:
-            out_fmt.set_editor_property("write_alpha", bool(cloud_matte))
-        except Exception:
-            pass
+        _set_write_alpha(out_fmt, cloud_matte, required=bool(cloud_matte))
+    if also_png and fmt != "png":
+        png_fmt = cfg.find_or_add_setting_by_class(unreal.MoviePipelineImageSequenceOutput_PNG)
+        _set_write_alpha(png_fmt, False)
 
     out = cfg.find_or_add_setting_by_class(unreal.MoviePipelineOutputSetting)
     out.set_editor_property("output_directory", unreal.DirectoryPath(output_dir))
@@ -458,8 +650,8 @@ def _start_render(sub, camera_actor, output_dir, width, height,
     out.set_editor_property("zero_pad_frame_numbers", 4)
     try:
         out.set_editor_property("flush_disk_writes_per_shot", True)  # 完了前に確実に書き出す
-    except Exception:
-        pass
+    except Exception as e:
+        _warn("flush_disk_writes_per_shot を設定できません: %s" % e)
     # 1 フレームだけ出す（end は排他的なので [0,1) = フレーム0 のみ）
     out.set_editor_property("use_custom_playback_range", True)
     out.set_editor_property("custom_start_frame", 0)
@@ -474,8 +666,8 @@ def _start_render(sub, camera_actor, output_dir, width, height,
     try:
         aa.set_editor_property("anti_aliasing_method",
                                unreal.AntiAliasingMethod.AAM_TSR)
-    except Exception:
-        pass
+    except Exception as e:
+        _warn("AA を TSR に設定できません（エンジン既定の AA で続行）: %s" % e)
 
     # Overscan（元カメラを変えずレンダ時だけ余白を追加。解像度も増える＝周囲にピクセルを足す）
     if overscan and float(overscan) > 0.0:
@@ -489,11 +681,7 @@ def _start_render(sub, camera_actor, output_dir, width, height,
     go.set_editor_property("use_lod_zero", True)
     go.set_editor_property("flush_grass_streaming", True)
     go.set_editor_property("flush_streaming_managers", True)
-    try:
-        go.set_editor_property("texture_streaming",
-                               unreal.MoviePipelineTextureStreamingMethod.FULLY_LOAD)
-    except Exception:
-        pass
+    _set_texture_streaming_full(go)
 
     pairs = _job_cvars() + [("r.MotionBlurQuality", 0)]   # 静止画はブラー無し
     if matte_material is not None:
@@ -575,7 +763,7 @@ def _start_render(sub, camera_actor, output_dir, width, height,
         _log("near clip = %.1f cm" % float(near_clip_cm))
         # start_console_commands だけだとウォームアップ/最初のサブフレームに間に合わず、
         # クリップ有り/無しが平均されて手前オブジェクトが半透明ゴースト化する（実測）。
-        # レンダ起動前にグローバルへも適用しておく（_on_finished が既定 10cm へ復元）。
+        # レンダ起動前にグローバルへも適用しておく（_on_finished が既定値へ復元）。
         unreal.SystemLibrary.execute_console_command(
             _editor_world(), "r.SetNearClipPlane %f" % float(near_clip_cm))
     cv.set_editor_property("start_console_commands", cmds)
@@ -583,36 +771,41 @@ def _start_render(sub, camera_actor, output_dir, width, height,
     executor = unreal.MoviePipelinePIEExecutor()
 
     def _on_finished(exec_obj, success):
-        _log("MRQ レンダ完了 success=%s -> %s" % (success, output_dir))
-        _delete_temp_sequence()
-        restore_scene()                 # 非表示 / matte / auto-play / アスペクトを戻す
-        if extra_passes or light_pass:
-            # <base>_FinalImage<Name>.* → <base>_<Name>.* / <base>_FinalImage.* → <base>.*
+        try:
+            _log("MRQ レンダ完了 success=%s -> %s" % (success, output_dir))
+            _delete_temp_sequence()
             try:
-                for f in os.listdir(output_dir):
-                    if not f.startswith(file_basename + "_FinalImage"):
-                        continue
-                    nf = (f.replace("_FinalImageMatte", "_Matte")
-                           .replace("_FinalImageDepth", "_Depth")
-                           .replace("_FinalImageNormal", "_Normal")
-                           .replace("_FinalImageGeoMask", "_GeoMask")
-                           .replace("_FinalImage", ""))
-                    os.replace(os.path.join(output_dir, f), os.path.join(output_dir, nf))
+                restore_scene()         # 非表示 / matte / auto-play / アスペクトを戻す
             except Exception as e:
-                _warn("追加パスのリネームに失敗: %s" % e)
-        if near_clip_cm is not None:
-            # near clip はコマンドでグローバルに残るので必ず既定(10cm)へ戻す
-            try:
-                unreal.SystemLibrary.execute_console_command(
-                    _editor_world(), "r.SetNearClipPlane 10")
-            except Exception:
-                pass
-        _KEEP.clear()                           # 先にクリア（on_done がチェインで次の render を張る場合があるため）
-        if on_done:
-            try:
-                on_done(bool(success), output_dir)
-            except Exception as e:
-                _warn("on_done でエラー: %s" % e)
+                _warn("シーン復元でエラー: %s" % e)
+            if extra_passes or light_pass:
+                # <base>_FinalImage<Name>.* → <base>_<Name>.* / <base>_FinalImage.* → <base>.*
+                try:
+                    for f in os.listdir(output_dir):
+                        if not f.startswith(file_basename + "_FinalImage"):
+                            continue
+                        nf = (f.replace("_FinalImageMatte", "_Matte")
+                               .replace("_FinalImageDepth", "_Depth")
+                               .replace("_FinalImageNormal", "_Normal")
+                               .replace("_FinalImageGeoMask", "_GeoMask")
+                               .replace("_FinalImage", ""))
+                        os.replace(os.path.join(output_dir, f), os.path.join(output_dir, nf))
+                except Exception as e:
+                    _warn("追加パスのリネームに失敗: %s" % e)
+            if near_clip_cm is not None:
+                # near clip はコマンドでグローバルに残るので必ず既定値へ戻す
+                _reset_near_clip()
+            _restore_queue()            # ユーザーの MRQ キューを戻す（_KEEP を消す前に）
+        finally:
+            # 復元で何が起きても必ず解放して通知する（_KEEP が残るとツールが
+            # 「レンダ中」のまま固まり、UI のチェーンも止まる）。on_done がチェインで
+            # 次の render を張る場合があるため先にクリアする。
+            _KEEP.clear()
+            if on_done:
+                try:
+                    on_done(bool(success), output_dir)
+                except Exception as e:
+                    _warn("on_done でエラー: %s" % e)
 
     executor.on_executor_finished_delegate.add_callable(_on_finished)
     _KEEP["executor"] = executor
@@ -763,7 +956,10 @@ def _spawn_cloud_fill_lights(intensity=20.0):
     HV(VDB雲) の α は照明依存（無照明で α0・照明の弱い遠景雲が α から消える実測）
     なので、シーン照明に依らず全方位からフラットに照らして α を安定させる。
     RGB は捨てるので過露光は問題ない（可視雲モードでは W=T×素板 の誤差 ≈
-    雲散乱/素板レベルになるため低強度を渡す）。返り値: レンダ後に破棄するリスト。"""
+    雲散乱/素板レベルになるため低強度を渡す）。返り値: レンダ後に破棄するリスト。
+    intensity <= 0（黒バッキング）はスポーンしない（無意味な spawn でレベルを dirty にしない）。"""
+    if intensity <= 0:
+        return []
     eas = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
     out = []
     for i, (pitch, yaw) in enumerate(((-90.0, 0.0), (30.0, 45.0), (30.0, 225.0))):
@@ -793,7 +989,7 @@ def _start_pie_backing_white(vol_targets, white=False):
     LevelInstance 内包・スポーナブルにも効かせるため PIE 側で毎 tick 冪等に行う
     （PIE は破棄されるので復元不要）。
     ⚠️ 差し替えるのは「元々不透明深度を書くスロット」だけ。半透明系スロットは
-    不可視マテ(BackingClear)へ、非表示コンポーネントは触らない — 一律差し替えは
+    元の材のまま、非表示コンポーネントは触らない — 一律差し替えは
     UDS の雲内フォグ板（半透明・深度なし）を雲高度の不透明面に変えてしまい、
     その奥の HV(VDB雲) が深度テストで全滅する（中距離雲のマット落ち実測
     2026-08-26）。"""
@@ -937,15 +1133,32 @@ def _start_pie_udsplane_hider():
 
 
 def _actor_pos_key(a):
+    """PIE 照合キー。基本は『クラス名 + ワールド位置(cm丸め)』（PIE で名前が変わる
+    LevelInstance 内包アクター対策）。pivot が原点に焼かれたインポート物のように
+    同クラス・同位置が多数あるシーンで無関係なアクターまで隠さないよう、最初の
+    StaticMeshComponent のメッシュアセットパスとワールドバウンズの extent(cm丸め)を
+    加える（メッシュが無いアクターは "" / None で従来キーと同じ識別力）。"""
     loc = a.get_actor_location()
-    return (a.get_class().get_name(), round(loc.x), round(loc.y), round(loc.z))
+    mesh, extent = "", None
+    try:
+        smc = a.get_component_by_class(unreal.StaticMeshComponent)
+        if smc is not None:
+            sm = smc.get_editor_property("static_mesh")
+            mesh = sm.get_path_name() if sm is not None else ""
+            _o, ext, _r = unreal.SystemLibrary.get_component_bounds(smc)
+            extent = (round(ext.x), round(ext.y), round(ext.z))
+    except Exception:
+        pass
+    return (a.get_class().get_name(), round(loc.x), round(loc.y), round(loc.z),
+            mesh, extent)
 
 
 def _start_pie_actor_hider(actors):
     """hidden_actors を PIE ワールド側でも隠すウォッチャ。LevelInstance 内包アクターは
     PIE で資産から再生成されるため、エディタ側の set_actor_hidden_in_game が伝搬しない
     （_start_pie_cloud_hider と同じ事情。AV024 の柱・橋は全て LevelInstance 内）。
-    名前は再生成で変わりうるので『クラス名 + ワールド位置(cm丸め)』で照合する。
+    名前は再生成で変わりうるので『クラス名 + ワールド位置(cm丸め)』を基本に
+    メッシュパス・バウンズ extent を足したキー（_actor_pos_key）で照合する。
     毎 tick 冪等（ストリーミングの遅延流入も拾う）。PIE は破棄されるので復元不要。"""
     keys = set()
     for a in actors or []:
@@ -1079,7 +1292,9 @@ def _set_sky_matte_mode(camera_actor):
     eas = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
     pairs = []
     for actor in eas.get_all_level_actors():
-        if actor.get_class().get_name() != "Ultra_Dynamic_Sky_C":
+        # 部分一致: プロジェクト独自の UDS 派生 BP（…Ultra_Dynamic_Sky…_C）も拾う
+        # （_start_pie_udsplane_hider と同じ判定）
+        if "Ultra_Dynamic_Sky" not in actor.get_class().get_name():
             continue
         for comp in actor.get_components_by_class(unreal.StaticMeshComponent):
             if comp.get_name() == "Sky_Sphere":
@@ -1095,16 +1310,32 @@ def _set_sky_matte_mode(camera_actor):
                       comp.get_editor_property("hidden_in_game")))
         comp.set_visibility(False, False)
         comp.set_hidden_in_game(True, False)
-    mesh = unreal.EditorAssetLibrary.load_asset("/Engine/BasicShapes/Sphere.Sphere")
-    dome = eas.spawn_actor_from_class(
-        unreal.StaticMeshActor, camera_actor.get_actor_location(),
-        unreal.Rotator(0.0, 0.0, 0.0))
-    dome.set_actor_label("UE5Cap_SkyDome_TMP")
-    s = radius / 50.0                       # BasicShapes/Sphere は半径 50cm
-    dome.set_actor_scale3d(unreal.Vector(s, s, s))
-    comp = dome.static_mesh_component
-    comp.set_static_mesh(mesh)
-    comp.set_material(0, mat)
+    dome = None
+    try:
+        mesh = unreal.EditorAssetLibrary.load_asset("/Engine/BasicShapes/Sphere.Sphere")
+        dome = eas.spawn_actor_from_class(
+            unreal.StaticMeshActor, camera_actor.get_actor_location(),
+            unreal.Rotator(0.0, 0.0, 0.0))
+        dome.set_actor_label("UE5Cap_SkyDome_TMP")
+        s = radius / 50.0                       # BasicShapes/Sphere は半径 50cm
+        dome.set_actor_scale3d(unreal.Vector(s, s, s))
+        comp = dome.static_mesh_component
+        comp.set_static_mesh(mesh)
+        comp.set_material(0, mat)
+    except Exception:
+        # ドーム生成に失敗 → 呼び出し側は saved を受け取れないのでここで戻す
+        if dome is not None:
+            try:
+                eas.destroy_actor(dome)
+            except Exception:
+                pass
+        for c, pv, ph in saved:
+            try:
+                c.set_visibility(pv, False)
+                c.set_hidden_in_game(ph, False)
+            except Exception:
+                pass
+        raise
     for prop, val in (("cast_shadow", False),
                       ("affect_dynamic_indirect_lighting", False),
                       ("affect_distance_field_lighting", False),
@@ -1205,7 +1436,9 @@ def _restore_cloud_matte_mode(saved):
 def _set_backing_materials(actors, white):
     """バッキング差分レンダ用: マット板の全メッシュスロットを白(1.0)/黒(板の常用
     アンリット材)へ一時差替え（アクター単位の property でなく material のみ・
-    HV コンポーネントは対象外）。復元用 [(comp, slot, 元material)] を返す。"""
+    HV コンポーネントは対象外）。復元用 [(comp, 元 override_materials 配列)] を返す。
+    get_material(i)/set_material(i) で戻すと、override の無いスロットにメッシュ既定材が
+    明示的な override として書き込まれレベルが dirty になるため、配列ごと退避する。"""
     from capture_core import (get_or_create_backing_white_material,
                               get_or_create_matteboard_material)
     mat = (get_or_create_backing_white_material() if white
@@ -1219,18 +1452,18 @@ def _set_backing_materials(actors, white):
         for comp in comps:
             if _is_hv_comp(comp):
                 continue
+            saved.append((comp, list(comp.get_editor_property("override_materials"))))
             for i in range(comp.get_num_materials()):
-                saved.append((comp, i, comp.get_material(i)))
                 comp.set_material(i, mat)
     return saved
 
 
 def _restore_backing_materials(saved):
-    for comp, i, mat in saved or []:
+    for comp, overrides in saved or []:
         try:
-            comp.set_material(i, mat)
-        except Exception:
-            pass
+            comp.set_editor_property("override_materials", overrides)
+        except Exception as e:
+            _warn("バッキング材の復元に失敗: %s" % e)
 
 
 def _set_objid_render_mode(actors):
@@ -1291,6 +1524,35 @@ def _camera_cut_camera_actors(level_sequence, world):
                 if isinstance(o, unreal.CameraActor) and o not in actors:
                     actors.append(o)
     return actors
+
+
+def _first_cut_camera(level_sequence):
+    """先頭（開始フレームが最も早い）カメラカットのカメラ。解決できなければ
+    （スポーナブル等）レベル内の最初のカメラにフォールバック。無ければ None。"""
+    ext = unreal.MovieSceneSequenceExtensions
+    try:
+        secs = []
+        for tr in (ext.find_tracks_by_exact_type(
+                level_sequence, unreal.MovieSceneCameraCutTrack) or []):
+            secs += list(tr.get_sections())
+        secs.sort(key=lambda s: s.get_start_frame() if s.has_start_frame() else -(2 ** 31))
+        bindings = {}
+        for b in ext.get_bindings(level_sequence):
+            bindings[b.get_id().export_text()] = b    # Guid の == は 5.7 で常に False
+        world = _editor_world()
+        for sec in secs:
+            g = sec.get_camera_binding_id().get_editor_property("guid").export_text()
+            b = bindings.get(g)
+            if b is None:
+                continue
+            for o in ext.locate_bound_objects(level_sequence, b, world):
+                if isinstance(o, unreal.CameraActor):
+                    return o
+    except Exception as e:
+        _warn("先頭カメラカットのカメラ解決に失敗: %s" % e)
+    from capture_core import list_cameras
+    cams = list_cameras()
+    return cams[0] if cams else None
 
 
 def _fill_aspect_comp(camera_actor, width, height):
@@ -1365,19 +1627,24 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
                     cloud_backing=None, cloud_sources_off=False,
                     geomask_material=None,
                     backing_actors=None, backing_white=False, use_exr=False,
-                    sky_matte=False, pp_materials_off=False):
+                    sky_matte=False, pp_materials_off=False,
+                    image_format=None, also_png=False):
     """開いている/指定の LevelSequence を MRQ でレンダリング（非同期）。
     一時シーケンスは作らず job.sequence に直接指定し、カメラはシーケンスの
     カメラカットトラックに従う。fps はシーケンスの Display Rate。
     静止画と違いモーションブラーは殺さない（切ると動きがストロボ状になる）。
-    do_png=PNG連番 / do_mp4=内蔵 H.264 MP4（CRF 指定・音声なし）。両方同時可。
+    do_png=画像連番 / do_mp4=内蔵 H.264 MP4（CRF 指定・音声なし）。両方同時可。
+    連番の形式は image_format（"png" 既定 / "jpg" / "exr"。None なら use_exr で
+    exr/png を選ぶ旧指定）。EXR は常に非マルチレイヤ（パス毎に別ファイル）。
+    also_png=True かつ形式が png 以外なら PNG 連番（α無し）も同時に出す
+    （PIL で読む後段の PNG 合成パイプラインをそのまま使うため）。
     depth_material / matte_material / normal_material を渡すと
     additional_post_process_materials でパスが増え、パス毎に別ファイルで出力される。matte_material / matte_sil_material
     には matte_actors も必須（対象を main pass 非表示 + CustomDepth 書き込みに切替え、
     完了時に復元）。matte_sil_material は遮蔽非依存の全投影シルエット（Behind 合成用）。
     hidden_actors は単純な非表示（クリーンプレートのみ。matte とは排他で使う）。
     near_clip_cm でその距離より手前を描画時クリップ（behind-matte のプレート用。
-    グローバル cvar なので完了時に既定 10cm へ戻す）。
+    グローバル cvar なので完了時にプロジェクト既定値へ戻す）。
     出力名: name_body_{render_pass}_take.{frame_number} 。レンダパス名は完了時に
     FinalImage→beauty_label（既定 Beauty）/ FinalImageDepth→Depth /
     FinalImageMatte→Matte にリネーム。beauty_label は behind プレートの2本目ジョブが
@@ -1397,6 +1664,7 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
         raise RuntimeError("ObjectID 出力には対象アクターが必要です。")
 
     sub = unreal.get_editor_subsystem(unreal.MoviePipelineQueueSubsystem)
+    # is_rendering() は 5.8 のレンダ中/チェーンの合間に False になり得るので _KEEP も見る
     if sub.is_rendering() or _KEEP.get("executor") is not None:
         raise RuntimeError("MRQ は既にレンダリング中です。完了までお待ちください（多重起動防止）。")
 
@@ -1410,82 +1678,45 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
         raise RuntimeError("シーケンスにカメラカットトラックがありません。"
                            "Sequencer でカメラカットを追加してください。")
 
-    # シーン状態の変更（レンダ後・起動失敗時に必ず復元）
-    saved_matte = None
-    saved_objid = None
-    saved_cloud = None
-    hidden = []
-    if matte_material is not None or matte_sil_material is not None:
-        saved_matte = _set_matte_render_mode(matte_actors)
-    if hidden_actors:
-        # matte レンダモードと独立に適用する（板＝matte機構 / 雲＝単純非表示 の併用）
-        for a in hidden_actors:
-            try:
-                a.set_actor_hidden_in_game(True)
-                hidden.append(a)
-            except Exception:
-                pass
-    pie_hider = _start_pie_actor_hider(hidden) if hidden else None
-    if objid_material is not None:
-        saved_objid = _set_objid_render_mode(objid_actors)
-    saved_vis = None
-    if cloud_matte_actors and cloud_visible:
-        # 可視雲モード: 何も隠さず PIE 側でバッキング材化（深度順序が保たれる）。
-        # cloud_backing は静止画タブと同義: "white"=T測定(白発光100+微弱fill) /
-        # "black"=ベール輝度(純黒+fillなし) / None=従来の黒+20lux（旧L方式）
-        white = (cloud_backing == "white")
-        fills = (5.0 if cloud_backing == "white"
-                 else 0.0 if cloud_backing == "black" else 20.0)
-        saved_vis = {"pie": _start_pie_backing_white(cloud_matte_actors,
-                                                     white=white),
-                     "fills": _spawn_cloud_fill_lights(fills)}
-        if cloud_sources_off:
-            # 雲なしベール（CloudVeil0）: UDS の雲内フォグ板も PIE 側で隠す
-            # （HV は hidden_actors・雲レイヤーは ShowFlag.Cloud 0 が受け持つ）
-            saved_vis["plane_hider"] = _start_pie_udsplane_hider()
-    elif cloud_matte_actors:
-        # 分離モード固定（render_beauty 側の注記参照。holdout は UE5.7 で出力が壊れている）
-        saved_cloud = _set_cloud_matte_mode(cloud_matte_actors, use_holdout=False)
-    saved_backing = None
-    if backing_actors:
-        saved_backing = _set_backing_materials(backing_actors, backing_white)
-    saved_sky = None
-    if sky_matte:
-        from capture_core import list_cameras
-        cams = list_cameras()
-        if not cams:
-            raise RuntimeError("空マット: カメラが見つかりません")
-        saved_sky = _set_sky_matte_mode(cams[0])
-    # レンダ対象以外の auto-play プレイヤーが PIE で並走するとシーンが二重評価される
-    saved_players = _suppress_autoplay_players()
-    # 全ジョブで適用する。メイン/BehindPlate 間でビュー矩形が食い違うと
-    # per-frame 合成がズレるため（ミスマッチのカメラだけ触る）。
-    saved_cam_aspect = _set_cameras_fill_aspect(level_sequence, width, height)
+    # シーン状態の変更（レンダ後・起動失敗時に必ず復元）。復元クロージャを先に作り、
+    # 変更は st に逐次積む（セットアップ途中の例外でもそれまでの変更だけを戻す）。
+    st = {}
 
     def _restore_scene():
-        if saved_matte:
-            _restore_matte_render_mode(saved_matte)
-        if saved_objid:
-            _restore_objid_render_mode(saved_objid)
-        if saved_cloud:
-            _restore_cloud_matte_mode(saved_cloud)
-        if saved_vis:
-            _restore_visible_cloud_mode(saved_vis)
-        if saved_backing:
-            _restore_backing_materials(saved_backing)
-        if saved_sky:
-            _restore_sky_matte_mode(saved_sky)
-        if pie_hider:
-            pie_hider["stop"]()
-        for a in hidden:
-            try:
-                a.set_actor_hidden_in_game(False)
-            except Exception:
-                pass
-        _restore_autoplay_players(saved_players)
-        _restore_cameras_aspect(saved_cam_aspect)
+        _restore_saved_scene(st)
 
+    _KEEP["restore"] = _restore_scene
     try:
+        if matte_material is not None or matte_sil_material is not None:
+            st["matte"] = _set_matte_render_mode(matte_actors)
+        if hidden_actors:
+            # matte レンダモードと独立に適用する（板＝matte機構 / 雲＝単純非表示 の併用）
+            st["hidden"] = _hide_actors(hidden_actors)
+            # PIE 側は元々 hidden だったものも含めて全指定を隠す（render_beauty と同じ）
+            st["pie_hider"] = _start_pie_actor_hider(hidden_actors)
+        if objid_material is not None:
+            st["objid"] = _set_objid_render_mode(objid_actors)
+        if cloud_matte_actors and cloud_visible:
+            # cloud_backing は静止画タブと同義（_start_visible_cloud_mode 参照）
+            _start_visible_cloud_mode(st, cloud_matte_actors, cloud_backing,
+                                      cloud_sources_off)
+        elif cloud_matte_actors:
+            # 分離モード固定（render_beauty 側の注記参照。holdout は UE5.7 で出力が壊れている）
+            st["cloud"] = _set_cloud_matte_mode(cloud_matte_actors, use_holdout=False)
+        if backing_actors:
+            st["backing"] = _set_backing_materials(backing_actors, backing_white)
+        if sky_matte:
+            # ドーム中心は先頭カメラカットのカメラ（半径は Sky_Sphere の 0.9 倍）
+            cam0 = _first_cut_camera(level_sequence)
+            if cam0 is None:
+                raise RuntimeError("空マット: カメラが見つかりません")
+            st["sky"] = _set_sky_matte_mode(cam0)
+        # レンダ対象以外の auto-play プレイヤーが PIE で並走するとシーンが二重評価される
+        st["players"] = _suppress_autoplay_players()
+        # 全ジョブで適用する。メイン/BehindPlate 間でビュー矩形が食い違うと
+        # per-frame 合成がズレるため（ミスマッチのカメラだけ触る）。
+        st["cam"] = _set_cameras_fill_aspect(level_sequence, width, height)
+
         return _start_sequence_render(sub, level_sequence, output_dir, width, height,
                                       name_body, take_str, do_png, do_mp4, mp4_crf,
                                       temporal_samples, warmup, custom_start, custom_end,
@@ -1500,16 +1731,14 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
                                       geomask_material=geomask_material,
                                       backing=bool(backing_actors), use_exr=use_exr,
                                       sky_matte=sky_matte,
-                                      pp_materials_off=pp_materials_off)
+                                      pp_materials_off=pp_materials_off,
+                                      image_format=image_format, also_png=also_png)
     except Exception:
         _restore_scene()
         if near_clip_cm is not None:
             # 起動前にグローバル適用済みの near clip を戻す
-            try:
-                unreal.SystemLibrary.execute_console_command(
-                    _editor_world(), "r.SetNearClipPlane 10")
-            except Exception:
-                pass
+            _reset_near_clip()
+        _restore_queue()
         _KEEP.clear()      # 起動失敗時に次回レンダを塞がない
         raise
 
@@ -1525,10 +1754,9 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
                            cloud_visible=False, cloud_sources_off=False,
                            geomask_material=None,
                            backing=False, use_exr=False, sky_matte=False,
-                           pp_materials_off=False):
+                           pp_materials_off=False, image_format=None, also_png=False):
     queue = sub.get_queue()
-    for j in list(queue.get_jobs()):
-        queue.delete_job(j)
+    _backup_and_clear_queue(queue)
     job = queue.allocate_new_job(unreal.MoviePipelineExecutorJob)
     ensure_preset_config_mode(job)
     job.job_name = "UE5Capture_Sequence"
@@ -1562,19 +1790,23 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
         # 完了時に _light_label へリネーム）
         cfg.find_or_add_setting_by_class(_lighting_only_class())
 
+    fmt = (image_format or ("exr" if use_exr else "png")).lower()
     if do_png:
-        if use_exr:
+        if fmt == "exr":
             # バッキング差分は線形色の減算が要るため EXR（PNG はトーンマップ後で非線形）
             exr = cfg.find_or_add_setting_by_class(unreal.MoviePipelineImageSequenceOutput_EXR)
             # multilayer だと {render_pass} トークンが空になり W/B ジョブが同名で
             # 上書きし合う（実測）。分割出力で FinalImage 名を出しリネームに乗せる。
             exr.set_editor_property("multilayer", False)
+        elif fmt == "jpg":
+            cfg.find_or_add_setting_by_class(_jpg_output_class())
         else:
             png = cfg.find_or_add_setting_by_class(unreal.MoviePipelineImageSequenceOutput_PNG)
-            try:
-                png.set_editor_property("write_alpha", bool(cloud_matte))
-            except Exception:
-                pass
+            _set_write_alpha(png, cloud_matte, required=bool(cloud_matte))
+        if also_png and fmt != "png":
+            # 後段の PNG 合成パイプライン用に PNG 連番も同時出力
+            png = cfg.find_or_add_setting_by_class(unreal.MoviePipelineImageSequenceOutput_PNG)
+            _set_write_alpha(png, False)
     if do_mp4:
         mp4 = cfg.find_or_add_setting_by_class(unreal.MoviePipelineMP4EncoderOutput)
         mp4.set_editor_property("constant_rate_factor", int(mp4_crf))
@@ -1599,8 +1831,8 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
     out.set_editor_property("zero_pad_frame_numbers", 4)
     try:
         out.set_editor_property("flush_disk_writes_per_shot", True)
-    except Exception:
-        pass
+    except Exception as e:
+        _warn("flush_disk_writes_per_shot を設定できません: %s" % e)
     if custom_start is not None and custom_end is not None:
         out.set_editor_property("use_custom_playback_range", True)
         out.set_editor_property("custom_start_frame", int(custom_start))
@@ -1614,19 +1846,15 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
     aa.set_editor_property("render_warm_up_count", int(warmup))
     try:
         aa.set_editor_property("anti_aliasing_method", unreal.AntiAliasingMethod.AAM_TSR)
-    except Exception:
-        pass
+    except Exception as e:
+        _warn("AA を TSR に設定できません（エンジン既定の AA で続行）: %s" % e)
 
     go = cfg.find_or_add_setting_by_class(unreal.MoviePipelineGameOverrideSetting)
     go.set_editor_property("use_high_quality_shadows", True)
     go.set_editor_property("use_lod_zero", True)
     go.set_editor_property("flush_grass_streaming", True)
     go.set_editor_property("flush_streaming_managers", True)
-    try:
-        go.set_editor_property("texture_streaming",
-                               unreal.MoviePipelineTextureStreamingMethod.FULLY_LOAD)
-    except Exception:
-        pass
+    _set_texture_streaming_full(go)
 
     # モーションブラーは切らない（切ると 24fps でストロボ状の動きになり、
     # MRQ のテンポラルサンプル蓄積ブラーも効かなくなる）→ _HQ_CVARS に含めていない。
@@ -1703,7 +1931,7 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
         cmds.append("r.SetNearClipPlane %f" % float(near_clip_cm))
         _log("near clip = %.1f cm" % float(near_clip_cm))
         # ウォームアップ/先頭サブフレームにも効かせるため起動前にグローバル適用
-        # （半透明ゴースト防止・_on_finished が既定 10cm へ復元）
+        # （半透明ゴースト防止・_on_finished が既定値へ復元）
         unreal.SystemLibrary.execute_console_command(
             _editor_world(), "r.SetNearClipPlane %f" % float(near_clip_cm))
     cv.set_editor_property("start_console_commands", cmds)
@@ -1711,23 +1939,27 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
     executor = unreal.MoviePipelinePIEExecutor()
 
     def _on_finished(exec_obj, success):
-        _log("MRQ シーケンスレンダ完了 success=%s -> %s" % (success, output_dir))
-        restore_scene()             # matte/objid/hidden/auto-play/アスペクトを戻す
-        if near_clip_cm is not None:
-            # near clip はコマンドでグローバルに残るので必ず既定(10cm)へ戻す
+        try:
+            _log("MRQ シーケンスレンダ完了 success=%s -> %s" % (success, output_dir))
             try:
-                unreal.SystemLibrary.execute_console_command(
-                    _editor_world(), "r.SetNearClipPlane 10")
-            except Exception:
-                pass
-        _rename_final_image(output_dir, beauty_label,
-                            light_label if light_pass else None)   # FinalImage -> Beauty ほか
-        _KEEP.clear()
-        if on_done:
-            try:
-                on_done(bool(success), output_dir)
+                restore_scene()         # matte/objid/hidden/auto-play/アスペクトを戻す
             except Exception as e:
-                _warn("on_done でエラー: %s" % e)
+                _warn("シーン復元でエラー: %s" % e)
+            if near_clip_cm is not None:
+                # near clip はコマンドでグローバルに残るので必ず既定値へ戻す
+                _reset_near_clip()
+            # FinalImage -> Beauty ほか（拡張子非依存: png/jpg/exr 共通）
+            _rename_final_image(output_dir, beauty_label,
+                                light_label if light_pass else None)
+            _restore_queue()            # ユーザーの MRQ キューを戻す（_KEEP を消す前に）
+        finally:
+            # 復元で何が起きても必ず解放して通知する（render_beauty 側と同じ）
+            _KEEP.clear()
+            if on_done:
+                try:
+                    on_done(bool(success), output_dir)
+                except Exception as e:
+                    _warn("on_done でエラー: %s" % e)
 
     executor.on_executor_finished_delegate.add_callable(_on_finished)
     _KEEP["executor"] = executor

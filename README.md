@@ -32,7 +32,7 @@ PNG / EXR で書き出す。映像タブは Sequencer で開いている LevelSe
 - **クリーンプレート**: Matte ON のとき Beauty と Z-Depth からマット対象を自動除外（隠せば影/AO も自動で消える）。
 - **解像度**: カメラ設定（アスペクト表示）/ 指定（アスペクト維持トグルで幅⇄高さ自動）。出力名は `[任意名]_[カメラ名]_素材名_NNN`。
 - **anti-aliasing**: Spatial Supersample (1x / 2x / 4x)。Beauty は MRQ の TSR/Temporal。
-- **シーケンスレンダ（映像タブ）**: Sequencer で開いている LevelSequence をカメラカットに従って MRQ レンダ。**素材（Beauty / Z-Depth / Normal / Beauty+Matte(Matteの前) / Matteの奥 / 雲マット / 空マット / ObjectID / Raw Lighting Full(Sun+GI+Sky) / Raw Lighting Direct）それぞれに PNG 連番と H.264 MP4 を個別指定**できる（Raw Lighting Direct は GI/スカイライト/AO を切った直射のみの専用ジョブ。Direct 以外と併用時は2本目ジョブとして自動チェーン。雲マット/空マットのみを選ぶとメインの Beauty ジョブを省略して専用ジョブチェーンから直接開始する）。MRQ は PNG 連番（マスター）を出力し、MP4 は **ffmpeg でシーケンスの Display Rate どおりに**エンコード（CRF プリセット 17/20/24/28 + 数値直接入力・音声なし・余剰フレームは自動トリム）。Matte 系の対象は画像タブの Matte targets、ObjectID は Object ID targets を共用（色↔名前の JSON マニフェスト付き。レンダ中のみ r.CustomDepth=3 に切替えて復元）。フレーム範囲はシーケンス設定または指定。テイク毎サブフォルダ出力のトグルあり。詳細設定の「画像タブの設定をコピー」ボタンで画像タブの解像度 / 出力先 / 品質 / Depth 設定を一括コピー。中間ファイル（内部素材・EXR・トリム前連番）はテイクフォルダ内の `_work_<take>` に集約し、成功時はまとめて削除される。雲マットのヘルパージョブはウォームアップを最大8に抑え、雲なしBG は半解像度でレンダしてコストを削る。
+- **シーケンスレンダ（映像タブ）**: Sequencer で開いている LevelSequence をカメラカットに従って MRQ レンダ。**素材（Beauty / Z-Depth / Normal / Beauty+Matte(Matteの前) / Matteの奥 / 雲マット / 空マット / ObjectID / Raw Lighting Full(Sun+GI+Sky) / Raw Lighting Direct）それぞれに PNG 連番と H.264 MP4 を個別指定**できる（Raw Lighting Direct は GI/スカイライト/AO を切った直射のみの専用ジョブ。Direct 以外と併用時は2本目ジョブとして自動チェーン。雲マット/空マットのみを選ぶとメインの Beauty ジョブを省略して専用ジョブチェーンから直接開始する）。MRQ は PNG 連番（マスター）を出力し、MP4 は **ffmpeg でシーケンスの Display Rate どおりに**エンコード（CRF プリセット 17/20/24/28 + 数値直接入力・音声なし・余剰フレームは自動トリム）。Matte 系の対象と ObjectID の対象は、タブの外（パネル下部）の「対象」カードにある **Matte targets / Object ID targets** を両タブで共用する（色↔名前の JSON マニフェスト付き。レンダ中のみ r.CustomDepth=3 に切替えて復元）。**連番の形式（PNG 8bit / JPG 8bit / EXR 16bit float。Beauty / Raw Lighting に適用、他は常に PNG）と Z-Depth のビット深度（8bit PNG = Beauty と同一ジョブの PP パス / 16bit PNG・EXR float = フレーム毎に SceneCapture で実測した厳密リニア。EXR は生 cm で MP4 と雲抜きなし）を画像タブと同じ欄で選べる**。フレーム範囲はシーケンス設定または指定。テイク毎サブフォルダ出力のトグルあり。詳細設定の「画像タブの設定をコピー」ボタンで画像タブの解像度 / 出力先 / 形式 / 品質 / Depth 設定を一括コピー。中間ファイル（内部素材・EXR・トリム前連番）はテイクフォルダ内の `_work_<take>` に集約し、成功時はまとめて削除される。雲マットのヘルパージョブはウォームアップを最大8に抑え、雲なしBG は半解像度でレンダしてコストを削る。
 - **設定の保持**: 両タブの入力は `Saved/UE5Capture_ui_settings.json` に保存され、次回起動時に復元される。
 - GUI (tkinter) は UE の Slate tick に非ブロッキング統合。tkinter が無い環境は CONFIG ベースの CUI に自動フォールバック。
 
@@ -173,7 +173,8 @@ py "<install dir>/ue5_capture/capture_tool.py"
 ```
 
 GUI が開く。画像タブでカメラ / 解像度 / AA / 出力先 / 各パスを設定し **Capture**、
-映像タブでシーケンスと形式を設定し **シーケンスレンダ** を押す。
+映像タブでシーケンスと形式を設定し **シーケンスレンダ** を押す。Matte / ObjectID の対象は
+パネル下部の「対象」カード（両タブ共通）で指定する。レンダ中は両タブのボタンが無効になる。
 詳細（CUI / CONFIG モード、出力仕様、Matte 方式、安全性）は
 [`ue5_capture/README.md`](ue5_capture/README.md)、シーケンスレンダの仕様は
 [`ue5_capture_sequence_spec.md`](ue5_capture_sequence_spec.md) を参照。

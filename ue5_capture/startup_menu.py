@@ -21,7 +21,7 @@ _ENTRY = "UE5CaptureLaunch"
 # capture_menu.on_open_panel()（次の Slate tick に遅延して開く）を経由する。
 _LAUNCH_CMD = (
     "import sys\n"
-    "p = r'%s'\n"
+    "p = %r\n"
     "if p not in sys.path:\n"
     "    sys.path.insert(0, p)\n"
     "import capture_menu\n"

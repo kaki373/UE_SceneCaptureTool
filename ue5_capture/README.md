@@ -1,6 +1,6 @@
-# UE5.7 Scene Capture Tool
+# UE5.7/5.8 Scene Capture Tool
 
-Unreal Engine **5.7** のエディタ上で動く Python シーンキャプチャツール。
+Unreal Engine **5.7 / 5.8** のエディタ上で動く Python シーンキャプチャツール。
 シーン内の既存 **CineCamera** を指定し、同一フレーム・同一解像度で
 
 - **Beauty**（＝ビューポート/シーケンサ相当の高品質カラー）
@@ -41,9 +41,9 @@ UE の Output Log を Python に切替えて：
 ```
 py "<install dir>/ue5_capture/capture_tool.py"
 ```
-ウィンドウ「**Scene Capture Tool (UE5.7) ★Beauty版★**」が開く。設定後、唯一のボタン
-**▶ Capture (Beauty + Depth/Matte/ObjectID)** を押すと、データ系を出力 → MRQ Beauty（PIE に入る）→
-Beauty 合成、の順で全パスが揃う。
+ウィンドウ「**Scene Capture Tool**」（画像 / 映像の 2 タブ）が開く。設定後、タブ下端のボタン
+**キャプチャ**（映像タブは **シーケンスレンダ**）を押すと、データ系を出力 → MRQ Beauty（PIE に入る）→
+Beauty 合成、の順で全パスが揃う。Matte / ObjectID の対象はパネル下部の「対象」カード（両タブ共通）。
 
 > 出力先が無効になる「残留ウィンドウ」を避けるため、`show()` は登録簿（`unreal._ue5capture_windows`）
 > 経由で既存ウィンドウを閉じてから1枚だけ開く。コード変更後にウィンドウが増えたら
@@ -148,7 +148,7 @@ OFF=雲を完全無視した従来の書き出し＝雲対象は注記を出し�
 
 ---
 
-## UE5.7 API の要点（ハマりどころ）
+## UE5.7/5.8 API の要点（ハマりどころ）
 - **列挙体**：`unreal.TextureRenderTargetFormat`（×`RenderTargetFormat`）、
   `RenderingLibrary`（×`KismetRenderingLibrary`）、`SceneCapturePrimitiveRenderMode.PRM_USE_SHOW_ONLY_LIST`。
 - **Depth は RGBA16F 必須**：`SCS_SCENE_DEPTH` を **R32F** に撮ると全画素一定値になる不具合。

@@ -2,7 +2,7 @@
 """
 capture_menu.py  --  メニューバー「SceneCapture」メニュー + ツールバーボタンの登録
 
-導入（ue2max と同じ方式・プロジェクト毎に1回）:
+導入（Python の Startup Scripts に登録する方式・プロジェクト毎に1回）:
   Project Settings > Plugins > Python > Startup Scripts の「+Add」に
   このファイルのパスを追加してエディタを再起動する:
 
@@ -54,13 +54,18 @@ def on_open_panel():
             # レンダ中の reload/UI再構築は、実行中ジョブの executor と
             # シーン復元コールバックを破壊する（アクターが隠れたまま残る事故の
             # 実測あり 2026-07-24）。ジョブチェーンの合間も _KEEP で検出して中止。
+            # is_rendering() は UE5.8 のレンダ中にも False を返すことがある（実測）
+            # ため、必ず _KEEP と併用する。判定自体が失敗したら安全側（busy）に倒す。
+            # unreal._ue5capture_busy は UI がクリックから最後の後処理/MP4 エンコード
+            # まで立てるチェーン全体のフラグ（ジョブ間や ffmpeg 中は上の2つが空になる）。
             try:
-                busy = unreal.get_editor_subsystem(
+                busy = bool(getattr(unreal, "_ue5capture_busy", False))
+                busy = busy or unreal.get_editor_subsystem(
                     unreal.MoviePipelineQueueSubsystem).is_rendering()
                 _m = sys.modules.get("capture_mrq")
                 busy = busy or bool(_m and _m._KEEP.get("executor") is not None)
             except Exception:
-                busy = False
+                busy = True
             if busy:
                 unreal.log_warning(
                     "[SceneCapture] レンダリング中のためパネルの再構築を中止しました。"
@@ -77,6 +82,27 @@ def on_open_panel():
             unreal.log_error("[SceneCapture] パネルを開けませんでした: %s" % ex)
 
     state["h"] = unreal.register_slate_post_tick_callback(_open_once)
+
+
+def on_force_reset():
+    """レンダ状態の強制リセット。完了通知が来ずにツールが「レンダ中」のまま
+    固まったとき用（capture_mrq.force_reset: 実際にレンダ中なら何もしない）。"""
+    _m = sys.modules.get("capture_mrq")
+    if _m is None:
+        unreal._ue5capture_busy = False
+        unreal.log("[SceneCapture] 強制リセット: capture_mrq 未ロードのためチェーンの"
+                   "busy フラグだけ解除しました。")
+        return
+    try:
+        ok = _m.force_reset()
+    except Exception as ex:
+        unreal.log_error("[SceneCapture] 強制リセットに失敗: %s" % ex)
+        return
+    if ok:
+        unreal._ue5capture_busy = False     # UI のチェーン全体フラグ（保持中の復元の後に解除）
+        unreal.log("[SceneCapture] 強制リセット: レンダ状態を解放しました。")
+    else:
+        unreal.log_warning("[SceneCapture] 強制リセット: レンダ中のため実行しませんでした。")
 
 
 def _settings_json_path():
@@ -156,6 +182,11 @@ def register():
         "Settings", "Settings...",
         "UI 設定 JSON (Saved/UE5Capture_ui_settings.json) を開く",
         "on_settings()"))
+    sub.add_menu_entry("misc", _entry(
+        "ForceReset", "強制リセット",
+        "レンダ完了通知が来ずに「レンダ中」のまま固まったとき、シーン状態と"
+        "MRQ キューを戻してレンダ状態を解放する（レンダ中は何もしない）",
+        "on_force_reset()"))
 
     # ツールバーの SceneCapture ボタンも登録（セッション内での二重登録は防ぐ）
     try:

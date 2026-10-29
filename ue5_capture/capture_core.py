@@ -5,7 +5,8 @@ capture_core.py  --  UE5.7/5.8 Scene Capture core logic
 SceneCaptureComponent2D + TextureRenderTarget2D をランタイムで Spawn / 生成し、
 Color / Z-Depth / Matte Alpha の各パスをキャプチャしてディスクへ書き出す。
 すべて Transient パッケージ上で生成し、キャプチャ後（例外時含む）に確実に破棄する。
-.uasset の保存は一切行わない。
+.uasset として保存するのは /Game/_UE5Capture_Tmp 下の一時 PP マテリアル群と
+マット板用の MatteBoard 材（M_UE5Cap_MatteBoardUnlit。レベルから参照される）だけ。
 
 外部依存（仕様書 ue5_capture_tool_prompt.md の「外部依存」節を参照）:
   - numpy   : 必須（RenderTarget 画素の後処理。AA ダウンスケール / Depth 正規化 / Matte 閾値）
@@ -19,6 +20,7 @@ UE の RenderTarget は全画素を Python から高速に読み取る API が�
 import os
 import re
 import math
+import uuid
 import datetime
 
 import unreal
@@ -59,6 +61,17 @@ def _err(msg):
     unreal.log_error(_TAG + str(msg))
 
 
+_WARNED_ONCE = set()
+
+
+def _warn_once(key, msg):
+    """同じ key の警告はセッション中1回だけ出す（フレーム毎ループ等での連打防止）。"""
+    if key in _WARNED_ONCE:
+        return
+    _WARNED_ONCE.add(key)
+    _warn(msg)
+
+
 # ----------------------------------------------------------------------------
 # エンジンバージョン差の吸収（UE5.7 / 5.8）
 #   ツールが使う API は 5.7 と 5.8 で同名・同シグネチャ（2026-10-29 リフレクション
@@ -75,6 +88,45 @@ def ensure_preset_config_mode(job):
         return
     if job.get_config_mode() != mode_enum.PRESET:
         job.set_config_mode(mode_enum.PRESET)
+
+
+def default_near_clip_cm():
+    """プロジェクト設定の near clip（GEngine の NearClipPlane, cm）。
+    r.SetNearClipPlane はコマンドで自動復元されないため、撮影後はこの値へ戻す
+    （10 固定で戻すと DefaultEngine.ini で変えているプロジェクトで値が変わったままになる）。
+    読めなければエンジン既定（BaseEngine.ini）の 10.0。
+    UEngine は Python に公開されていない（5.7 実測: unreal.Engine が無い）ので、
+    プロジェクトの DefaultEngine.ini の [/Script/Engine.Engine] NearClipPlane を読む。
+    ⚠ 簡易読み: プラットフォーム別 ini / Saved 側の上書きは見ない。厳密にするなら
+    C++ 側で GNearClippingPlane を返す関数を公開する。結果はモジュール変数にキャッシュ。"""
+    global _NEAR_CLIP_CACHE
+    if _NEAR_CLIP_CACHE is None:
+        _NEAR_CLIP_CACHE = _read_near_clip_ini()
+    return _NEAR_CLIP_CACHE
+
+
+_NEAR_CLIP_CACHE = None
+
+
+def _read_near_clip_ini():
+    try:
+        ini = os.path.join(unreal.Paths.project_config_dir(), "DefaultEngine.ini")
+        if os.path.isfile(ini):
+            sec = None
+            v = None
+            with open(ini, "r", encoding="utf-8-sig", errors="replace") as f:
+                for line in f:
+                    s = line.strip()
+                    if s.startswith("["):
+                        sec = s
+                    elif sec == "[/Script/Engine.Engine]" and \
+                            s.lower().startswith("nearclipplane="):
+                        v = float(s.split("=", 1)[1])
+            if v is not None and v > 0.0:
+                return v
+    except Exception as e:
+        _warn_once("near_clip", "near clip 設定を読めないため 10cm で復元します: %s" % e)
+    return 10.0
 
 
 # ----------------------------------------------------------------------------
@@ -264,7 +316,8 @@ def _apply_game_show_flags(comp, fog_off=False):
     try:
         names = list(_EDITOR_ONLY_SHOW_FLAGS)
         if fog_off:
-            names += ["Fog", "AtmosphericFog", "VolumetricFog", "Bloom"]
+            # 大気の ShowFlag は UE5 では "Atmosphere"（"AtmosphericFog" は UE4 名で無視される）
+            names += ["Fog", "Atmosphere", "AtmosphericFog", "VolumetricFog", "Bloom"]
         settings = []
         for name in names:
             try:
@@ -272,8 +325,8 @@ def _apply_game_show_flags(comp, fog_off=False):
                 fs.set_editor_property("show_flag_name", name)
                 fs.set_editor_property("enabled", False)
                 settings.append(fs)
-            except Exception:
-                pass
+            except Exception as e:
+                _warn_once("showflag:" + name, "ShowFlag %s を設定できません: %s" % (name, e))
         if settings:
             comp.set_editor_property("show_flag_settings", settings)
     except Exception as e:
@@ -286,12 +339,33 @@ def _spawn_capture(world, transform, fov, rt, source,
     """SceneCapture2D アクターを Spawn して1フレームキャプチャし、アクターを返す。
     clip_base/clip_normal を渡すと、その平面の normal-負側（手前）を描画時にクリップする。
     fog_off=True で Fog を OFF にして撮る。"""
+    actor = _spawn_transient_capture_actor(transform)
+    try:
+        _setup_and_capture(actor, fov, rt, source, show_only_actors, hidden_actors,
+                           post_process, clip_base, clip_normal, fog_off)
+    except Exception:
+        # 呼び出し側の spawned へ入る前に失敗するとレベルに残るのでここで破棄する
+        _destroy_actors([actor])
+        raise
+    return actor
+
+
+def _spawn_transient_capture_actor(transform):
+    """SceneCapture2D を transient で Spawn する（レベルを dirty にせず Undo にも積まない）。"""
     loc = transform.translation
     rot = transform.rotation.rotator()
-    actor = _actor_subsystem().spawn_actor_from_class(unreal.SceneCapture2D, loc, rot)
+    sub = _actor_subsystem()
+    try:
+        actor = sub.spawn_actor_from_class(unreal.SceneCapture2D, loc, rot, transient=True)
+    except TypeError:
+        actor = sub.spawn_actor_from_class(unreal.SceneCapture2D, loc, rot)
     if actor is None:
         raise RuntimeError("SceneCapture2D の Spawn に失敗しました。")
+    return actor
 
+
+def _setup_and_capture(actor, fov, rt, source, show_only_actors, hidden_actors,
+                       post_process, clip_base, clip_normal, fog_off):
     comp = actor.capture_component2d
     comp.set_editor_property("fov_angle", float(fov))
     comp.set_editor_property("texture_target", rt)
@@ -327,7 +401,6 @@ def _spawn_capture(world, transform, fov, rt, source,
             comp.hide_actor_components(ha)
 
     comp.capture_scene()
-    return actor
 
 
 def _destroy_actors(actors):
@@ -354,18 +427,36 @@ def _temp_dir():
 def _export_rt(world, rt, ext):
     """RenderTarget を一時ファイルへ書き出し、絶対パスを返す。"""
     tdir = _temp_dir()
-    fname = "rt_tmp_%d%s" % (id(rt), ext)
-    unreal.RenderingLibrary.export_render_target(world, rt, tdir, fname)
+    # export_render_target は失敗しても例外を出さないので、名前を毎回一意にし
+    # 既存ファイルを消してから書く（古い画像を今回のキャプチャとして読まない）
+    fname = "rt_tmp_%s%s" % (uuid.uuid4().hex, ext)
     path = os.path.join(tdir, fname)
+    if os.path.isfile(path):
+        os.remove(path)
+    unreal.RenderingLibrary.export_render_target(world, rt, tdir, fname)
     if not os.path.isfile(path):
         raise RuntimeError("RenderTarget のエクスポートに失敗しました: %s" % path)
     return path
 
 
-def _read_ldr(path):
-    """PNG など LDR 画像を numpy uint8 (H,W,C) で読む。"""
-    img = _PILImage.open(path)
-    return _np.asarray(img)
+def _read_ldr(path, delete=False):
+    """PNG など LDR 画像を numpy uint8 (H,W,C) で読む。delete=True なら読んだ後に消す。"""
+    with _PILImage.open(path) as img:
+        arr = _np.array(img)
+    if delete:
+        try:
+            os.remove(path)
+        except Exception as e:
+            _warn("一時ファイルを削除できません %s: %s" % (path, e))
+    return arr
+
+
+def _release_rt(rt):
+    """RenderTarget の GPU リソースを即時解放する（GC はフレーム毎ループ中に走らない）。"""
+    try:
+        unreal.RenderingLibrary.release_render_target2d(rt)
+    except Exception as e:
+        _warn_once("release_rt", "RenderTarget の解放に失敗: %s" % e)
 
 
 # ----------------------------------------------------------------------------
@@ -377,9 +468,9 @@ def _read_rt_raw_r(world, rt, width, height):
     """RenderTarget の R チャンネルを生値のまま numpy float32 (H,W) で返す。"""
     samples = unreal.RenderingLibrary.read_render_target_raw(world, rt, False)
     n = width * height
-    a = _np.fromiter((c.r for c in samples), dtype=_np.float32, count=min(n, len(samples)))
-    if a.size < n:
-        a = _np.resize(a, n)
+    if len(samples) < n:
+        raise RuntimeError("RenderTarget の読み出しが不足 (%d / %d 画素)" % (len(samples), n))
+    a = _np.fromiter((c.r for c in samples), dtype=_np.float32, count=n)
     return a.reshape(height, width)
 
 
@@ -392,11 +483,12 @@ _DEPTH_FAR_CM = 60000.0
 _DEPTH_FAR_32F = 1.0e7
 
 
-def _visible_mask(target_depth, full_depth):
+def _visible_mask(target_depth, full_depth, far=_DEPTH_FAR_CM):
     """show-only 深度と全シーン深度の一致で「対象が最前面に見える画素」の bool マスクを返す。
-    手前に非対象物がある画素は target と full の差が許容値を超えて除外される（オクルージョン考慮）。"""
+    手前に非対象物がある画素は target と full の差が許容値を超えて除外される（オクルージョン考慮）。
+    far は「空/未ヒット」しきい値（32F で撮った深度なら _DEPTH_FAR_32F を渡す）。"""
     tol = _np.maximum(full_depth * 0.02, 10.0)
-    return (target_depth < _DEPTH_FAR_CM) & (_np.abs(target_depth - full_depth) <= tol)
+    return (target_depth < far) & (_np.abs(target_depth - full_depth) <= tol)
 
 
 def _render_depth_r(world, cam, w, h, spawned, show_only_actors=None,
@@ -409,12 +501,48 @@ def _render_depth_r(world, cam, w, h, spawned, show_only_actors=None,
     rt = _make_render_target(world, w, h,
                              fmt or unreal.TextureRenderTargetFormat.RTF_RGBA16F,
                              True)
-    actor = _spawn_capture(world, cam["transform"], cam["fov"], rt,
-                           unreal.SceneCaptureSource.SCS_SCENE_DEPTH,
-                           show_only_actors=show_only_actors, hidden_actors=hidden_actors,
-                           clip_base=clip_base, clip_normal=clip_normal)
-    spawned.append(actor)
-    return _read_rt_raw_r(world, rt, w, h)
+    try:
+        actor = _spawn_capture(world, cam["transform"], cam["fov"], rt,
+                               unreal.SceneCaptureSource.SCS_SCENE_DEPTH,
+                               show_only_actors=show_only_actors, hidden_actors=hidden_actors,
+                               clip_base=clip_base, clip_normal=clip_normal)
+        spawned.append(actor)
+        return _read_rt_raw_r(world, rt, w, h)
+    finally:
+        _release_rt(rt)
+
+
+def _depth_rt_broken(d):
+    """32F 深度が R32F 系バグ（全画素一定値）に該当するか。
+    全画素が空/未ヒット（板が画面外のフレーム等）でも ptp=0 になるので、それは
+    バグ扱いしない（誤判定すると以降ずっと 16F に固定され 655m 超が抜ける）。"""
+    if d is None or d.size == 0:
+        return False
+    if float(d.min()) >= _DEPTH_FAR_32F:
+        return False
+    return float(_np.ptp(d)) < 1e-3
+
+
+def _depth_fmt(state):
+    return (unreal.TextureRenderTargetFormat.RTF_RGBA32F if state.get("use32", True)
+            else unreal.TextureRenderTargetFormat.RTF_RGBA16F)
+
+
+def _render_depth_r_auto(world, cam, w, h, spawned, state, label="Depth", **kw):
+    """_render_depth_r を RGBA32F で撮り、R32F 系バグ（全画素一定値）なら RGBA16F で
+    撮り直す。state={"use32": True} を呼び出し側で共有すると、一度 16F に落ちた後は
+    以降の呼び出しも 16F で撮る（フレーム毎に 32F を無駄撃ちしない）。
+    戻り値 (depth, far): far はその深度に使う空/未ヒットしきい値
+    （32F=_DEPTH_FAR_32F / 16F=_DEPTH_FAR_CM）。kw は _render_depth_r へそのまま渡す。"""
+    if state.get("use32", True):
+        d = _render_depth_r(world, cam, w, h, spawned,
+                            fmt=unreal.TextureRenderTargetFormat.RTF_RGBA32F, **kw)
+        if not _depth_rt_broken(d):
+            return d, _DEPTH_FAR_32F
+        _warn("%s: RGBA32F が定数値（深度RTバグ該当）→ RGBA16F へ退避"
+              "（655m 超と空は飽和）" % label)
+        state["use32"] = False
+    return _render_depth_r(world, cam, w, h, spawned, **kw), _DEPTH_FAR_CM
 
 
 def measure_depth_range(camera_actor, w=384, h=216,
@@ -433,17 +561,13 @@ def measure_depth_range(camera_actor, w=384, h=216,
     try:
         # RGBA32F で FP16 の 655m 飽和を回避（R32F 単チャンネルのみのバグ）。
         # 万一 32F が全画素一定（バグ該当）なら 16F に落として続行
-        d = _render_depth_r(world, cam, int(w), int(h), spawned,
-                            fmt=unreal.TextureRenderTargetFormat.RTF_RGBA32F)
-        if d is not None and float(_np.ptp(d)) < 1e-3:
-            _warn("Depth自動レンジ: RGBA32F が定数値（バグ該当）→ RGBA16F で再測定"
-                  "（655m 超は飽和）")
-            d = _render_depth_r(world, cam, int(w), int(h), spawned)
+        d, far_th = _render_depth_r_auto(world, cam, int(w), int(h), spawned,
+                                         {"use32": True}, label="Depth自動レンジ")
     finally:
         _destroy_actors(spawned)
     if d is None:
         return None
-    v = d[(d > 1.0) & (d < 1e7)]
+    v = d[(d > 1.0) & (d < far_th)]
     if v.size < 64:
         return None
     near = float(_np.percentile(v, lo_pct)) * (1.0 - pad)
@@ -476,13 +600,16 @@ def _render_final_color(world, settings, cam, w, h, aa, spawned,
     pp = _resolve_color_pp(world, settings, cam)
     rt = _make_render_target(world, w * aa, h * aa,
                              unreal.TextureRenderTargetFormat.RTF_RGBA8, False)
-    actor = _spawn_capture(world, cam["transform"], cam["fov"], rt,
-                           unreal.SceneCaptureSource.SCS_FINAL_COLOR_LDR,
-                           hidden_actors=hidden_actors, post_process=pp,
-                           clip_base=clip_base, clip_normal=clip_normal,
-                           fog_off=fog_off)
-    spawned.append(actor)
-    arr = _read_ldr(_export_rt(world, rt, ".png"))
+    try:
+        actor = _spawn_capture(world, cam["transform"], cam["fov"], rt,
+                               unreal.SceneCaptureSource.SCS_FINAL_COLOR_LDR,
+                               hidden_actors=hidden_actors, post_process=pp,
+                               clip_base=clip_base, clip_normal=clip_normal,
+                               fog_off=fog_off)
+        spawned.append(actor)
+        arr = _read_ldr(_export_rt(world, rt, ".png"), delete=True)
+    finally:
+        _release_rt(rt)
     return _downscale(arr, aa)
 
 
@@ -503,10 +630,11 @@ def _probe_luma(world, cam, bias, pw=160, ph=90):
     """小サイズで1枚撮り、median 輝度(0-255 sRGB)を返す（露出キャリブレーション用）。"""
     rt = _make_render_target(world, pw, ph,
                              unreal.TextureRenderTargetFormat.RTF_RGBA8, False)
-    actor = _spawn_capture(world, cam["transform"], cam["fov"], rt,
-                           unreal.SceneCaptureSource.SCS_FINAL_COLOR_LDR,
-                           post_process=_manual_exposure_pp(bias))
+    actor = None
     try:
+        actor = _spawn_capture(world, cam["transform"], cam["fov"], rt,
+                               unreal.SceneCaptureSource.SCS_FINAL_COLOR_LDR,
+                               post_process=_manual_exposure_pp(bias))
         RL = unreal.RenderingLibrary
         vals = []
         for yy in range(4, ph, 8):
@@ -515,6 +643,7 @@ def _probe_luma(world, cam, bias, pw=160, ph=90):
                 vals.append((px.r + px.g + px.b) / 3.0)
     finally:
         _destroy_actors([actor])
+        _release_rt(rt)
     vals.sort()
     return vals[len(vals) // 2] if vals else 0.0
 
@@ -573,22 +702,25 @@ def _write_png_u16_gray(path, arr01):
 
 
 def _write_exr_gray(path, arr):
-    """単一チャンネル float を EXR で書く。失敗時 False。"""
+    """単一チャンネル float を 32bit float EXR で書く。失敗時 False。
+    imageio(FreeImage) は flags 無しだと half で書く（65504cm≈655m 超が inf になり
+    50000cm も 49984 に量子化される実測）ので EXR_FLOAT を明示する。"""
     try:
-        import imageio
-        imageio.imwrite(path, arr.astype(_np.float32))
+        import imageio.v2 as _iio
+        from imageio.plugins.freeimage import IO_FLAGS
+        _iio.imwrite(path, arr.astype(_np.float32), flags=IO_FLAGS.EXR_FLOAT)
         return True
-    except Exception:
-        pass
+    except Exception as e:
+        _warn_once("exr_imageio", "imageio で EXR を書けません（OpenEXR を試します）: %s" % e)
     try:
         import OpenEXR
         import Imath
         h, w = arr.shape[0], arr.shape[1]
         hdr = OpenEXR.Header(w, h)
-        half = Imath.Channel(Imath.PixelType(Imath.PixelType.HALF))
-        hdr["channels"] = {"R": half, "G": half, "B": half}
+        fch = Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT))
+        hdr["channels"] = {"R": fch, "G": fch, "B": fch}
         out = OpenEXR.OutputFile(path, hdr)
-        data = arr.astype(_np.float16).tobytes()
+        data = _np.ascontiguousarray(arr, dtype=_np.float32).tobytes()
         out.writePixels({"R": data, "G": data, "B": data})
         out.close()
         return True
@@ -617,7 +749,7 @@ def next_take_number(output_dir):
             m = dirpat.search(f)
             if m:
                 mx = max(mx, int(m.group(1)))
-        elif f.lower().endswith((".png", ".exr", ".json", ".mp4")):
+        elif f.lower().endswith((".png", ".exr", ".jpg", ".jpeg", ".json", ".mp4")):
             for m in pat.finditer(f):
                 mx = max(mx, int(m.group(1)))
     return mx + 1
@@ -744,13 +876,8 @@ def _capture_depth(world, settings, cam, w, h, ts, spawned):
     # RGBA32F で撮る: 16F だと空/未ヒットと 655m 超が half 最大 65504cm に飽和し、
     # far>655m のとき空が「far より手前」扱いでグレーに残る（far=700m で空 6.4%
     # グレーの実測 2026-08-27）。32F が定数値（R32F 系バグ該当）なら 16F へ退避
-    depth = _render_depth_r(world, cam, w * aa, h * aa, spawned,
-                            hidden_actors=hidden,
-                            fmt=unreal.TextureRenderTargetFormat.RTF_RGBA32F)
-    if depth is not None and float(_np.ptp(depth)) < 1e-3:
-        _warn("Depth: RGBA32F が定数値 → RGBA16F で再取得（655m 超と空は飽和）")
-        depth = _render_depth_r(world, cam, w * aa, h * aa, spawned,
-                                hidden_actors=hidden)
+    depth, _far = _render_depth_r_auto(world, cam, w * aa, h * aa, spawned,
+                                       {"use32": True}, hidden_actors=hidden)
     depth = _downscale(depth, aa)  # cm 単位の距離（空/未ヒットは 1e8 オーダー）
 
     near, far = settings.depth_near, settings.depth_far
@@ -829,10 +956,13 @@ def _capture_matte(world, settings, cam, w, h, ts, spawned):
     try:
         # 全シーン深度と対象のみ(show-only)深度の一致で、対象が「実際に最前面に
         # 見えている」画素だけマット化する（オクルージョン考慮）。
-        full = _render_depth_r(world, cam, w * aa, h * aa, spawned)
-        grp = _render_depth_r(world, cam, w * aa, h * aa, spawned,
-                              show_only_actors=actors)
-        sel = _visible_mask(grp, full).astype(_np.float32)
+        # 600m 超の対象も拾えるよう RGBA32F（定数値なら 16F・600m しきい値へ退避）
+        st = {"use32": True}
+        full, _f = _render_depth_r_auto(world, cam, w * aa, h * aa, spawned, st,
+                                        label="Matte")
+        grp, far = _render_depth_r_auto(world, cam, w * aa, h * aa, spawned, st,
+                                        label="Matte", show_only_actors=actors)
+        sel = _visible_mask(grp, full, far=far).astype(_np.float32)
         if settings.matte_invert:
             sel = 1.0 - sel          # 選択=黒 / 周囲=白
         mask = _downscale(sel * 255.0, aa)  # 縁が AA される
@@ -854,6 +984,17 @@ def _capture_matte(world, settings, cam, w, h, ts, spawned):
         _restore_custom_depth(saved)
 
 
+def _objid_u8(r, g, b):
+    """ObjectID の塗り色（0..1 の rgb → PNG に書かれる値と同じ rint 丸めの 0..255）。
+    マニフェストのキーもこの値から作る（int 切り捨てだと画素と 1 ずれる）。"""
+    return _np.clip(_np.rint(_np.array([r, g, b], dtype=_np.float64) * 255.0),
+                    0, 255).astype(_np.float32)
+
+
+def _objid_key(col):
+    return "#%02X%02X%02X" % (int(col[0]), int(col[1]), int(col[2]))
+
+
 def _capture_object_id(world, settings, cam, w, h, ts, spawned):
     """選択/指定アクターを色分けした Object ID 1枚 + 色→名前の対応 JSON を出力。
     オクルージョンは全シーン深度と各アクター深度の一致で正しく解決する。"""
@@ -863,8 +1004,10 @@ def _capture_object_id(world, settings, cam, w, h, ts, spawned):
         _warn("Object ID 対象アクターがありません（選択 or 名前リストを指定）。スキップします。")
         return None
 
-    # 全シーン深度（オクルージョン解決用）
-    full = _render_depth_r(world, cam, w, h, spawned)
+    # 全シーン深度（オクルージョン解決用）。600m 超の対象が「見えない」扱いで
+    # マニフェストから落ちないよう RGBA32F（定数値なら 16F へ退避）
+    st = {"use32": True}
+    full, _f = _render_depth_r_auto(world, cam, w, h, spawned, st, label="Object ID")
 
     id_rgb = _np.zeros((h, w, 3), dtype=_np.float32)
     coverage = _np.zeros((h, w), dtype=bool)   # 対象全体の可視カバレッジ（アルファ用）
@@ -875,8 +1018,9 @@ def _capture_object_id(world, settings, cam, w, h, ts, spawned):
             label = act.get_actor_label()
         except Exception:
             continue
-        ad = _render_depth_r(world, cam, w, h, spawned, show_only_actors=[act])
-        vis = _visible_mask(ad, full)          # そのアクターが最前面に見える画素
+        ad, far = _render_depth_r_auto(world, cam, w, h, spawned, st,
+                                       label="Object ID", show_only_actors=[act])
+        vis = _visible_mask(ad, full, far=far)  # そのアクターが最前面に見える画素
         if not bool(vis.any()):
             continue
         coverage |= vis
@@ -886,9 +1030,9 @@ def _capture_object_id(world, settings, cam, w, h, ts, spawned):
         val = 1.0 - 0.20 * ((idx // 3) % 2)
         idx += 1
         r, g, b = colorsys.hsv_to_rgb(hue, sat, val)
-        col = _np.array([r, g, b], dtype=_np.float32) * 255.0
+        col = _objid_u8(r, g, b)
         id_rgb[vis] = col
-        manifest["#%02X%02X%02X" % (int(col[0]), int(col[1]), int(col[2]))] = label
+        manifest[_objid_key(col)] = label
 
     outs = []
     out = _out_path(settings, ts, "ObjectID", ".png")
@@ -978,16 +1122,13 @@ def set_matte_shadow_occlusion(actors, enabled):
         for comp in a.get_components_by_class(unreal.PrimitiveComponent):
             if _is_hv_comp(comp):
                 continue   # ボリューム(雲)は板ではない: ライティング分離しない
-            try:
-                comp.set_editor_property("cast_shadow", bool(enabled))
-            except Exception:
-                pass
-            for prop in ("affect_distance_field_lighting",
+            for prop in ("cast_shadow", "affect_distance_field_lighting",
                          "affect_dynamic_indirect_lighting"):
                 try:
                     comp.set_editor_property(prop, bool(enabled))
-                except Exception:
-                    pass
+                except Exception as e:
+                    _warn("Matte ライティング分離: %s.%s を設定できません: %s"
+                          % (comp.get_name(), prop, e))
             n += 1
     _log("Matte 影/オクルージョン = %s（%d component）" % ("ON" if enabled else "OFF", n))
     return n
@@ -1004,22 +1145,28 @@ def get_or_create_matteboard_material():
     バッキング差分の黒側も 0 になり数学が単純化する。"""
     full = _TMP_MAT_PKG + "/" + _TMP_MATTEBOARD_NAME
     mat = None
+    MEL = unreal.MaterialEditingLibrary
     if unreal.EditorAssetLibrary.does_asset_exist(full):
         mat = unreal.EditorAssetLibrary.load_asset(full)
+        # 既存で Emissive が繋がっていればそのまま返す。毎回作り直すと再コンパイルで
+        # 固まり、uasset の上書き保存で SVN 作業コピーが常に「変更あり」になる
+        if (mat is not None and _emissive_connected(mat)
+                and mat.get_editor_property("shading_model")
+                == unreal.MaterialShadingModel.MSM_UNLIT):
+            return mat
     if mat is None:
         at = unreal.AssetToolsHelpers.get_asset_tools()
         mat = at.create_asset(_TMP_MATTEBOARD_NAME, _TMP_MAT_PKG,
                               unreal.Material, unreal.MaterialFactoryNew())
     if mat is None:
         raise RuntimeError("MatteBoard マテリアルの生成に失敗しました。")
-    MEL = unreal.MaterialEditingLibrary
     mat.set_editor_property("shading_model", unreal.MaterialShadingModel.MSM_UNLIT)
     try:
         MEL.delete_all_material_expressions(mat)
-    except Exception:
-        pass
+    except Exception as ex:
+        _warn("MatteBoard マテリアルの式削除に失敗: %s" % ex)
     e = _mx_const(mat, 0.0, -300, 0)    # 純黒（放射ゼロ）
-    MEL.connect_material_property(e, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+    _mx_prop(e, unreal.MaterialProperty.MP_EMISSIVE_COLOR)
     MEL.recompile_material(mat)
     try:
         unreal.EditorAssetLibrary.save_loaded_asset(mat)
@@ -1081,12 +1228,12 @@ def get_or_create_backing_clear_material():
     mat.set_editor_property("two_sided", True)
     try:
         MEL.delete_all_material_expressions(mat)
-    except Exception:
-        pass
+    except Exception as ex:
+        _warn("BackingClear マテリアルの式削除に失敗: %s" % ex)
     z = _mx_const(mat, 0.0, -300, 0)
-    MEL.connect_material_property(z, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+    _mx_prop(z, unreal.MaterialProperty.MP_EMISSIVE_COLOR)
     z2 = _mx_const(mat, 0.0, -300, 150)
-    MEL.connect_material_property(z2, "", unreal.MaterialProperty.MP_OPACITY)
+    _mx_prop(z2, unreal.MaterialProperty.MP_OPACITY)
     MEL.recompile_material(mat)
     try:
         unreal.EditorAssetLibrary.save_loaded_asset(mat)
@@ -1118,10 +1265,10 @@ def get_or_create_backing_white_material():
     mat.set_editor_property("two_sided", True)
     try:
         MEL.delete_all_material_expressions(mat)
-    except Exception:
-        pass
+    except Exception as ex:
+        _warn("BackingWhite マテリアルの式削除に失敗: %s" % ex)
     e = _mx_const(mat, 100.0, -300, 0)
-    MEL.connect_material_property(e, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+    _mx_prop(e, unreal.MaterialProperty.MP_EMISSIVE_COLOR)
     MEL.recompile_material(mat)
     try:
         unreal.EditorAssetLibrary.save_loaded_asset(mat)
@@ -1172,6 +1319,12 @@ def set_matte_unlit(actors):
                 cur_path = cur.get_path_name() if cur else ""
                 if cur_path == mat_path:
                     continue               # 既に差替え済み
+                if cur_path.startswith("/Engine/Transient"):
+                    # BP の construction script が作る MID 等。パスを退避しても
+                    # 復元時に解決できずスロットが既定材（WorldGrid）になるので触らない
+                    _warn("マット板アンリット化: %s の %s slot %d は一時材 (%s) のためスキップ"
+                          % (a.get_actor_label(), cname, i, cur_path))
+                    continue
                 tags.append(unreal.Name("%s|%s|%d|%s"
                                         % (_MATTE_ORIGMAT_TAG, cname, i, cur_path)))
                 comp.set_material(i, mat)
@@ -1200,10 +1353,17 @@ def restore_matte_materials(actors):
                 comp = comps.get(cname)
                 if comp is not None:
                     m = unreal.load_object(None, path) if path else None
+                    if path and m is None:
+                        # 元材が解決できない（リネーム/削除/一時材）。None を入れると
+                        # WorldGrid になり手掛かりも消えるので、タグを残して触らない
+                        keep.append(unreal.Name(s))
+                        _warn("マテリアル復元: 元材を読み込めないためタグを残します (%s)" % s)
+                        continue
                     comp.set_material(int(idx), m)
                     n += 1
             except Exception as e:
-                _warn("マテリアル復元に失敗 (%s): %s" % (s, e))
+                keep.append(unreal.Name(s))
+                _warn("マテリアル復元に失敗・タグを残します (%s): %s" % (s, e))
         a.set_editor_property("tags", keep)
     _log("マット板のマテリアル復元: %d slot" % n)
     return n
@@ -1220,11 +1380,13 @@ def composite_behind_in_matte(world, cam, matte_actors, beauty_path, behind_path
         return None
     tmp = []
     try:
-        md = _render_depth_r(world, cam, width, height, tmp,
-                             show_only_actors=matte_actors)
+        # 600m 超の板面がシルエットから抜けないよう RGBA32F（定数値なら 16F へ退避）
+        md, far = _render_depth_r_auto(world, cam, width, height, tmp, {"use32": True},
+                                       label="behind composite",
+                                       show_only_actors=matte_actors)
     finally:
         _destroy_actors(tmp)
-    mask = (md < _DEPTH_FAR_CM).astype(_np.float32)
+    mask = (md < far).astype(_np.float32)
     cov = 100.0 * float(mask.mean())
     _log("behind composite: マットシルエット被覆 %.1f%%" % cov)
     beauty = _np.asarray(_PILImage.open(beauty_path).convert("RGB")).astype(_np.float32)
@@ -1241,11 +1403,20 @@ def composite_behind_in_matte(world, cam, matte_actors, beauty_path, behind_path
 
 
 def find_ffmpeg(explicit=None):
-    """ffmpeg 実行ファイルを探す。優先: 明示パス → imageio_ffmpeg 同梱 → PATH。"""
+    """ffmpeg 実行ファイルを探す。優先: 明示パス → imageio_ffmpeg 同梱（実行中の
+    Python に入っているもの）→ 個人 Python の imageio_ffmpeg（glob）→ PATH。"""
     import glob as _glob
     import shutil as _shutil
     if explicit and os.path.isfile(explicit):
         return explicit
+    try:
+        import imageio_ffmpeg
+        p = imageio_ffmpeg.get_ffmpeg_exe()
+        if p and os.path.isfile(p):
+            return p
+    except Exception as e:
+        _warn_once("imageio_ffmpeg", "imageio_ffmpeg から ffmpeg を取得できません: %s" % e)
+    # 最後の手段: ユーザー個人の Python レイアウト依存（配布先ではまず当たらない）
     pat = os.path.expanduser(
         r"~\AppData\Local\Programs\Python\*\Lib\site-packages"
         r"\imageio_ffmpeg\binaries\ffmpeg-*.exe")
@@ -1262,26 +1433,34 @@ def encode_mp4_cmd(ffmpeg, output_dir, name_body, pass_name, take_str,
     fps = "%d/%d" % (int(fps_num), max(int(fps_den), 1))
     src = os.path.join(output_dir, "%s_%s_%s.%%04d.png" % (name_body, pass_name, take_str))
     dst = os.path.join(output_dir, "%s_%s_%s.mp4" % (name_body, pass_name, take_str))
-    return [ffmpeg, "-y", "-framerate", fps, "-start_number", str(int(start_number)),
+    # pad: libx264 の yuv420p は幅・高さが偶数必須（例 round(1080*2.39)=2581 で失敗する）
+    return [ffmpeg, "-nostdin", "-y", "-framerate", fps,
+            "-start_number", str(int(start_number)),
             "-i", src, "-c:v", "libx264", "-crf", str(int(crf)),
+            "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
             "-pix_fmt", "yuv420p", "-r", fps, dst], dst
 
 
+# 連番の拡張子（Depth 連番は EXR もあり得る）。合成・雲抜き系は PNG 専用のまま
+_FRAME_EXT_RE = r"\.(png|exr|jpg|jpeg)$"
+
+
 def trim_sequence_frames(output_dir, name_body, take_str, pass_names, start, end_excl):
-    """[start, end_excl) 範囲外のフレーム PNG を削除する。
+    """[start, end_excl) 範囲外のフレーム（PNG/EXR/JPG）を削除する。
     MRQ はテンポラルサンプル使用時に終端へ1フレーム余分に書くことがあるため、
     合成・エンコード前に必ず範囲を揃える。削除数を返す。"""
     n = 0
     for pn in pass_names:
-        pat = re.compile(re.escape("%s_%s_%s." % (name_body, pn, take_str)) + r"(\d+)\.png$")
+        pat = re.compile(re.escape("%s_%s_%s." % (name_body, pn, take_str))
+                         + r"(\d+)" + _FRAME_EXT_RE)
         for f in os.listdir(output_dir):
             m = pat.match(f)
             if m and not (int(start) <= int(m.group(1)) < int(end_excl)):
                 try:
                     os.remove(os.path.join(output_dir, f))
                     n += 1
-                except Exception:
-                    pass
+                except Exception as e:
+                    _warn("範囲外フレームの削除に失敗 %s: %s" % (f, e))
     if n:
         _log("範囲外フレームを削除: %d" % n)
     return n
@@ -1293,7 +1472,8 @@ def move_pass_frames_to_subdirs(output_dir, name_body, take_str, pass_names):
     合成・エンコード等の後処理がすべて終わった最後に呼ぶこと。移動数を返す。"""
     n = 0
     for pn in pass_names:
-        pat = re.compile(re.escape("%s_%s_%s." % (name_body, pn, take_str)) + r"\d+\.png$")
+        pat = re.compile(re.escape("%s_%s_%s." % (name_body, pn, take_str))
+                         + r"\d+" + _FRAME_EXT_RE)
         files = [f for f in os.listdir(output_dir) if pat.match(f)]
         if not files:
             continue
@@ -1314,14 +1494,15 @@ def delete_pass_frames(output_dir, name_body, take_str, pass_names):
     """指定パスのフレーム PNG を削除（中間素材や PNG 不要指定の後始末）。"""
     n = 0
     for pn in pass_names:
-        pat = re.compile(re.escape("%s_%s_%s." % (name_body, pn, take_str)) + r"\d+\.png$")
+        pat = re.compile(re.escape("%s_%s_%s." % (name_body, pn, take_str))
+                         + r"\d+" + _FRAME_EXT_RE)
         for f in os.listdir(output_dir):
             if pat.match(f):
                 try:
                     os.remove(os.path.join(output_dir, f))
                     n += 1
-                except Exception:
-                    pass
+                except Exception as e:
+                    _warn("連番の削除に失敗 %s: %s" % (f, e))
     return n
 
 
@@ -1450,13 +1631,9 @@ def matte_near_clip_cm(actors, cam):
     world = _get_editor_world()
     tmp = []
     try:
-        d = _render_depth_r(world, cam, 480, 270, tmp, show_only_actors=actors,
-                            fmt=unreal.TextureRenderTargetFormat.RTF_RGBA32F)
-        far = _DEPTH_FAR_32F
-        if d is not None and float(_np.ptp(d)) < 1e-3:
-            # 32F が定数値（UE5.7 の深度RTバグ）→ 16F へ退避（655m 超は測れない）
-            d = _render_depth_r(world, cam, 480, 270, tmp, show_only_actors=actors)
-            far = _DEPTH_FAR_CM
+        # 32F が定数値（UE5.7 の深度RTバグ）なら 16F へ退避（655m 超は測れない）
+        d, far = _render_depth_r_auto(world, cam, 480, 270, tmp, {"use32": True},
+                                      label="near-clip 実測", show_only_actors=actors)
     finally:
         _destroy_actors(tmp)
     v = d[(d > 1.0) & (d < far)] if d is not None else None
@@ -1465,7 +1642,7 @@ def matte_near_clip_cm(actors, cam):
     return max(1.0, float(v.min()))
 
 
-def render_matte_sil_sequence(output_dir, name_body, take_str, start, end,
+def render_matte_sil_sequence(output_dir, name_body, take_str, start, end_excl,
                               actors, width, height, camera_for_frame, aa=2,
                               occlusion=True, near_clip_cm=None, hidden_front=None):
     """映像 Behind 用: 各フレームをシーケンサーでスクラブ評価し、マット対象の
@@ -1484,18 +1661,23 @@ def render_matte_sil_sequence(output_dir, name_body, take_str, start, end,
     hidden_front はプレートで隠したアクター（actors_in_front_of_matte）。プレートに
     写っていないので遮蔽物からも外す（外さないと隠した物の形に黒が残る）。
     camera_for_frame(frame) はスクラブ込みでそのフレームのカメラアクターを返す。
+    end_excl は排他的終端（trim_sequence_frames と同じ [start, end_excl)）。
     書いたフレーム数を返す。"""
     if not (_HAS_NUMPY and _HAS_PIL):
         return 0
     world = _get_editor_world()
     try:
         t0 = unreal.LevelSequenceEditorBlueprintLibrary.get_current_time()
-    except Exception:
+    except Exception as e:
+        _warn("MatteSil 生成: プレイヘッド位置を取得できません（復元しません）: %s" % e)
         t0 = None
     n = 0
-    use32 = True          # 1フレーム目で 32F が使えるか判定し、以降は使い回す
+    # 一度 32F の定数値バグを検出したら以降のフレームも 16F で撮る
+    # （板が画面外＝全画素が空のフレームはバグ扱いしない: _depth_rt_broken）
+    st = {"use32": True}
+    restore_nc = default_near_clip_cm()
     try:
-        for fr in range(int(start), int(end) + 1):
+        for i_fr, fr in enumerate(range(int(start), int(end_excl))):
             cam_actor = camera_for_frame(fr)
             if cam_actor is None:
                 _warn("MatteSil 生成: フレーム %d のカメラを特定できずスキップ" % fr)
@@ -1509,22 +1691,11 @@ def render_matte_sil_sequence(output_dir, name_body, take_str, start, end,
                 # 選ばれるので、映像に「マットの手前」が出る（実測 2026-08-30
                 # AV003A take015: 板が視線方向 545〜1156m に跨り、600m の等距離線
                 # x≒1008 を境に Behind が左右で前後に割れた）。
-                if use32:
-                    d = _render_depth_r(
-                        world, cam, width * aa, height * aa, tmp,
-                        show_only_actors=actors,
-                        fmt=unreal.TextureRenderTargetFormat.RTF_RGBA32F)
-                    if d is not None and float(_np.ptp(d)) < 1e-3:
-                        # 32F が全画素一定（UE5.7 の深度RTバグ該当）→ 以降 16F。
-                        # この場合 655m 超のマット面は救えない
-                        _warn("MatteSil: RGBA32F が定数値のため RGBA16F へ退避"
-                              "（655m 超のマット面はシルエットから抜けます）")
-                        use32 = False
-                if not use32:
-                    d = _render_depth_r(world, cam, width * aa, height * aa, tmp,
-                                        show_only_actors=actors)
-                fmt = (unreal.TextureRenderTargetFormat.RTF_RGBA32F if use32
-                       else unreal.TextureRenderTargetFormat.RTF_RGBA16F)
+                # 32F が全画素一定（UE5.7 の深度RTバグ該当）なら 16F。この場合
+                # 655m 超のマット面は救えない
+                d, far = _render_depth_r_auto(world, cam, width * aa, height * aa, tmp, st,
+                                              label="MatteSil", show_only_actors=actors)
+                fmt = _depth_fmt(st)
                 sd = None
                 if occlusion:
                     # プレートと同じ near clip（r.SetNearClipPlane）を立てて撮る。
@@ -1544,10 +1715,11 @@ def render_matte_sil_sequence(output_dir, name_body, take_str, start, end,
                     finally:
                         if near_clip_cm:
                             unreal.SystemLibrary.execute_console_command(
-                                world, "r.SetNearClipPlane 10")
+                                world, "r.SetNearClipPlane %f" % restore_nc)
             finally:
                 _destroy_actors(tmp)
-            far = _DEPTH_FAR_32F if use32 else _DEPTH_FAR_CM
+            if i_fr % 8 == 7:
+                unreal.SystemLibrary.collect_garbage()
             sil = _downscale((d < far).astype(_np.float32) * 255.0, aa)
             out = os.path.join(output_dir,
                                "%s_MatteSil_%s.%04d.png" % (name_body, take_str, fr))
@@ -1565,13 +1737,92 @@ def render_matte_sil_sequence(output_dir, name_body, take_str, start, end,
                     occ_img)                     # 手前=白
             n += 1
     finally:
-        if t0 is not None:
-            try:
-                unreal.LevelSequenceEditorBlueprintLibrary.set_current_time(int(t0))
-            except Exception:
-                pass
+        _restore_playhead(t0, "MatteSil 生成")
     _log("MatteSil 生成（スクラブ+show-only深度）: %d フレーム" % n)
     return n
+
+
+def _restore_playhead(t0, label):
+    if t0 is None:
+        return
+    try:
+        unreal.LevelSequenceEditorBlueprintLibrary.set_current_time(int(t0))
+    except Exception as e:
+        _warn("%s: プレイヘッドを復元できません（フレーム %s）: %s" % (label, t0, e))
+
+
+def render_depth_sequence(output_dir, name_body, take_str, start, end_excl,
+                          width, height, camera_for_frame, near_cm, far_cm, mode,
+                          aa=1):
+    """映像タブの厳密リニア Depth: 各フレームをシーケンサーでスクラブ評価し、
+    SceneCapture の全シーン SceneDepth を width*aa × height*aa で撮って書く
+    （MRQ の PP パスは表示用 sRGB エンコードの 8bit なので、16bit/EXR はこちら）。
+    mode="16bit": 手前=白の正規化 v = clip((far−d)/(far−near), 0, 1)。空/未ヒット
+                  （しきい値以上）は 0 固定。%s_Depth_%s.%04d.png（16bit グレー）。
+    mode="exr"  : 生 cm の float32（空は生の巨大値のまま＝静止画 EXR と同じ）。
+                  %s_Depth_%s.%04d.exr。1 フレーム目で EXR を書けなければ全編
+                  16bit PNG へ切り替える（警告付き）。
+    RGBA32F で撮り、定数値バグなら 16F へ退避（_render_depth_r_auto）。
+    camera_for_frame(frame) はスクラブ込みでそのフレームのカメラアクターを返す。
+    end_excl は排他的終端。戻り値 (書いたフレーム数, 拡張子 "png"|"exr")。
+    参考: 同じフレーム毎 RGBA32F キャプチャは 1920x1080 aa=1 で約 1.1 秒/フレーム。"""
+    if not (_HAS_NUMPY and _HAS_PIL):
+        return 0, "png"
+    mode = "exr" if str(mode).lower().startswith("exr") else "16bit"
+    near, far = float(near_cm), float(far_cm)
+    world = _get_editor_world()
+    try:
+        t0 = unreal.LevelSequenceEditorBlueprintLibrary.get_current_time()
+    except Exception as e:
+        _warn("Depth 連番: プレイヘッド位置を取得できません（復元しません）: %s" % e)
+        t0 = None
+    st = {"use32": True}
+    aa = max(int(aa), 1)
+    frames = list(range(int(start), int(end_excl)))
+    n = 0
+    try:
+        for i_fr, fr in enumerate(frames):
+            cam_actor = camera_for_frame(fr)
+            if cam_actor is None:
+                _warn("Depth 連番: フレーム %d のカメラを特定できずスキップ" % fr)
+                continue
+            cam = get_camera_settings(cam_actor)
+            tmp = []
+            try:
+                d, far_th = _render_depth_r_auto(world, cam, int(width) * aa,
+                                                 int(height) * aa, tmp, st,
+                                                 label="Depth 連番")
+            finally:
+                _destroy_actors(tmp)
+            if i_fr % 8 == 7:
+                unreal.SystemLibrary.collect_garbage()
+            d = _downscale(d, aa)
+            if mode == "exr":
+                out = os.path.join(output_dir,
+                                   "%s_Depth_%s.%04d.exr" % (name_body, take_str, fr))
+                if _write_exr_gray(out, d):
+                    n += 1
+                elif n == 0:
+                    _warn("Depth 連番: EXR を書けないため全編 16bit PNG で出力します")
+                    mode = "16bit"
+                else:
+                    _warn("Depth 連番: フレーム %d の EXR 書き出しに失敗" % fr)
+                    continue
+            if mode == "16bit":
+                v = _np.clip((far - d) / max(far - near, 1e-6), 0.0, 1.0)
+                v[d >= far_th] = 0.0
+                out = os.path.join(output_dir,
+                                   "%s_Depth_%s.%04d.png" % (name_body, take_str, fr))
+                _write_png_u16_gray(out, v)
+                n += 1
+            if (i_fr + 1) % 10 == 0:
+                _log("Depth 連番: %d / %d フレーム" % (i_fr + 1, len(frames)))
+    finally:
+        _restore_playhead(t0, "Depth 連番")
+    ext = "exr" if mode == "exr" else "png"
+    _log("Depth 連番（スクラブ+SceneCapture %s）: %d フレーム"
+         % ("EXR 生cm" if ext == "exr" else "16bit PNG 手前=白", n))
+    return n, ext
 
 
 def volumetrics_nearer_than(dist_cm, cam):
@@ -1633,13 +1884,22 @@ def _box_in_front_of_planes(origin, ext, planes, cam_locs, straddle_ratio=0.0):
     return True
 
 
-assert _box_in_front_of_planes((0, 0, 5), (1, 1, 1), [((0, 0, 0), (0, 0, 1))], [(0, 0, 9)])
-assert not _box_in_front_of_planes((0, 0, .5), (1, 1, 1), [((0, 0, 0), (0, 0, 1))], [(0, 0, 9)])
-assert not _box_in_front_of_planes((0, 0, -5), (1, 1, 1), [((0, 0, 0), (0, 0, 1))], [(0, 0, 9)])
-# 跨ぎ: 奥へ 0.5 / 全奥行き 2 = 25% → ratio 0.5 なら手前扱い、ratio 0.2 なら跨ぎのまま
-assert _box_in_front_of_planes((0, 0, .5), (1, 1, 1), [((0, 0, 0), (0, 0, 1))], [(0, 0, 9)], 0.5)
-assert not _box_in_front_of_planes((0, 0, .5), (1, 1, 1), [((0, 0, 0), (0, 0, 1))], [(0, 0, 9)], 0.2)
-assert not _box_in_front_of_planes((0, 0, -.5), (1, 1, 1), [((0, 0, 0), (0, 0, 1))], [(0, 0, 9)], 0.5)
+def _selftest_planes():
+    pl, cl = [((0, 0, 0), (0, 0, 1))], [(0, 0, 9)]
+    assert _box_in_front_of_planes((0, 0, 5), (1, 1, 1), pl, cl)
+    assert not _box_in_front_of_planes((0, 0, .5), (1, 1, 1), pl, cl)
+    assert not _box_in_front_of_planes((0, 0, -5), (1, 1, 1), pl, cl)
+    # 跨ぎ: 奥へ 0.5 / 全奥行き 2 = 25% → ratio 0.5 なら手前扱い、ratio 0.2 なら跨ぎのまま
+    assert _box_in_front_of_planes((0, 0, .5), (1, 1, 1), pl, cl, 0.5)
+    assert not _box_in_front_of_planes((0, 0, .5), (1, 1, 1), pl, cl, 0.2)
+    assert not _box_in_front_of_planes((0, 0, -.5), (1, 1, 1), pl, cl, 0.5)
+
+
+try:
+    _selftest_planes()
+except AssertionError:
+    # import を壊さない（パネル全体が開けなくなるため）。判定が壊れていることだけ知らせる
+    _warn("_box_in_front_of_planes のセルフテストに失敗（Matteの奥の手前判定が不正の可能性）")
 
 
 def actors_in_front_of_matte(matte_actors, cams, straddle_ratio=0.5):
@@ -1710,9 +1970,11 @@ def capture_behind_matte(world, settings, cam, w, h, ts, spawned):
     outs = []
 
     # 1) マットのシルエット（形状・per-pixel）を show-only 深度で取得
-    matte_d = _render_depth_r(world, cam, w * aa, h * aa, spawned,
-                              show_only_actors=actors)
-    matte_vis = (matte_d < _DEPTH_FAR_CM).astype(_np.float32)
+    #    （600m 超の板面も拾えるよう RGBA32F。定数値なら 16F へ退避）
+    matte_d, far = _render_depth_r_auto(world, cam, w * aa, h * aa, spawned,
+                                        {"use32": True}, label="behind-matte",
+                                        show_only_actors=actors)
+    matte_vis = (matte_d < far).astype(_np.float32)
 
     # 2) マット面からクリッププレーンを導出
     base, normal = _matte_clip_plane(actors, cam)
@@ -1748,9 +2010,10 @@ def capture_behind_matte_mask(world, settings, cam, w, h, ts, spawned):
         _warn("behind-matte: マット対象がありません。スキップします。")
         return None
     aa = settings.aa_factor
-    grp = _render_depth_r(world, cam, w * aa, h * aa, spawned,
-                          show_only_actors=actors)
-    mask = (grp < _DEPTH_FAR_CM).astype(_np.float32) * 255.0  # 全シルエット（手前遮蔽は無視）
+    grp, far = _render_depth_r_auto(world, cam, w * aa, h * aa, spawned,
+                                    {"use32": True}, label="behind-matte",
+                                    show_only_actors=actors)
+    mask = (grp < far).astype(_np.float32) * 255.0  # 全シルエット（手前遮蔽は無視）
     mask = _downscale(mask, aa)
     out = _out_path(settings, ts, "BehindMask", ".png")
     _write_png_u8(out, mask)
@@ -1952,9 +2215,14 @@ def _read_linear_gray(path, ffmpeg):
         tmp = path + "._g.pfm"
         # creationflags: コンソールウインドウを出さない（フレーム毎の起動で
         # ウインドウが連続開閉してエディタの UI 操作を奪う・ユーザー報告）
-        r = _subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", path,
-                             "-vf", "format=gbrpf32le,extractplanes=g", tmp],
-                            capture_output=True, creationflags=0x08000000)
+        try:
+            r = _subprocess.run([ffmpeg, "-nostdin", "-y", "-loglevel", "error", "-i", path,
+                                 "-vf", "format=gbrpf32le,extractplanes=g", tmp],
+                                capture_output=True, creationflags=0x08000000,
+                                timeout=600)
+        except _subprocess.TimeoutExpired:
+            _warn("バッキング: EXR 変換がタイムアウト %s" % path)
+            return None
         if r.returncode != 0 or not os.path.isfile(tmp):
             _warn("バッキング: EXR 変換失敗 %s: %s" % (path, r.stderr.decode(errors="replace")[-200:]))
             return None
@@ -2012,9 +2280,14 @@ def _read_linear_alpha(path, ffmpeg):
         _warn("可視雲: ffmpeg が見つからず EXR αを読めません")
         return None
     tmp = path + "._a.pfm"
-    r = _subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", path,
-                         "-vf", "format=gbrapf32le,extractplanes=a", tmp],
-                        capture_output=True, creationflags=0x08000000)
+    try:
+        r = _subprocess.run([ffmpeg, "-nostdin", "-y", "-loglevel", "error", "-i", path,
+                             "-vf", "format=gbrapf32le,extractplanes=a", tmp],
+                            capture_output=True, creationflags=0x08000000,
+                            timeout=600)
+    except _subprocess.TimeoutExpired:
+        _warn("可視雲: EXR α抽出がタイムアウト %s" % path)
+        return None
     if r.returncode != 0 or not os.path.isfile(tmp):
         _warn("可視雲: EXR α抽出失敗 %s: %s"
               % (path, r.stderr.decode(errors="replace")[-200:]))
@@ -2136,8 +2409,8 @@ def compose_visible_cloud_sequence(output_dir, name_body, take_str, ffmpeg=None)
                 and f.endswith(".exr")):
             try:
                 os.remove(os.path.join(output_dir, f))
-            except Exception:
-                pass
+            except Exception as e:
+                _warn("可視雲: 中間 EXR を削除できません %s: %s" % (f, e))
     _log("可視雲マット: %d フレーム合成" % n)
     return n
 
@@ -2179,10 +2452,15 @@ def compose_visible_cloud_h5(w_exr, geomask_exr, veil_exr, bg_png,
             plate = float(_np.percentile(W[geo], 99)) if geo.sum() else 0.0
             if norm is not None and plate > 1e-6:
                 norm["plate"] = plate
-        if plate <= 1e-6:
+        if plate > 1e-6:
+            T = _np.clip(W / plate, 0.0, 1.0)
+        elif Vn0 is not None and not bool(geo.any()):
+            # 空だけのフレーム（ジオメトリ無し）: ペア方式は空を T=1 で計算するので
+            # 素板レベルは不要（ここで落とすと連番に欠番が出て MP4 が短くなる）
+            T = _np.ones_like(W)
+        else:
             _warn("可視雲H5: 素板レベルを推定できません")
             return None
-        T = _np.clip(W / plate, 0.0, 1.0)
         if Vn0 is not None:
             V = _np.clip(V - Vn0, 0.0, None)   # ペア差分＝純粋な雲ベール輝度
             T = _np.where(geo, T, 1.0)         # 空は「明るい背景」として同式で扱う
@@ -2239,6 +2517,7 @@ def compose_visible_cloud_h5_sequence(output_dir, name_body, take_str,
             frames[m.group(1)] = f
     n = 0
     norm = {}
+    failed = set()
     for fr in sorted(frames):
         wp = os.path.join(output_dir, frames[fr])
         gp = os.path.join(output_dir,
@@ -2259,7 +2538,11 @@ def compose_visible_cloud_h5_sequence(output_dir, name_body, take_str,
             norm=norm)
         if r:
             n += 1
-    # 中間素材は後段（PNG合成・MP4）で不要なので削除
+        else:
+            failed.add(fr)
+    # 中間素材は後段（PNG合成・MP4）で不要なので削除。合成に失敗したフレームの
+    # 入力は診断用に残す
+    fr_pat = re.compile(r"\.(\d+)\.(exr|png)$")
     for f in list(os.listdir(output_dir)):
         drop = False
         for tag in ("CloudMatte", "GeoMask", "CloudVeil", "CloudVeil0"):
@@ -2269,11 +2552,17 @@ def compose_visible_cloud_h5_sequence(output_dir, name_body, take_str,
         if (f.startswith("%s_CloudBG_%s." % (name_body, take_str))
                 and f.endswith(".png")):
             drop = True
+        m = fr_pat.search(f)
+        if drop and m and m.group(1) in failed:
+            drop = False
         if drop:
             try:
                 os.remove(os.path.join(output_dir, f))
-            except Exception:
-                pass
+            except Exception as e:
+                _warn("可視雲H5: 中間素材を削除できません %s: %s" % (f, e))
+    if failed:
+        _warn("可視雲H5: %d フレームの合成に失敗（入力 EXR を残しました: %s）"
+              % (len(failed), ", ".join(sorted(failed)[:10])))
     _log("可視雲H5マット(ペア方式): %d フレーム合成" % n)
     return n
 
@@ -2297,8 +2586,9 @@ def backing_t_png(white_path, out_path, ffmpeg=None, scale=None):
     return out_path, scale
 
 
-def backing_t_sequence(output_dir, name_body, take_str, start, end, ffmpeg):
+def backing_t_sequence(output_dir, name_body, take_str, start, end_excl, ffmpeg):
     """映像用: BackingW の EXR 連番から %s_BackingT_%s.NNNN.png 連番を作る。
+    対象は [start, end_excl)（排他的終端・trim_sequence_frames と同じ）。
     正規化スケールは最初のフレームで決めて全フレームに固定（フレーム間のチラつき防止）。
     使用後の EXR は範囲外も含め全て削除する。書いたフレーム数を返す。"""
     pat_w = re.compile(re.escape("%s_BackingW_%s." % (name_body, take_str)) + r"(\d+)\.exr$")
@@ -2310,7 +2600,7 @@ def backing_t_sequence(output_dir, name_body, take_str, start, end, ffmpeg):
     n = 0
     scale = None
     for fr in sorted(frames):
-        if not (int(start) <= int(fr) <= int(end)):
+        if not (int(start) <= int(fr) < int(end_excl)):
             continue
         wp = os.path.join(output_dir, frames[fr])
         op = os.path.join(output_dir, "%s_BackingT_%s.%s.png" % (name_body, take_str, fr))
@@ -2324,8 +2614,8 @@ def backing_t_sequence(output_dir, name_body, take_str, start, end, ffmpeg):
         if f.startswith(prefix) and f.endswith(".exr"):
             try:
                 os.remove(os.path.join(output_dir, f))
-            except Exception:
-                pass
+            except Exception as e:
+                _warn("バッキング: 中間 EXR を削除できません %s: %s" % (f, e))
     _log("バッキングT: %d フレーム出力" % n)
     return n
 
@@ -2397,8 +2687,8 @@ def merge_cloud_objid(objid_png, manifest_path, cloud_entries, threshold=0.5):
             val = 1.0 - 0.20 * ((idx // 3) % 2)
             idx += 1
             r, g, b = colorsys.hsv_to_rgb(hue, sat, val)
-            col = _np.array([r, g, b], dtype=_np.float32) * 255.0
-            key = "#%02X%02X%02X" % (int(col[0]), int(col[1]), int(col[2]))
+            col = _objid_u8(r, g, b)
+            key = _objid_key(col)
             if key not in man:
                 break
         img[vis] = col
@@ -2511,21 +2801,21 @@ def create_temp_depth_material(near, far, invert=True):
     c_near = MEL.create_material_expression(mat, unreal.MaterialExpressionConstant, -800, 200)
     c_near.set_editor_property("r", float(near))
     sub = MEL.create_material_expression(mat, unreal.MaterialExpressionSubtract, -600, 100)
-    MEL.connect_material_expressions(depth, "", sub, "A")
-    MEL.connect_material_expressions(c_near, "", sub, "B")
+    _mx_conn(depth, "", sub, "A")
+    _mx_conn(c_near, "", sub, "B")
     c_inv = MEL.create_material_expression(mat, unreal.MaterialExpressionConstant, -600, 300)
     c_inv.set_editor_property("r", 1.0 / max(float(far) - float(near), 1e-6))
     mul = MEL.create_material_expression(mat, unreal.MaterialExpressionMultiply, -400, 200)
-    MEL.connect_material_expressions(sub, "", mul, "A")
-    MEL.connect_material_expressions(c_inv, "", mul, "B")
+    _mx_conn(sub, "", mul, "A")
+    _mx_conn(c_inv, "", mul, "B")
     clamp = MEL.create_material_expression(mat, unreal.MaterialExpressionClamp, -250, 200)
-    MEL.connect_material_expressions(mul, "", clamp, "")
+    _mx_conn(mul, "", clamp, "")
     last = clamp
     if invert:
         inv = MEL.create_material_expression(mat, unreal.MaterialExpressionOneMinus, -120, 200)
-        MEL.connect_material_expressions(clamp, "", inv, "")
+        _mx_conn(clamp, "", inv, "")
         last = inv
-    MEL.connect_material_property(last, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+    _mx_prop(last, unreal.MaterialProperty.MP_EMISSIVE_COLOR)
     MEL.recompile_material(mat)
     try:
         unreal.EditorAssetLibrary.save_loaded_asset(mat)
@@ -2545,6 +2835,24 @@ def _mx_conn(frm, out_name, to, in_name):
         return
     raise RuntimeError("マテリアルのノード接続に失敗: %s.%s -> %s.%s"
                        % (type(frm).__name__, out_name, type(to).__name__, in_name))
+
+
+def _mx_prop(expr, prop, out_name=""):
+    """マテリアル出力ピンへの接続。こちらも失敗は False が返るだけなので検証する。"""
+    if unreal.MaterialEditingLibrary.connect_material_property(expr, out_name, prop):
+        return
+    raise RuntimeError("マテリアル出力への接続に失敗: %s.%s -> %s"
+                       % (type(expr).__name__, out_name, prop))
+
+
+def _emissive_connected(mat):
+    """Material の EmissiveColor に式が繋がっているか（判定 API が無ければ False）。"""
+    try:
+        node = unreal.MaterialEditingLibrary.get_material_property_input_node(
+            mat, unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+    except Exception:
+        return False
+    return node is not None
 
 
 def _mx_expr(mat, cls, x, y):
@@ -2618,7 +2926,7 @@ def get_or_create_sky_black_material():
     MEL.delete_all_material_expressions(mat)
     c = MEL.create_material_expression(mat, unreal.MaterialExpressionConstant, -300, 0)
     c.set_editor_property("r", 0.0)
-    MEL.connect_material_property(c, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+    _mx_prop(c, unreal.MaterialProperty.MP_EMISSIVE_COLOR)
     MEL.recompile_material(mat)
     _log("一時 SkyBlack マテリアル生成")
     return mat
@@ -2691,8 +2999,7 @@ def create_temp_normal_material(camera_space=True):
     outm = _mx_expr(mat, unreal.MaterialExpressionMultiply, -60, 100)
     _mx_conn(add, "", outm, "A")
     _mx_conn(clampv, "", outm, "B")
-    unreal.MaterialEditingLibrary.connect_material_property(
-        outm, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+    _mx_prop(outm, unreal.MaterialProperty.MP_EMISSIVE_COLOR)
     unreal.MaterialEditingLibrary.recompile_material(mat)
     try:
         unreal.EditorAssetLibrary.save_loaded_asset(mat)
@@ -2725,8 +3032,7 @@ def create_temp_geomask_material():
     _mx_conn(c_k, "", mul, "B")
     clamp = _mx_expr(mat, unreal.MaterialExpressionClamp, -250, 100)
     _mx_conn(mul, "", clamp, "")
-    unreal.MaterialEditingLibrary.connect_material_property(
-        clamp, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+    _mx_prop(clamp, unreal.MaterialProperty.MP_EMISSIVE_COLOR)
     unreal.MaterialEditingLibrary.recompile_material(mat)
     try:
         unreal.EditorAssetLibrary.save_loaded_asset(mat)
@@ -2808,7 +3114,7 @@ def create_temp_matte_material():
     _conn(eq, "", black, "B")
     inv = MEL.create_material_expression(mat, unreal.MaterialExpressionOneMinus, -10, 260)
     _conn(black, "", inv, "")
-    MEL.connect_material_property(inv, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+    _mx_prop(inv, unreal.MaterialProperty.MP_EMISSIVE_COLOR)
     MEL.recompile_material(mat)
     try:
         unreal.EditorAssetLibrary.save_loaded_asset(mat)
@@ -2840,7 +3146,7 @@ def create_temp_matte_sil_material():
     eq = _mx_stencil_eq(mat, MATTE_STENCIL, -1250, 120)
     inv = MEL.create_material_expression(mat, unreal.MaterialExpressionOneMinus, -10, 120)
     _mx_conn(eq, "", inv, "")
-    MEL.connect_material_property(inv, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+    _mx_prop(inv, unreal.MaterialProperty.MP_EMISSIVE_COLOR)
     MEL.recompile_material(mat)
     try:
         unreal.EditorAssetLibrary.save_loaded_asset(mat)
@@ -2940,8 +3246,7 @@ def create_temp_objid_material():
     outm = _mx_expr(mat, unreal.MaterialExpressionMultiply, -60, 40)
     _mx_conn(ap2, "", outm, "A")
     _mx_conn(gate2, "", outm, "B")
-    unreal.MaterialEditingLibrary.connect_material_property(
-        outm, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+    _mx_prop(outm, unreal.MaterialProperty.MP_EMISSIVE_COLOR)
     unreal.MaterialEditingLibrary.recompile_material(mat)
     try:
         unreal.EditorAssetLibrary.save_loaded_asset(mat)

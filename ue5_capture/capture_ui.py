@@ -134,6 +134,9 @@ class CaptureWindow(object):
         ttk.Label(outer, textvariable=self.status_var, style="Status.TLabel",
                   wraplength=520, justify="left").pack(
             side="bottom", fill="x", padx=12, pady=(2, 8))
+        # 対象（Matte / ObjectID）は両タブで同じリストを使うので Notebook の外に置く
+        # （タブを切り替えても見える。status の上・タブの下）
+        self._build_shared_targets(outer)
         nb = ttk.Notebook(outer)
         nb.pack(fill="both", expand=True, padx=8, pady=(8, 0))
         tab_img = ttk.Frame(nb, style="Body.TFrame")
@@ -353,9 +356,41 @@ class CaptureWindow(object):
     def _entry(self, parent, var, width):
         return ttk.Entry(parent, textvariable=var, width=width)
 
+    def _build_shared_targets(self, outer):
+        """Matte / Object ID の対象リスト。画像・映像の両タブが同じリストを参照するので
+        Notebook の外（下部）に常時表示する。2 列（Matte | ObjectID）で縦を節約。"""
+        holder = ttk.Frame(outer, style="Body.TFrame")
+        holder.pack(side="bottom", fill="x", padx=8, pady=(4, 0))
+        card = ttk.Frame(holder, padding=(12, 8, 12, 10))
+        card.pack(fill="x", padx=4)
+        head = ttk.Frame(card)
+        head.pack(fill="x", pady=(0, 6))
+        ttk.Label(head, text="対象", style="Title.TLabel").pack(side="left")
+        ttk.Label(head, text="画像 / 映像 共通", style="Sub.TLabel").pack(
+            side="left", padx=(8, 0))
+        cols = ttk.Frame(card)
+        cols.pack(fill="x")
+        cols.columnconfigure(0, weight=1, uniform="pick")
+        cols.columnconfigure(1, weight=1, uniform="pick")
+        left = ttk.Frame(cols)
+        right = ttk.Frame(cols)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        right.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        self.matte_pick = self._make_picker(
+            left, "Matte targets",
+            "Matteの前 / Matteの奥 の対象（両タブ共通）。空ならエディタ選択を使う。"
+            "リストに入れた対象は自動で 影/AO/受光なし になり、外すと元に戻る。"
+            "出力時は Beauty から自動で隠す")
+        # マット対象はリストに入れた時点でライティングから分離、外したら復元する
+        self.matte_pick["on_added"] = self._matte_paths_neutralize
+        self.matte_pick["on_removed"] = self._matte_paths_restore
+        self.objid_pick = self._make_picker(
+            right, "Object ID targets",
+            "ObjectID で色分けする対象（両タブ共通）。空ならエディタ選択を使う")
+
     def _build_image_tab(self, frm):
-        """単発キャプチャ。上から カメラ / 出力先 / 出力素材 / 対象 / 詳細設定、
-        実行ボタンは下端に固定。"""
+        """単発キャプチャ。上から カメラ / 出力先 / 出力素材 / 詳細設定、
+        実行ボタンは下端に固定（対象リストはタブ外の共通カード）。"""
         foot = ttk.Frame(frm, style="Body.TFrame")
         foot.pack(side="bottom", fill="x")
         self.capture_btn = ttk.Button(foot, text="キャプチャ", style="Accent.TButton",
@@ -508,19 +543,6 @@ class CaptureWindow(object):
                     "空=黒・大気光/雲は維持。PPマテリアル/ブルームOFFの追加レンダ1回"
                     ).pack(anchor="w")
 
-        # ---- 対象 ----
-        tgtf = self._card(body, "対象")
-        self.matte_pick = self._make_picker(
-            tgtf, "Matte targets",
-            "Matteの前 / Matteの奥 の対象。空ならエディタ選択を使う。リストに入れた対象は"
-            "自動で 影/AO/受光なし になり、外すと元に戻る。出力時は Beauty から自動で隠す")
-        # マット対象はリストに入れた時点でライティングから分離、外したら復元する
-        self.matte_pick["on_added"] = self._matte_paths_neutralize
-        self.matte_pick["on_removed"] = self._matte_paths_restore
-        ttk.Frame(tgtf, height=8).pack()
-        self.objid_pick = self._make_picker(
-            tgtf, "Object ID targets", "ObjectID で色分けする対象。空ならエディタ選択を使う")
-
         # ---- 詳細設定 ----
         advf = self._fold(body, "詳細設定（品質 / Overscan / VDB雲）")
         r = self._row(advf, "品質")
@@ -638,17 +660,27 @@ class CaptureWindow(object):
                     "OFF にすると指定フォルダへ直接書き出す").pack(side="left")
 
         # ---- 出力素材 ----
+        # 画像タブと同じ並び: 形式 → Fog/露出 → 素材。連番の形式（Beauty / Raw Lighting）と
+        # MP4 レートを 1 行目に、Fog/露出固定を 2 行目に置く
         matf = self._card(body, "出力素材")
-        r = self._row(matf, "MP4 レート")
+        r = self._row(matf, "形式")
+        self.seq_beauty_fmt_var = tk.StringVar(master=self.root, value="PNG 8bit")
+        self._tip(ttk.Combobox(r, textvariable=self.seq_beauty_fmt_var, state="readonly",
+                               width=16,
+                               values=["PNG 8bit", "JPG 8bit", "EXR 16bit (float)"]),
+                  "連番の形式（Beauty / Raw Lighting）。Matte系合成・ObjectID・各マットは"
+                  "常に PNG。MP4 は形式によらず内部 PNG からエンコード").pack(side="left")
+        ttk.Label(r, text="MP4", style="Sub.TLabel").pack(side="left", padx=(14, 4))
         self.seq_rate_var = tk.StringVar(master=self.root, value="高 (CRF 20)")
         self._tip(ttk.Combobox(r, textvariable=self.seq_rate_var, state="normal",
                                width=13, values=list(_MP4_RATE_PRESETS.keys())),
                   "H.264 の CRF。数値を直接入力してもよい（小さいほど高品質）。"
                   "MP4 はシーケンスの fps で ffmpeg エンコード").pack(side="left")
+        r = self._row(matf, " ")
         self.seq_fog_var = tk.BooleanVar(master=self.root, value=False)
         self._check(r, "Fog/グローなし", self.seq_fog_var,
                     "フォグとポスプロのグロー(ブルーム)を切ってレンダする").pack(
-            side="left", padx=(14, 0))
+            side="left")
         self.seq_exposure_lock_var = tk.BooleanVar(master=self.root, value=False)
         self._check(r, "露出固定", self.seq_exposure_lock_var, _EXPOSURE_LOCK_TIP).pack(
             side="left", padx=(8, 0))
@@ -663,7 +695,7 @@ class CaptureWindow(object):
             ttk.Label(mtx, text=gname, style="Group.TLabel").grid(
                 row=mrow, column=0, sticky="w", pady=(8 if gi else 0, 2))
             if gi == 0:
-                ttk.Label(mtx, text="PNG連番", style="Sub.TLabel").grid(
+                ttk.Label(mtx, text="連番", style="Sub.TLabel").grid(
                     row=mrow, column=1, padx=8)
                 ttk.Label(mtx, text="MP4", style="Sub.TLabel").grid(
                     row=mrow, column=2, padx=8)
@@ -680,6 +712,15 @@ class CaptureWindow(object):
                 self.seq_out_vars[key] = (pv, mv)
                 if key == "depth":
                     depf = ttk.Frame(mtx)
+                    # ビット深度（画像タブと同じ 3 択）。8bit は Beauty と同一ジョブの
+                    # PP パス、16bit PNG / EXR float はフレーム毎の SceneCapture 実測
+                    self.seq_depth_bit_var = tk.StringVar(master=self.root, value="8bit PNG")
+                    self._tip(ttk.Combobox(depf, textvariable=self.seq_depth_bit_var,
+                                           values=["8bit PNG", "16bit PNG", "EXR float"],
+                                           state="readonly", width=10),
+                              "8bit PNG=Beauty と同一ジョブの PP パス（風で揺れる前景も画素整合）/ "
+                              "16bit PNG・EXR float=フレーム毎に SceneCapture で実測した厳密リニア"
+                              "（EXR は生 cm。MP4 と雲抜きは無し）").pack(side="left", padx=(0, 8))
                     ttk.Label(depf, text="Near", style="Sub.TLabel").pack(side="left")
                     self.seq_near_var = tk.StringVar(master=self.root, value="0")
                     self._entry(depf, self.seq_near_var, 7).pack(side="left", padx=(2, 0))
@@ -704,8 +745,6 @@ class CaptureWindow(object):
                               "カメラ=正対面が青 / ワールド=上向きが青").grid(
                         row=mrow, column=3, sticky="w", padx=(10, 0))
                 mrow += 1
-        ttk.Label(matf, text="Matte系 / ObjectID の対象は画像タブの「対象」を共用",
-                  style="Sub.TLabel").pack(anchor="w", pady=(8, 0))
 
         # ---- 詳細設定 ----
         advf = self._fold(body, "詳細設定（品質 / VDB雲 / 画像タブからコピー）")
@@ -729,12 +768,12 @@ class CaptureWindow(object):
         r = self._row(advf, " ")
         self._tip(ttk.Button(r, text="画像タブの設定をコピー",
                              command=self._transfer_from_image_tab),
-                  "解像度 / 出力先 / 任意名 / 品質 / Depth / Fog を画像タブからコピーする"
+                  "解像度 / 出力先 / 任意名 / 形式 / 品質 / Depth / Fog を画像タブからコピーする"
                   ).pack(side="left")
         ttk.Frame(body, style="Body.TFrame", height=6).pack()
 
     def _transfer_from_image_tab(self):
-        """画像キャプチャタブの設定（解像度/出力先/任意名/品質/Depth/Fog）を映像タブへコピー。"""
+        """画像キャプチャタブの設定（解像度/出力先/任意名/形式/品質/Depth/Fog）を映像タブへコピー。"""
         W = self._int_var(self.w_var, 1920)
         if self.mrq_camasp_var.get():
             asp = self._aspect_ratio()
@@ -750,6 +789,8 @@ class CaptureWindow(object):
         self.seq_ts_var.set(self.mrq_ts_var.get())
         self.seq_near_var.set(self.near_var.get())
         self.seq_far_var.set(self.far_var.get())
+        self.seq_depth_bit_var.set(self.depth_bit_var.get())
+        self.seq_beauty_fmt_var.set(self.beauty_fmt_var.get())
         self.seq_normal_space_var.set(self.normal_space_var.get())
         self.seq_fog_var.set(self.fog_off_var.get())
         self.seq_exposure_lock_var.set(self.exposure_lock_var.get())
@@ -782,9 +823,76 @@ class CaptureWindow(object):
 
     def _browse(self, var=None):
         var = var if var is not None else self.out_var
-        d = filedialog.askdirectory(initialdir=var.get() or "/")
+        # parent を明示しないと tkinter._default_root（別ツールの withdraw 済み窓の
+        # こともある）が親になり、ダイアログがエディタの背後に隠れて固まって見える
+        d = filedialog.askdirectory(parent=self.root, initialdir=var.get() or "/")
         if d:
             var.set(os.path.normpath(d))
+
+    # ---- 多重実行ガード（レンダ・後処理・MP4 エンコードの間は両ボタンを無効化） ----
+    def _is_busy(self):
+        return bool(getattr(unreal, "_ue5capture_busy", False))
+
+    def _set_busy(self, on):
+        """チェーン開始〜完了（_finalize / _final）までのフラグ。ハンドラ内の
+        root.update() が溜まったクリックを発火させても再入しないようにする。
+        reload をまたいで残るよう unreal モジュール上に持つ。"""
+        unreal._ue5capture_busy = bool(on)
+        for b in (getattr(self, "capture_btn", None), getattr(self, "seq_btn", None)):
+            if b is None:
+                continue
+            try:
+                b.state(["disabled"] if on else ["!disabled"])
+            except Exception:
+                pass
+        if not on:
+            # 無効化中に溜まったクリックを捨ててから有効化する
+            try:
+                self.root.update()
+            except Exception:
+                pass
+
+    def _run_guarded(self, impl):
+        """ハンドラ本体 impl() を busy ガード付きで実行する。impl は非同期チェーンを
+        開始したら True を返す（完了側の _finalize/_final が busy を下ろす）。
+        False/例外なら即座に busy を下ろし、登録済みの復元フックを実行する。"""
+        import capture_mrq
+        if self._is_busy():
+            self.status_var.set("実行中です。完了までお待ちください。")
+            return
+        # reload はレンダ中に行うと実行中ジョブの executor/復元コールバックを
+        # 破壊する（シーンが隠れたまま残る）。必ず busy チェックを先に行う。
+        # 5.8 では is_rendering() がレンダ中でも False を返す実測があるため
+        # _KEEP の executor も併せて見る。
+        if (unreal.get_editor_subsystem(unreal.MoviePipelineQueueSubsystem).is_rendering()
+                or capture_mrq._KEEP.get("executor") is not None):
+            self.status_var.set("MRQ は既にレンダリング中です。完了までお待ちください。")
+            return
+        importlib.reload(capture_mrq)
+        self._restore_hooks = []
+        self._set_busy(True)
+        started = False
+        try:
+            started = bool(impl())
+        except Exception as e:
+            self.status_var.set("エラー: %s" % e)
+            unreal.log_error("[SceneCapture] ハンドラ例外: %s" % e)
+            raise
+        finally:
+            if not started:
+                self._run_restore_hooks()
+                self._set_busy(False)
+
+    def _run_restore_hooks(self):
+        """途中で登録された復元処理（Overscan filmback / PropagateAlpha 等）を実行する。
+        正常完了時は _finalize/_final が自分で復元してから空にする。"""
+        hooks = getattr(self, "_restore_hooks", None) or []
+        self._restore_hooks = []
+        for h in hooks:
+            try:
+                h()
+            except Exception as e:
+                unreal.log_warning("[SceneCapture] 復元フック失敗: %s" % e)
 
     def _matte_paths_neutralize(self, paths):
         """マット対象をライティングから切り離す（影/AO/GIを落とさない・
@@ -805,7 +913,12 @@ class CaptureWindow(object):
             "マット対象を無効化: 影/AO OFF %d comp・アンリット %d slot（リストから外すと復元）" % (n, m))
 
     def _matte_paths_restore(self, paths):
-        actors = core._resolve_target_actors(None, list(paths) or None)
+        # 起動時の再適用はパス失効時にラベルで解決している（_pick_targets_resolved）ので、
+        # 復元側も同じ規則で解決しないと、ラベル経由で無効化した対象が戻らない
+        p2l = self._path2label()
+        labels = self.matte_pick.get("labels", {}) if hasattr(self, "matte_pick") else {}
+        names = [pth if pth in p2l else (labels.get(pth) or pth) for pth in paths]
+        actors = core._resolve_target_actors(None, names or None)
         if not actors:
             return
         prims, _vols = core.split_volumetric_targets(actors)
@@ -816,35 +929,42 @@ class CaptureWindow(object):
         self.status_var.set("マット対象を復元: 影/AO ON %d comp・マテリアル復元 %d slot" % (n, m))
 
     def _on_mrq(self):
-        """Movie Render Queue で Beauty を高品質レンダ（非同期・PIE）。"""
+        """Movie Render Queue で Beauty を高品質レンダ（非同期・PIE）。
+        本体は _on_mrq_impl。busy ガード / capture_mrq の reload / 失敗時の復元は
+        _run_guarded が担う。"""
+        self._run_guarded(self._on_mrq_impl)
+
+    def _on_mrq_impl(self):
+        """戻り値: 非同期チェーンを開始したら True（完了側の _finalize が後始末）。"""
         import capture_mrq
-        # reload はレンダ中に行うと実行中ジョブの executor/復元コールバックを
-        # 破壊する（シーンが隠れたまま残る）。必ず busy チェックを先に行う。
-        if (unreal.get_editor_subsystem(unreal.MoviePipelineQueueSubsystem).is_rendering()
-                or capture_mrq._KEEP.get("executor") is not None):
-            self.status_var.set("MRQ は既にレンダリング中です。完了までお待ちください。")
-            return
-        importlib.reload(capture_mrq)
         _apply_exposure_lock(self.exposure_lock_var.get())
         cam = self._current_camera()
         if cam is None:
             self.status_var.set("MRQ: カメラが選択されていません")
-            return
+            return False
         out = self.out_var.get().strip()
         if not out:
             self.status_var.set("MRQ: 出力先を指定してください")
-            return
+            return False
         if not os.path.isdir(out):
             try:
                 os.makedirs(out)
-            except Exception:
-                pass
+            except Exception as e:
+                self.status_var.set("MRQ: 出力先を作成できません: %s" % e)
+                return False
+        # クリック時点の値を確定する（レンダ中にウィジェットを触っても、後続ジョブや
+        # 後処理が途中から別の値を読まないように）
+        fog_off = self.fog_off_var.get()
+        keep_beauty0 = self.beauty_var.get()
         W = self._int_var(self.w_var, 1920)
         if self.mrq_camasp_var.get():
             asp = core.get_camera_settings(cam).get("aspect_ratio", 0.0)
             H = int(round(W / asp)) if asp > 0.1 else 1080
         else:
             H = self._int_var(self.h_var, 1080)
+        if W < 16 or H < 16:
+            self.status_var.set("MRQ: 解像度が不正です (%d×%d)" % (W, H))
+            return False
         # Overscan: ON のとき fx(横)/fy(縦) を決める。% は一律、px は X/Y 別。
         # カメラの filmback を一時拡大して FOV を縦横独立に広げ、解像度も ×(1+f) に拡大。
         fx = fy = 0.0
@@ -857,8 +977,24 @@ class CaptureWindow(object):
         if fx > 0.0 or fy > 0.0:
             W = int(round(W * (1.0 + fx)))
             H = int(round(H * (1.0 + fy)))
-        warm = self._int_var(self.mrq_warmup_var, 32)
-        ts = self._int_var(self.mrq_ts_var, 8)
+        warm = max(1, self._int_var(self.mrq_warmup_var, 32))
+        ts = max(1, self._int_var(self.mrq_ts_var, 8))
+        auto_rng_failed = False
+        if self.depth_var.get() and self.depth_auto_var.get():
+            # Depth 自動レンジ: 現在フレームの可視ジオメトリの最近/最遠を実測して
+            # Near/Far を決定（値は欄へ書き戻す。失敗時は欄の手動値のまま）。
+            # _collect_settings() が欄を読む前に行う（16bit PNG / EXR の SceneCapture
+            # 深度は settings の Near/Far で正規化されるため）
+            rng = None
+            try:
+                rng = core.measure_depth_range(cam)
+            except Exception as e:
+                unreal.log_warning("[SceneCapture] Depth自動レンジ失敗: %s" % e)
+            if rng:
+                self.near_var.set("%g" % rng[0])
+                self.far_var.set("%g" % rng[1])
+            else:
+                auto_rng_failed = True
         self._save_ui_state()
         # Overscan: filmback を一時拡大（全パスのレンダ前。MRQ完了後/失敗時に復元）。
         _osc_fb = None
@@ -872,8 +1008,10 @@ class CaptureWindow(object):
             if _osc_fb is not None:
                 try:
                     core.restore_camera_filmback(cam, _osc_fb[0], _osc_fb[1])
-                except Exception:
-                    pass
+                except Exception as e:
+                    unreal.log_warning("[SceneCapture] filmback 復元失敗: %s" % e)
+        # 途中で例外が出ても _run_guarded / _finalize が必ず戻す
+        self._restore_hooks.append(_restore_fb)
         # この Capture の通し番号（全出力に _NNN を付与。設定違いを上書きしない）
         suf = "%03d" % core.next_take_number(out)
         # シーケンサーを開いていれば MRQ 側も「その現在フレーム」で固定する
@@ -918,19 +1056,13 @@ class CaptureWindow(object):
             except Exception as e:
                 skip_notes.append("Matteの前: 一時マテリアル生成失敗でスキップ")
                 self.status_var.set("Matteの前: 一時マテリアル生成失敗: %s" % e)
-        if self.depth_var.get() and self.depth_auto_var.get():
-            # Depth 自動レンジ: 現在フレームの可視ジオメトリの最近/最遠を実測して
-            # Near/Far を決定（値は欄へ書き戻す。失敗時は欄の手動値のまま）
-            rng = None
-            try:
-                rng = core.measure_depth_range(self._current_camera())
-            except Exception as e:
-                unreal.log_warning("[SceneCapture] Depth自動レンジ失敗: %s" % e)
-            if rng:
-                self.near_var.set("%g" % rng[0])
-                self.far_var.set("%g" % rng[1])
-            else:
-                skip_notes.append("Depth自動レンジ: 測定失敗（手動値を使用）")
+        if auto_rng_failed:
+            skip_notes.append("Depth自動レンジ: 測定失敗（手動値を使用）")
+        if self.depth_var.get() and s.depth_far <= s.depth_near:
+            skip_notes.append("Z-Depth: Far が Near 以下のため既定値 (0〜10000cm) を使用")
+            s.depth_near, s.depth_far = 0.0, 10000.0
+            self.near_var.set("0")
+            self.far_var.set("10000")
         depth_pp_mat = None
         if self.depth_var.get() and self.depth_bit_var.get() == "8bit PNG":
             # 8bit深度は Beauty と同一 MRQ ジョブの PP パスで撮る（WPO/風の位相一致）。
@@ -959,7 +1091,9 @@ class CaptureWindow(object):
                 self.root.update()
                 core.run_capture(s)
         except Exception as e:
+            skip_notes.append("データパス(Depth/ObjectID)出力でエラー")
             self.status_var.set("データパス出力でエラー: %s" % e)
+            unreal.log_error("[SceneCapture] データパス出力でエラー: %s" % e)
 
         # VDB雲: Auto=レベル内のHV検出で自動 / ON=強制 / OFF=雲を完全無視した従来書き出し
         vdb = self._vdb_enabled()
@@ -977,25 +1111,27 @@ class CaptureWindow(object):
         img_fmt = {"PNG 8bit": "png", "JPG 8bit": "jpg",
                    "EXR 16bit (float)": "exr"}.get(self.beauty_fmt_var.get(), "png")
         beauty_path = os.path.join(out, _name("Beauty") + _FMT_EXT[img_fmt])
-        # Matte 系合成は PIL で読める画像が必要。EXR のときは PNG も内部出力して使う
-        # （Depth PP パスの PNG 出力にも必要）。
+        # Matte 系合成は PIL で読める画像が必要。EXR / JPG のときは PNG も内部出力して
+        # 使う（Depth / Normal / Matte の PP パスは PNG で受け取る前提のため）。
         need_comp = want_mfront or want_behind
-        aux_png = (img_fmt == "exr") and (need_comp or depth_pp_mat is not None
+        aux_png = (img_fmt != "png") and (need_comp or depth_pp_mat is not None
                                           or normal_pp_mat is not None)
         comp_beauty = (os.path.join(out, _name("Beauty") + ".png")
-                       if img_fmt == "exr" else beauty_path)
+                       if img_fmt != "png" else beauty_path)
 
         # Beauty（MRQ）は Beauty 指定時・Matte 系合成・同一ジョブ深度・Raw Lighting Full
         # が要るときにレンダする（Raw Lighting Direct はメイン無しでも専用ジョブで出せる）
-        beauty_needed = (self.beauty_var.get() or want_mfront or want_behind
+        beauty_needed = (keep_beauty0 or want_mfront or want_behind
                          or depth_pp_mat is not None or normal_pp_mat is not None
                          or want_rlfull)
         if (not beauty_needed and not want_rldir and not objid_cloud_vols
                 and not self.cloudmatte_var.get() and not self.skymatte_var.get()):
-            _restore_fb()
-            self.status_var.set("完了（データパスのみ出力）" if (s.do_depth or s.do_object_id)
-                                else "出力が選ばれていません")
-            return
+            msg = ("完了（データパスのみ出力）" if (s.do_depth or s.do_object_id)
+                   else "出力が選ばれていません")
+            if skip_notes:
+                msg += "（%s）" % " / ".join(skip_notes)
+            self.status_var.set(msg)
+            return False
 
         # Matte 系出力時は Beauty から対象を常に隠す（クリーンプレート）。
         # 対象は 板(プリミティブ)/雲(HVボリューム) に分割: 板は従来の
@@ -1067,8 +1203,13 @@ class CaptureWindow(object):
         # チェーン完了時に元値へ戻すため開始前の値を控える。
         pa0 = None
         if matte_vols or objid_cloud_vols or cloudmatte_vols:
-            pa0 = unreal.SystemLibrary.get_console_variable_bool_value(
+            pa0 = unreal.SystemLibrary.get_console_variable_int_value(
                 "r.PostProcessing.PropagateAlpha")
+
+            def _restore_pa():
+                unreal.SystemLibrary.execute_console_command(
+                    None, "r.PostProcessing.PropagateAlpha %d" % int(pa0))
+            self._restore_hooks.append(_restore_pa)
         # 板あり: 白/黒バッキング差分で「板より手前の透過率T」を取り、板マスクの穴を
         # 遮蔽関係どおりに塞ぐ（板の手前の雲・半透明が他オブジェクトと同じ挙動になり、
         # 板の後ろの雲は板に遮られて写らないので自動的に無効）。何も隠さず照明も素のまま。
@@ -1169,7 +1310,40 @@ class CaptureWindow(object):
             else:
                 skip_notes.append("Matteの前: マスクが得られずスキップ（Beauty は残置）")
 
+        def _fail_finish(msg):
+            """チェーンを途中で打ち切る: 一時材の削除・filmback/PropagateAlpha の復元・
+            露出固定の解除・busy 解除をまとめて行う。"""
+            try:
+                if matte_mat_still is not None:
+                    core.delete_temp_matte_material()
+                if depth_pp_mat is not None:
+                    core.delete_temp_depth_material()
+                if normal_pp_mat is not None:
+                    core.delete_temp_normal_material()
+                if geomask_mat is not None:
+                    core.delete_temp_geomask_material()
+            except Exception as e:
+                unreal.log_warning("[SceneCapture] 一時マテリアル削除失敗: %s" % e)
+            self._run_restore_hooks()
+            _apply_exposure_lock(False)
+            self._set_busy(False)
+            self.status_var.set(msg)
+
         def _finalize():
+            """後処理の本体 _finalize_body が例外で抜けても、復元と busy 解除は必ず行う。"""
+            try:
+                _finalize_body()
+            except Exception as e:
+                skip_notes.append("後処理エラー")
+                unreal.log_error("[SceneCapture] 後処理エラー: %s" % e)
+            finally:
+                self._run_restore_hooks()       # filmback / PropagateAlpha
+                _apply_exposure_lock(False)     # 露出固定の cvar を他スクリプトへ持ち越さない
+                self._set_busy(False)
+            self.status_var.set("完了" if not skip_notes
+                                else "完了（%s）" % " / ".join(skip_notes))
+
+        def _finalize_body():
             # 雲 ObjectID を合成してから内部素材を消す
             if objid_cloud_entries:
                 try:
@@ -1183,7 +1357,7 @@ class CaptureWindow(object):
             # Beauty のチェックが無い場合（合成のためだけにレンダした場合）も削除するが、
             # 合成がスキップされたときは唯一の成果物になるため残す。
             aux = comp_beauty if comp_beauty != beauty_path else None
-            keep_beauty = self.beauty_var.get() or bool(skip_notes)
+            keep_beauty = keep_beauty0 or bool(skip_notes)
             # H5 合成: 白T + 黒ベール + 雲なしBeauty から可視雲αを作る
             cm_png = os.path.join(out, _name("CloudMatte") + ".png")
             if cloud_alpha_needed:
@@ -1309,12 +1483,6 @@ class CaptureWindow(object):
                                 out, "%s_%s.png" % (_name(_bn), gtag)))
                         except Exception:
                             skip_notes.append("%s: Gタグ付与失敗" % _bn)
-            _restore_fb()
-            if pa0 is not None:
-                unreal.SystemLibrary.execute_console_command(
-                    None, "r.PostProcessing.PropagateAlpha %d" % (1 if pa0 else 0))
-            self.status_var.set("完了" if not skip_notes
-                                else "完了（%s）" % " / ".join(skip_notes))
 
         def _run_jobs():
             if not jobs:
@@ -1324,6 +1492,10 @@ class CaptureWindow(object):
 
             def _jdone(ok, od, _j=j):
                 nonlocal cloud_matte_path
+                if not ok and (_j.get("composite") or _j.get("sky")):
+                    # Behind プレート / 空マットは下に専用の失敗分岐が無いのでここで注記
+                    skip_notes.append("%s: レンダ失敗" % (
+                        "Matteの奥" if _j.get("composite") else "空マット"))
                 # バッキングジョブ: 白1レンダから T を計算して合成へ
                 if _j.get("cloud_kind") == "backing_w":
                     bp = os.path.join(out, _j["base"] + ".exr")
@@ -1343,6 +1515,7 @@ class CaptureWindow(object):
                         try:
                             _compose_mfront()
                         except Exception as e:
+                            skip_notes.append("Matteの前: 合成エラー")
                             self.status_var.set("雲マット合成エラー: %s" % e)
                 # CloudMatte / 雲ObjectID ジョブ: αを回収して合成へ
                 elif _j.get("cloud_kind") in ("cloudvis", "cloudveil"):
@@ -1362,6 +1535,7 @@ class CaptureWindow(object):
                             try:
                                 _compose_mfront()
                             except Exception as e:
+                                skip_notes.append("Matteの前: 合成エラー")
                                 self.status_var.set("雲マット合成エラー: %s" % e)
                     else:
                         objid_cloud_entries.append(
@@ -1385,10 +1559,11 @@ class CaptureWindow(object):
                 # behind ジョブはマットシルエットで通常 Beauty と合成し behindmatte.png を作る
                 if ok and _j.get("composite"):
                     try:
-                        c = self._current_camera()
+                        # カメラはクリック時に確定した cam（レンダ中にコンボを触っても
+                        # 別カメラで合成しない）
                         inter = os.path.join(out, _j["base"] + ".png")
                         core.composite_behind_in_matte(
-                            core._get_editor_world(), core.get_camera_settings(c),
+                            core._get_editor_world(), core.get_camera_settings(cam),
                             _j["matte"], comp_beauty, inter,
                             os.path.join(out, _name("Behind") + ".png"),
                             W, H)
@@ -1399,6 +1574,7 @@ class CaptureWindow(object):
                         except Exception:
                             pass
                     except Exception as e:
+                        skip_notes.append("Matteの奥: 合成エラー")
                         self.status_var.set("behind 合成エラー: %s" % e)
                 _run_jobs()
             self.status_var.set("追加 MRQ レンダ中… (%s)" % j["base"])
@@ -1436,16 +1612,22 @@ class CaptureWindow(object):
                                           # 空マットはフォグ散乱が空を埋めるため
                                           # fog_off 強制（実績スクリプトと同条件）
                                           backing_white=j.get("backing_white", False),
-                                          fog_off=(True if j.get("sky")
-                                                   else self.fog_off_var.get()),
+                                          fog_off=(True if j.get("sky") else fog_off),
                                           scene_sequence=scene_seq,
                                           scene_frame=scene_frame, on_done=_jdone)
             except Exception as e:
-                # チェーンを死なせず _finalize まで確定させる（中間物の掃除・
-                # filmback/PropagateAlpha の復元・保留中の合成の後始末）
+                # 1 本の起動失敗でキューの残りを捨てない（注記して次のジョブへ）。
+                # バッキングが起動できなかった場合は板のみで Matteの前を確定させる
                 skip_notes.append("追加ジョブ起動失敗 (%s)" % j["base"])
                 self.status_var.set("追加 MRQ 失敗: %s" % e)
-                _finalize()
+                unreal.log_warning("[SceneCapture] 追加ジョブ起動失敗 %s: %s" % (j["base"], e))
+                if j.get("cloud_kind") == "backing_w" and want_mfront:
+                    try:
+                        _compose_mfront()
+                    except Exception as e2:
+                        skip_notes.append("Matteの前: 合成エラー")
+                        unreal.log_warning("[SceneCapture] Matteの前 合成エラー: %s" % e2)
+                _run_jobs()
 
         def _after_beauty(ok, od):
             nonlocal matte_path
@@ -1487,18 +1669,18 @@ class CaptureWindow(object):
                         else:
                             skip_notes.append("Raw Lighting Full: 出力が見つかりません")
                 except Exception as e:
-                    _restore_fb()
-                    self.status_var.set("Beautyブレンドでエラー: %s" % e)
+                    unreal.log_error("[SceneCapture] Beauty 後処理エラー: %s" % e)
+                    _fail_finish("Beauty 後処理でエラー: %s" % e)
                     return
                 _run_jobs()
                 return
-            _restore_fb()
-            self.status_var.set("MRQ 失敗: " + od)
+            # od は出力フォルダ（on_done の契約は (success, output_dir)）であって原因ではない
+            _fail_finish("MRQ Beauty レンダ失敗（Output Log 参照）")
 
         if not beauty_needed:
             # Raw Lighting Direct のみ: メインジョブ無しで専用ジョブだけ回す
             _run_jobs()
-            return
+            return True
 
         # 静止画（時間凍結）の TS>1 は、同一ジョブの Matte/Depth PP パスが
         # サブフレームの片方にしか写らず 50% に希釈される（TS=2 でマスク黒が
@@ -1525,20 +1707,13 @@ class CaptureWindow(object):
                                                     else None),
                                       depth_material=depth_pp_mat,
                                       normal_material=normal_pp_mat,
-                                      fog_off=self.fog_off_var.get(),
+                                      fog_off=fog_off,
                                       scene_sequence=scene_seq,
                                       scene_frame=scene_frame, on_done=_after_beauty)
         except Exception as e:
-            if matte_mat_still is not None:
-                core.delete_temp_matte_material()
-            if depth_pp_mat is not None:
-                core.delete_temp_depth_material()
-            if normal_pp_mat is not None:
-                core.delete_temp_normal_material()
-            if geomask_mat is not None:
-                core.delete_temp_geomask_material()
-            _restore_fb()
-            self.status_var.set("MRQ 起動失敗: %s" % e)
+            _fail_finish("MRQ 起動失敗: %s" % e)
+            return False
+        return True
 
     # ------------------------------------------------------ sequence render
     def _current_sequence(self):
@@ -1558,21 +1733,59 @@ class CaptureWindow(object):
         return core.level_has_volumetrics()
 
     def _sequence_camera_at(self, seq, frame):
-        """プレイヘッドを frame に合わせ、カメラカットに束縛されたカメラアクターを返す。
-        バインディング解決に失敗した場合はレベル内の先頭カメラにフォールバック。"""
+        """プレイヘッドを frame に合わせ、その時刻のカメラカットに束縛されたカメラ
+        アクターを返す。frame を含むカメラカットセクションを選び、その binding を
+        LevelSequenceEditorBlueprintLibrary.get_bound_objects で解決する（開いている
+        Sequencer 経由なのでスポーナブルも返る）。解決できなければ従来どおり
+        全カットのカメラ → レベル内の先頭カメラへフォールバック（警告ログ付き）。"""
         try:
             unreal.LevelSequenceEditorBlueprintLibrary.set_current_time(int(frame))
-        except Exception:
-            pass
+        except Exception as e:
+            unreal.log_warning("[SceneCapture] スクラブ失敗 (F%d): %s" % (frame, e))
+        cam = self._camera_cut_camera_for_frame(seq, int(frame))
+        if cam is not None:
+            return cam
         try:
             import capture_mrq
             cams = capture_mrq._camera_cut_camera_actors(seq, core._get_editor_world())
             if cams:
+                if len(cams) > 1:
+                    unreal.log_warning("[SceneCapture] F%d のカメラカットを解決できず、"
+                                       "先頭カットのカメラ %s を使用" % (frame, cams[0].get_actor_label()))
                 return cams[0]
         except Exception:
             pass
         cams = core.list_cameras()
+        if cams:
+            unreal.log_warning("[SceneCapture] F%d のカメラカットを解決できず、レベル内の"
+                               "カメラ %s を使用" % (frame, cams[0].get_actor_label()))
         return cams[0] if cams else None
+
+    @staticmethod
+    def _camera_cut_camera_for_frame(seq, frame):
+        """frame を含むカメラカットセクションのカメラアクター（無ければ None）。"""
+        try:
+            tracks = unreal.MovieSceneSequenceExtensions.find_tracks_by_exact_type(
+                seq, unreal.MovieSceneCameraCutTrack)
+        except Exception:
+            return None
+        for tr in list(tracks or []):
+            try:
+                sections = list(tr.get_sections())
+            except Exception:
+                continue
+            for sec in sections:
+                try:
+                    if not (sec.get_start_frame() <= frame < sec.get_end_frame()):
+                        continue
+                    bid = sec.get_camera_binding_id()
+                    objs = unreal.LevelSequenceEditorBlueprintLibrary.get_bound_objects(bid)
+                except Exception:
+                    continue
+                for o in list(objs or []):
+                    if isinstance(o, unreal.CameraActor):
+                        return o
+        return None
 
     def _refresh_sequence(self):
         seq = self._current_sequence()
@@ -1634,28 +1847,35 @@ class CaptureWindow(object):
         MRQ は PNG 連番（マスター）のみを出力し、MP4 はシーケンスの Display Rate で
         ffmpeg エンコードする（fps を確実に一致させるため）。余剰フレームは
         エンコード前にトリムする。素材ごとに PNG連番/MP4 を選択できる。"""
+        self._run_guarded(self._on_seq_render_impl)
+
+    def _on_seq_render_impl(self):
+        """戻り値: 非同期チェーンを開始したら True（完了側の _final が後始末）。"""
         import capture_mrq
-        # _on_mrq と同じ理由で reload 前に busy チェック（実行中チェーンの保護）
-        if (unreal.get_editor_subsystem(unreal.MoviePipelineQueueSubsystem).is_rendering()
-                or capture_mrq._KEEP.get("executor") is not None):
-            self.status_var.set("MRQ は既にレンダリング中です。完了までお待ちください。")
-            return
-        importlib.reload(capture_mrq)
         _apply_exposure_lock(self.seq_exposure_lock_var.get())
         seq = self._current_sequence()
         if seq is None:
             self.status_var.set("シーケンスレンダ: Sequencer でシーケンスを開いてください")
-            return
+            return False
         self._refresh_sequence()
         base_out = self.seq_out_var.get().strip()
         if not base_out:
             self.status_var.set("シーケンスレンダ: 出力先を指定してください")
-            return
+            return False
         if not os.path.isdir(base_out):
             try:
                 os.makedirs(base_out)
-            except Exception:
-                pass
+            except Exception as e:
+                self.status_var.set("シーケンスレンダ: 出力先を作成できません: %s" % e)
+                return False
+        # クリック時点の値を確定（レンダ中にウィジェットを触っても後続ジョブに混ざらない）
+        seq_fog = self.seq_fog_var.get()
+        seq_fmt = {"PNG 8bit": "png", "JPG 8bit": "jpg",
+                   "EXR 16bit (float)": "exr"}.get(self.seq_beauty_fmt_var.get(), "png")
+        # Depth のビット深度: 8bit は Beauty と同一ジョブの PP パス（従来）。
+        # 16bit PNG / EXR float はフレーム毎に SceneCapture で実測する（厳密リニア）
+        seq_depth_mode = {"8bit PNG": "8bit", "16bit PNG": "16bit",
+                          "EXR float": "exr"}.get(self.seq_depth_bit_var.get(), "8bit")
         W = self._int_var(self.seq_w_var, 1920)
         if self.seq_camasp_var.get():
             # カメラカットのカメラのアスペクトに従う（素の CameraActor も可）
@@ -1663,8 +1883,11 @@ class CaptureWindow(object):
             H = int(round(W / asp)) if asp > 0.1 else self._int_var(self.seq_h_var, 1080)
         else:
             H = self._int_var(self.seq_h_var, 1080)
-        warm = self._int_var(self.seq_warm_var, 32)
-        ts = self._int_var(self.seq_ts_var, 8)
+        if W < 16 or H < 16:
+            self.status_var.set("シーケンスレンダ: 解像度が不正です (%d×%d)" % (W, H))
+            return False
+        warm = max(1, self._int_var(self.seq_warm_var, 32))
+        ts = max(1, self._int_var(self.seq_ts_var, 8))
         ext = unreal.MovieSceneSequenceExtensions
         cs = ce = None
         if self.seq_range_mode.get() == "custom":
@@ -1672,7 +1895,7 @@ class CaptureWindow(object):
             ce = self._int_var(self.seq_end_var, cs) + 1   # UI は End含む → 排他へ
             if ce <= cs:
                 self.status_var.set("シーケンスレンダ: フレーム範囲が不正です (End は Start 以上)")
-                return
+                return False
             cs_eff, ce_eff = cs, ce
         else:
             cs_eff = ext.get_playback_start(seq)
@@ -1683,11 +1906,12 @@ class CaptureWindow(object):
         wants = {k: (pv.get(), mv.get()) for k, (pv, mv) in self.seq_out_vars.items()}
         if not any(p or m for p, m in wants.values()):
             self.status_var.set("シーケンスレンダ: 出力素材が1つも選ばれていません")
-            return
+            return False
 
         def _need(key):
             return wants[key][0] or wants[key][1]
 
+        seq_notes = []
         mp4_any = any(m for _, m in wants.values())
         ffmpeg = None
         if mp4_any:
@@ -1695,24 +1919,34 @@ class CaptureWindow(object):
             if not ffmpeg:
                 self.status_var.set("MP4 出力には ffmpeg が必要です（見つかりません。"
                                     "設定 JSON の ffmpeg_path か PATH を確認）")
-                return
+                return False
             self._ffmpeg_hint = ffmpeg
+            # libx264 + yuv420p は奇数の幅/高さを拒否する（spec E12）
+            if (W & 1) or (H & 1):
+                W, H = W & ~1, H & ~1
+                seq_notes.append("MP4 用に解像度を %d×%d（偶数）に調整" % (W, H))
         crf = self._resolve_crf()
 
         matte_needed = _need("mfront") or _need("behind")
         depth_needed = _need("depth")
+        depth_hi = depth_needed and seq_depth_mode != "8bit"
+        if depth_hi and seq_depth_mode == "exr" and wants["depth"][1]:
+            # 生 cm の float は H.264 にできない（値域が 0..1 でない）
+            wants["depth"] = (True, False)
+            seq_notes.append("Depth(EXR float): MP4 は出しません（連番のみ）")
         normal_needed = _need("normal")
         objid_needed = _need("objid")
         rlfull_needed = _need("rlfull")
         rldir_needed = _need("rldir")
         cloudmatte_needed = _need("cloudmatte")
         skymatte_needed = _need("skymatte")
+        # メインジョブ（全編 Beauty）が要るか: 16bit/EXR の Depth は PP パスではなく
+        # 別経路（フレーム毎 SceneCapture）なので、それ単独ならメインジョブは省く
+        main_needed = (_need("beauty") or (depth_needed and not depth_hi) or normal_needed
+                       or matte_needed or objid_needed or rlfull_needed)
         # Direct だけならメインジョブ自体を直射レンダにする（全編2回レンダの回避）
-        only_direct = rldir_needed and not (
-            _need("beauty") or depth_needed or normal_needed or matte_needed
-            or objid_needed or rlfull_needed)
+        only_direct = rldir_needed and not main_needed
 
-        seq_notes = []
         vdb = self._vdb_enabled()
         matte_actors = None
         matte_prims, matte_vols = [], []
@@ -1720,11 +1954,16 @@ class CaptureWindow(object):
             matte_actors = core._resolve_target_actors(
                 None, self._pick_targets_resolved(self.matte_pick) or None)
             if not matte_actors:
-                self.status_var.set("シーケンスレンダ: Matte 対象が見つかりません"
-                                    "（画像タブの Matte targets か選択を確認）")
-                return
+                if matte_needed:
+                    self.status_var.set("シーケンスレンダ: Matte 対象が見つかりません"
+                                        "（対象欄の Matte targets か選択を確認）")
+                    return False
+                # 「Matte 対象を隠す」だけが ON で対象が無い: 隠さずに続行する
+                seq_notes.append("Matte 対象を隠す: 対象が無いため無視")
+                matte_actors = None
             # 板(プリミティブ)/雲(HVボリューム) 分割。雲は専用 CloudMatte ジョブで扱う。
-            matte_prims, matte_vols = core.split_volumetric_targets(matte_actors)
+            if matte_actors:
+                matte_prims, matte_vols = core.split_volumetric_targets(matte_actors)
             if not vdb and matte_vols:
                 # OFF: 雲は対象から外す（従来の書き出しと同一の流れにする）
                 seq_notes.append("VDB雲モード OFF: 雲対象は無視されます")
@@ -1737,8 +1976,8 @@ class CaptureWindow(object):
                 None, self._pick_targets_resolved(self.objid_pick) or None)
             if not objid_actors:
                 self.status_var.set("シーケンスレンダ: ObjectID 対象が見つかりません"
-                                    "（画像タブの Object ID targets か選択を確認）")
-                return
+                                    "（対象欄の Object ID targets か選択を確認）")
+                return False
             _op, _ov = core.split_volumetric_targets(objid_actors)
             if _ov:
                 seq_notes.append("ObjectID: 雲(ボリューム)対象は映像では未対応（静止画のみ）")
@@ -1799,13 +2038,30 @@ class CaptureWindow(object):
                 self.seq_far_var.set("%g" % hi)
             else:
                 seq_notes.append("Depth自動レンジ: 測定失敗（手動値を使用）")
+        depth_near = self._float_var(self.seq_near_var, 0.0)
+        depth_far = self._float_var(self.seq_far_var, 10000.0)
+        if depth_needed and depth_far <= depth_near:
+            seq_notes.append("Z-Depth: Far が Near 以下のため既定値 (0〜10000cm) を使用")
+            depth_near, depth_far = 0.0, 10000.0
         depth_mat = matte_mat = matte_sil_mat = objid_mat = normal_mat = None
         hide_actors = None
+
+        def _cleanup_materials():
+            if depth_mat is not None:
+                core.delete_temp_depth_material()
+            if normal_mat is not None:
+                core.delete_temp_normal_material()
+            if matte_mat is not None:
+                core.delete_temp_matte_material()
+            if matte_sil_mat is not None:
+                core.delete_temp_matte_sil_material()
+            if objid_mat is not None:
+                core.delete_temp_objid_material()
+
         try:
-            if depth_needed:
+            if depth_needed and not depth_hi:
                 depth_mat = core.create_temp_depth_material(
-                    self._float_var(self.seq_near_var, 0.0),
-                    self._float_var(self.seq_far_var, 10000.0),
+                    depth_near, depth_far,
                     invert=True)   # 手前=白 / 奥=黒 固定
             if normal_needed:
                 normal_mat = core.create_temp_normal_material(
@@ -1827,27 +2083,20 @@ class CaptureWindow(object):
             if objid_needed:
                 objid_mat = core.create_temp_objid_material()
         except Exception as e:
+            # 途中まで作った一時マテリアルを残さない
+            _cleanup_materials()
             self.status_var.set("一時マテリアル生成失敗: %s" % e)
-            return
-
-        def _cleanup_materials():
-            if depth_mat is not None:
-                core.delete_temp_depth_material()
-            if normal_mat is not None:
-                core.delete_temp_normal_material()
-            if matte_mat is not None:
-                core.delete_temp_matte_material()
-            if matte_sil_mat is not None:
-                core.delete_temp_matte_sil_material()
-            if objid_mat is not None:
-                core.delete_temp_objid_material()
+            return False
 
         def _final(ok, od):
-            _cleanup_materials()
-            if pa0 is not None:
-                # 雲ジョブが残す r.PostProcessing.PropagateAlpha=1 を元値へ（実測リーク）
-                unreal.SystemLibrary.execute_console_command(
-                    None, "r.PostProcessing.PropagateAlpha %d" % (1 if pa0 else 0))
+            try:
+                _cleanup_materials()
+            except Exception as e:
+                unreal.log_warning("[SceneCapture] 一時マテリアル削除失敗: %s" % e)
+            # 雲ジョブが残す r.PostProcessing.PropagateAlpha=1 を元値へ（実測リーク）
+            self._run_restore_hooks()
+            _apply_exposure_lock(False)
+            self._set_busy(False)
             # 成功時: 作業フォルダに残った成果物（素材サブフォルダ/MP4/JSON）を
             # final_out へ移し、作業フォルダごと削除。失敗時は診断用に残す
             if ok:
@@ -1881,7 +2130,9 @@ class CaptureWindow(object):
         # Normal / Depth 選択時も雲αを自動レンダして連番の雲領域を黒に落とす。
         cm_vols = []
         cloud_for_black = False
-        if cloudmatte_needed or normal_needed or depth_needed:
+        # Depth の雲抜きは 8bit / 16bit PNG のみ（EXR float は生 cm なので対象外）
+        depth_cloud_ok = depth_needed and seq_depth_mode != "exr"
+        if cloudmatte_needed or normal_needed or depth_cloud_ok:
             if not vdb:
                 if cloudmatte_needed:
                     seq_notes.append("雲マット: VDB雲モード OFF のためスキップ")
@@ -1895,7 +2146,9 @@ class CaptureWindow(object):
                         wants["cloudmatte"] = (False, False)
                         cloudmatte_needed = False
                 else:
-                    cloud_for_black = normal_needed or depth_needed
+                    cloud_for_black = normal_needed or depth_cloud_ok
+                    if depth_needed and seq_depth_mode == "exr":
+                        seq_notes.append("Depth(EXR float): 生cmのため雲抜き対象外")
         cloud_vols_job = matte_vols if mfront_cloud else cm_vols
         if ((cloudmatte_needed or cloud_for_black) and mfront_cloud
                 and {a.get_path_name() for a in matte_vols}
@@ -1903,12 +2156,18 @@ class CaptureWindow(object):
             seq_notes.append("雲マット: Matte対象の雲のみ（Matteの前と共用）")
         cloud_seq = {"run": mfront_cloud or cloudmatte_needed or cloud_for_black,
                      "mfront": mfront_cloud}
-        pa0 = (unreal.SystemLibrary.get_console_variable_bool_value(
-            "r.PostProcessing.PropagateAlpha") if cloud_seq["run"] else None)
+        if cloud_seq["run"]:
+            pa0 = unreal.SystemLibrary.get_console_variable_int_value(
+                "r.PostProcessing.PropagateAlpha")
+
+            def _restore_pa():
+                unreal.SystemLibrary.execute_console_command(
+                    None, "r.PostProcessing.PropagateAlpha %d" % int(pa0))
+            self._restore_hooks.append(_restore_pa)
         if backing_seq["run"]:
             seq_notes.append("雲マット: バッキング差分（板の手前の雲を遮蔽どおり反映）")
         pass_files_main = [] if only_direct else ["Beauty"]
-        if depth_needed:
+        if depth_needed and not depth_hi:
             pass_files_main.append("Depth")
         if normal_needed:
             pass_files_main.append("Normal")
@@ -1940,6 +2199,22 @@ class CaptureWindow(object):
                     trim_list.append("CloudMatte")
                 core.trim_sequence_frames(out, name_body, take_str,
                                           trim_list, cs_eff, ce_eff)
+                if depth_hi:
+                    # 16bit PNG / EXR float の Depth: フレーム毎にスクラブして
+                    # SceneCapture（RGBA32F）で実測（Behind の MatteSil と同じ経路）
+                    self.status_var.set("Z-Depth(%s) をフレーム毎に実測中… (%d〜%dF)"
+                                        % (seq_depth_mode, cs_eff, ce_eff - 1))
+                    self.root.update()
+                    nd, dext = core.render_depth_sequence(
+                        out, name_body, take_str, cs_eff, ce_eff, W, H,
+                        camera_for_frame=lambda f: self._sequence_camera_at(seq, f),
+                        near_cm=depth_near, far_cm=depth_far,
+                        mode=seq_depth_mode, aa=1)
+                    if nd <= 0:
+                        seq_notes.append("Z-Depth: フレーム毎の深度取得に失敗")
+                        wants["depth"] = (False, False)
+                    elif seq_depth_mode == "exr" and dext != "exr":
+                        seq_notes.append("Z-Depth: EXR を書けず 16bit PNG にフォールバック")
                 if backing_seq["run"]:
                     nb = core.backing_t_sequence(
                         out, name_body, take_str, cs_eff, ce_eff,
@@ -1962,12 +2237,13 @@ class CaptureWindow(object):
                         core.composite_behind_sequence(out, name_body, take_str)
                     else:
                         seq_notes.append("Matteの奥: シルエット生成に失敗")
+                        wants["behind"] = (False, False)
                 if cloud_for_black and cloud_seq["run"]:
                     # Normal / Depth 連番の雲領域を黒に（CloudMatte が α のままのうちに乗算）
                     if normal_needed:
                         core.apply_cloud_black_to_pass_frames(
                             out, name_body, take_str, "Normal")
-                    if depth_needed:
+                    if depth_cloud_ok and _need("depth"):
                         core.apply_cloud_black_to_pass_frames(
                             out, name_body, take_str, "Depth")
                 if normal_needed and matte_prims:
@@ -1998,6 +2274,19 @@ class CaptureWindow(object):
                 _final(False, od)
                 return
 
+            def _delete_frames_ext(pass_names, exts):
+                """指定パスの連番のうち拡張子 exts のものだけ削除（形式切替の後始末）。"""
+                import re
+                for pn in pass_names:
+                    pat = re.compile(re.escape("%s_%s_%s." % (name_body, pn, take_str))
+                                     + r"\d+\.(%s)$" % "|".join(exts))
+                    for f in os.listdir(out):
+                        if pat.match(f):
+                            try:
+                                os.remove(os.path.join(out, f))
+                            except Exception:
+                                pass
+
             cmds = []
             for key, _label, pass_name in _SEQ_OUTPUTS:
                 if wants[key][1]:
@@ -2006,9 +2295,14 @@ class CaptureWindow(object):
                     cmds.append(cmd)
 
             def _after_encode(enc_ok):
+                if not enc_ok:
+                    # ffmpeg 失敗時は何も消さない（MP4 だけの素材の連番が消えて
+                    # データ消失になる。spec E15）。作業フォルダごと診断用に残す
+                    _final(False, od)
+                    return
                 drop = ["BehindPlate", "BackingT"]   # 中間素材は削除
                 # CloudMatte は _SEQ_OUTPUTS 行になったので下の汎用ループが
-                # 「PNG連番のチェックが無いときだけ」削除する
+                # 「連番のチェックが無いときだけ」削除する
                 if matte_mat is not None:
                     drop.append("Matte")
                 if _need("behind"):
@@ -2020,7 +2314,19 @@ class CaptureWindow(object):
                     if not wants[key][0]:
                         drop.append(pass_name)
                 core.delete_pass_frames(out, name_body, take_str, drop)
-                # PNG連番を選んだ素材は素材毎のサブフォルダへ自動移動（MP4は直下のまま）
+                if seq_fmt != "png":
+                    # 形式が EXR/JPG のとき MRQ は全パスをその形式でも書く。
+                    # 形式の対象は Beauty / Raw Lighting だけなので、他パスの EXR/JPG は
+                    # 捨て、対象パスは逆に内部 PNG（合成・MP4 用）を捨てる
+                    fmt_passes = {"Beauty", "RawLightingFull", "RawLightingDirect"}
+                    others = [pn for _k, _l, pn in _SEQ_OUTPUTS if pn not in fmt_passes]
+                    others += ["Matte", "MatteSil", "BehindOcc", "BehindPlate",
+                               "DirectPlate", "SkyMatte"]
+                    _delete_frames_ext(others, (seq_fmt,))
+                    _delete_frames_ext([pn for pn in fmt_passes
+                                        if any(wants[k][0] for k, _l, p in _SEQ_OUTPUTS
+                                               if p == pn)], ("png",))
+                # 連番を選んだ素材は素材毎のサブフォルダへ自動移動（MP4は直下のまま）
                 png_passes = [pass_name for key, _label, pass_name in _SEQ_OUTPUTS
                               if wants[key][0]]
                 if png_passes:
@@ -2035,7 +2341,7 @@ class CaptureWindow(object):
                     if cloud_for_black:
                         if normal_needed:
                             tag_passes.append("Normal")
-                        if depth_needed:
+                        if depth_cloud_ok and _need("depth"):
                             tag_passes.append("Depth")
                     for pn in tag_passes:
                         mp4 = os.path.join(out, "%s_%s_%s.mp4"
@@ -2095,6 +2401,9 @@ class CaptureWindow(object):
 
             def _abort(note, od):
                 cloud_seq["run"] = False
+                if cloudmatte_needed:
+                    # 連番が無いまま MP4 を組むと ffmpeg が失敗して全体が失敗扱いになる
+                    wants["cloudmatte"] = (False, False)
                 seq_notes.append(note)
                 _cleanup_geo()
                 _run_backing_w(True, od)
@@ -2118,7 +2427,7 @@ class CaptureWindow(object):
                         do_png=True, do_mp4=False,
                         temporal_samples=1, warmup=min(warm, 8),
                         custom_start=cs, custom_end=ce,
-                        fog_off=self.seq_fog_var.get(), on_done=cb, **kw)
+                        fog_off=seq_fog, on_done=cb, **kw)
                 except Exception as e:
                     self.status_var.set("雲マット起動失敗: %s" % e)
                     _abort("雲マット: 起動失敗 (%s)" % label, od)
@@ -2128,6 +2437,8 @@ class CaptureWindow(object):
                 def _cloud_done(cok, cod):
                     if not cok:
                         cloud_seq["run"] = False
+                        if cloudmatte_needed:
+                            wants["cloudmatte"] = (False, False)
                         seq_notes.append("雲マット: レンダ失敗")
                     _cleanup_geo()
                     _run_backing_w(True, od)
@@ -2208,7 +2519,7 @@ class CaptureWindow(object):
                     custom_start=cs, custom_end=ce,
                     backing_actors=matte_prims, backing_white=True,
                     use_exr=True, beauty_label="BackingW",
-                    fog_off=self.seq_fog_var.get(), on_done=_bw_done)
+                    fog_off=seq_fog, on_done=_bw_done)
             except Exception as e:
                 backing_seq["run"] = False
                 seq_notes.append("雲マット: バッキング起動失敗")
@@ -2272,7 +2583,8 @@ class CaptureWindow(object):
                     light_pass=True, light_direct=True,
                     light_label="RawLightingDirect",
                     beauty_label="DirectPlate",
-                    fog_off=self.seq_fog_var.get(), on_done=_direct_done)
+                    image_format=seq_fmt, also_png=(seq_fmt != "png"),
+                    fog_off=seq_fog, on_done=_direct_done)
             except Exception as e:
                 wants["rldir"] = (False, False)
                 seq_notes.append("Raw Lighting Direct: 起動失敗")
@@ -2323,6 +2635,14 @@ class CaptureWindow(object):
                 return
             # 「空マット」も選ばれていれば奥プレートも空黒で撮る（Matteの奥＝空黒版。
             # 空マットと同じく fog/PPマテリアル/ブルームは強制 OFF）。ユーザー指定 2026-10-07
+            def _bp_done(bok, bod):
+                # プレートが失敗しても、レンダ済みのメイン素材の後処理は完走する
+                # （Direct / 空マット / 雲マットと同じ扱い）
+                if not bok:
+                    wants["behind"] = (False, False)
+                    seq_notes.append("Matteの奥: プレートのレンダ失敗")
+                _run_direct(True, od)
+
             self.status_var.set("Matteの奥プレートをレンダ中… (near-clip %.0fcm%s)"
                                 % (nc, " / 空黒" if skymatte_needed else ""))
             self.root.update()
@@ -2336,24 +2656,22 @@ class CaptureWindow(object):
                     near_clip_cm=nc,
                     beauty_label="BehindPlate",
                     sky_matte=skymatte_needed,
-                    fog_off=True if skymatte_needed else self.seq_fog_var.get(),
-                    on_done=_run_direct)
+                    fog_off=True if skymatte_needed else seq_fog,
+                    on_done=_bp_done)
             except Exception as e:
                 seq_notes.append("Matteの奥: プレート起動失敗のためスキップ")
                 self.status_var.set("Matteの奥プレート起動失敗: %s" % e)
                 wants["behind"] = (False, False)
                 _run_direct(True, od)
 
-        if (cloudmatte_needed or skymatte_needed) and not (
-                _need("beauty") or depth_needed or normal_needed or matte_needed
-                or objid_needed or rlfull_needed or rldir_needed):
-            # 雲マット/空マットのみ: 全編の Beauty メインジョブを省いて
-            # 専用ジョブチェーンから開始する（従来は空マット単独でも捨て
-            # Beauty を全編レンダしていた）
-            self.status_var.set("マット素材のみをレンダ中…")
+        if not main_needed and not only_direct:
+            # 雲マット/空マット/16bit・EXR Depth のみ: 全編の Beauty メインジョブを
+            # 省いて専用ジョブチェーン（→ 後処理の Depth 実測）から開始する
+            self.status_var.set("マット素材のみをレンダ中…" if (cloudmatte_needed or skymatte_needed)
+                                else "Z-Depth をフレーム毎に実測中…")
             self.root.update()
             _run_skymatte(True, out)
-            return
+            return True
 
         self.status_var.set("シーケンスレンダ中… (PIE / %d〜%dF @%gfps)"
                             % (cs_eff, ce_eff - 1, float(fps_num) / fps_den))
@@ -2374,16 +2692,21 @@ class CaptureWindow(object):
                                                      and matte_mat is None
                                                      and matte_prims)
                                      else None)),
-                fog_off=self.seq_fog_var.get(),
+                fog_off=seq_fog,
                 light_pass=(rlfull_needed or only_direct),
                 light_direct=only_direct,
                 light_label=("RawLightingDirect" if only_direct
                              else "RawLightingFull"),
                 beauty_label=("DirectPlate" if only_direct else "Beauty"),
+                # 連番の形式（Beauty / Raw Lighting）。PNG 以外のときは合成・MP4 用の
+                # 内部 PNG も同時出力し、後処理の最後で片方を捨てる
+                image_format=seq_fmt, also_png=(seq_fmt != "png"),
                 on_done=_after_main)
         except Exception as e:
             _cleanup_materials()
             self.status_var.set("シーケンスレンダ起動失敗: %s" % e)
+            return False
+        return True
 
     def _run_ffmpeg_jobs(self, cmds, on_done):
         """ffmpeg を1本ずつ非同期実行し、全完了で on_done(ok)。
@@ -2432,10 +2755,13 @@ class CaptureWindow(object):
         lab.pack(side="left")
         if tip:
             self._tip(lab, tip)
-        ttk.Button(bar, text="＋ 選択を追加",
-                   command=lambda: self._pick_add_selection(p)).pack(side="right")
-        ttk.Button(bar, text="削除",
-                   command=lambda: self._pick_clear(p)).pack(side="right", padx=4)
+        self._tip(ttk.Button(bar, text="＋ 追加",
+                             command=lambda: self._pick_add_selection(p)),
+                  "アウトライナ / ビューポートで選択中のアクターをリストへ追加").pack(
+            side="right")
+        self._tip(ttk.Button(bar, text="－ 削除",
+                             command=lambda: self._pick_clear(p)),
+                  "リストで選択した項目を外す").pack(side="right", padx=4)
         bar.pack(fill="x", pady=(0, 4))
         lbf = ttk.Frame(parent)
         p["list"] = tk.Listbox(lbf, selectmode="extended", height=3,
@@ -2723,9 +3049,15 @@ class CaptureWindow(object):
                 "seq_custom": self.seq_custom_var.get(),
                 "seq_near": self.seq_near_var.get(),
                 "seq_far": self.seq_far_var.get(),
+                "seq_depth_bit": self.seq_depth_bit_var.get(),
+                "seq_beauty_fmt": self.seq_beauty_fmt_var.get(),
             }
-            with open(self._settings_path(), "w", encoding="utf-8") as f:
+            # 途中で失敗しても空ファイルを残さない（tmp に書いて差し替え）
+            path = self._settings_path()
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(state, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
         except Exception as e:
             unreal.log_warning("[SceneCapture] 設定保存に失敗: %s" % e)
 
@@ -2738,6 +3070,9 @@ class CaptureWindow(object):
                 st = json.load(f)
         except Exception as e:
             unreal.log_warning("[SceneCapture] 設定読込に失敗: %s" % e)
+            return
+        if not isinstance(st, dict):
+            unreal.log_warning("[SceneCapture] 設定ファイルの形式が不正（無視）: %s" % p)
             return
 
         def _setvar(var, key):
@@ -2840,6 +3175,10 @@ class CaptureWindow(object):
         _setvar(self.seq_custom_var, "seq_custom")
         _setvar(self.seq_near_var, "seq_near")
         _setvar(self.seq_far_var, "seq_far")
+        if st.get("seq_depth_bit") in ("8bit PNG", "16bit PNG", "EXR float"):
+            self.seq_depth_bit_var.set(st["seq_depth_bit"])
+        if st.get("seq_beauty_fmt") in ("PNG 8bit", "JPG 8bit", "EXR 16bit (float)"):
+            self.seq_beauty_fmt_var.set(st["seq_beauty_fmt"])
 
     def _collect_settings(self):
         s = core.CaptureSettings()

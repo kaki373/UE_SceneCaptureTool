@@ -32,3 +32,29 @@
 - **Z-Depth**: 可視レンジの自動フィット（Near/Far の「自動」）。16bit PNG / EXR で far が
   655m を超えると空が黒にならなかった不具合を修正（RGBA32F 取得）。
 - `render_beauty` / `render_sequence` に `pp_materials_off` 引数を追加。
+
+### 2026-10-29 のコードレビューによる修正（詳細は `REVIEW.md`）
+- **対象リスト（Matte / ObjectID）をタブの外（パネル下部）の共通カードへ移動**。タブを
+  切り替えても同じリストが見える。
+- **映像タブ**に画像タブと同じ「形式」（Beauty / Raw Lighting の PNG 8bit / JPG 8bit /
+  EXR 16bit float）と **Z-Depth のビット深度**（8bit PNG = Beauty と同一ジョブの PP パス /
+  16bit PNG・EXR float = フレーム毎に SceneCapture で実測した厳密リニア）を追加。
+- Depth の EXR float が half で書かれ 655m 超と空が inf になっていた不具合を修正（32bit float）。
+- MRQ セットアップ途中の例外でマット板が隠れたまま残る／元から非表示のアクターが表示される
+  不具合を修正。失敗時の復元（filmback / PropagateAlpha / 一時マテリアル / 露出固定）を
+  必ず実行するようにした。
+- 複数カメラカットのシーケンスで Behind / MatteSil / Depth 自動レンジが 1 カット目の
+  カメラ基準になっていた不具合を修正（フレーム毎にカメラカットを解決）。
+- 静止画 Depth「自動」が 16bit PNG / EXR に効いていなかった不具合を修正。
+- ffmpeg 失敗時に連番を削除していた（データ消失）／奇数解像度で MP4 が失敗する不具合を修正。
+- レンダ〜後処理〜MP4 エンコードの間はボタンを無効化（多重実行の防止）。メニューに
+  「強制リセット」を追加（完了通知が来ず固まった時の復旧用）。
+- 静止画の ObjectID / Matte / Behind 合成が 600m 超で割れる不具合（RGBA16F）を修正。
+- `find_ffmpeg` が UE 同梱 Python の imageio-ffmpeg を見ていなかった不具合を修正
+  （配布先で MP4 / 雲マット系が動かない原因）。
+- Pillow 13 で 16bit PNG の書き出しが失敗する不具合を修正。
+- JPG 形式で Depth / Normal / Matteの前 が欠落・テイク番号が進まない不具合を修正。
+- MRQ の共有キューをレンダ前に退避し完了時に復元（ユーザーのジョブを消さない）。
+- near clip の復元値をプロジェクト設定から取得。一時アセット／RenderTarget の後始末、
+  各種 `except: pass` の警告化、入力値の最低限の検証、設定 JSON の安全な保存。
+- UE 5.8: MRQ ジョブを Preset 構成モードに固定（5.7/5.8 で API 差分なしを全数比較で確認）。
