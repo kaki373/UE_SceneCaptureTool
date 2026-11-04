@@ -1,0 +1,267 @@
+# Headless smoke test of the capture_ui panel (tkinter inside a UE commandlet, throwaway project).
+# Exercises: window build (shared target card outside the Notebook, seq-tab format/depth-bit
+# widgets), settings round-trip, busy guard, impl early returns, frame-aware camera-cut lookup.
+import os, sys, json, traceback
+import unreal
+
+SP = os.path.dirname(os.path.abspath(__file__))
+TOOL = os.path.join(os.path.dirname(os.path.dirname(SP)), "ue5_capture")
+OUTD = os.environ.get("UE_CAPTURE_SMOKE_OUT") or SP
+os.makedirs(OUTD, exist_ok=True)
+RES = []
+
+
+def P(msg):
+    print("[SMOKEUI] " + msg)
+
+
+def step(name, fn):
+    try:
+        r = fn()
+        RES.append((name, "OK", repr(r)[:400]))
+        P("OK   %s -> %s" % (name, repr(r)[:400]))
+        return r
+    except Exception as e:
+        RES.append((name, "FAIL", "%s: %s" % (type(e).__name__, e)))
+        P("FAIL %s -> %s: %s" % (name, type(e).__name__, e))
+        for line in traceback.format_exc().splitlines():
+            P("     " + line)
+        return None
+
+
+ver = unreal.SystemLibrary.get_engine_version()
+VSHORT = ver.split("-")[0]
+try:
+    import numpy, PIL  # noqa
+except ImportError:
+    _site = os.environ.get("UE_CAPTURE_SMOKE_SITE")
+    if not _site:
+        raise ImportError("numpy/Pillow missing in engine Python: run Install.bat or set UE_CAPTURE_SMOKE_SITE")
+    sys.path.insert(0, _site)
+    import numpy, PIL  # noqa
+    P("numpy/PIL missing in engine Python -> using UE_CAPTURE_SMOKE_SITE=" + _site)
+if TOOL not in sys.path:
+    sys.path.insert(0, TOOL)
+
+core = step("import capture_core", lambda: __import__("capture_core"))
+ui = step("import capture_ui", lambda: __import__("capture_ui"))
+import tkinter as tk
+from tkinter import ttk
+
+eas = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+
+
+def _spawn():
+    cube = eas.spawn_actor_from_class(unreal.StaticMeshActor, unreal.Vector(500, 0, 0))
+    cube.static_mesh_component.set_static_mesh(
+        unreal.EditorAssetLibrary.load_asset("/Engine/BasicShapes/Cube"))
+    cube.set_actor_label("SmokeCube")
+    cam = eas.spawn_actor_from_class(unreal.CineCameraActor, unreal.Vector(0, 0, 0))
+    cam.set_actor_label("SmokeCam")
+    cam2 = eas.spawn_actor_from_class(unreal.CineCameraActor, unreal.Vector(0, 100, 0))
+    cam2.set_actor_label("SmokeCam2")
+    return cube, cam, cam2
+
+
+cube, cam, cam2 = step("spawn cube + 2 CineCameras", _spawn) or (None, None, None)
+
+win = step("capture_ui.show() builds the window", ui.show)
+
+
+def _pump(n=5):
+    for _ in range(n):
+        win.root.update()
+    return True
+
+
+step("root.update() x5", _pump)
+
+
+def _ancestors(w):
+    out = []
+    while w is not None:
+        out.append(type(w).__name__)
+        w = w.master
+    return out
+
+
+def _shared_card():
+    a1 = _ancestors(win.matte_pick["list"])
+    a2 = _ancestors(win.objid_pick["list"])
+    assert "Notebook" not in a1 and "Notebook" not in a2, (a1, a2)
+    return {"matte_anc": a1[:6], "objid_anc": a2[:6]}
+
+
+step("target pickers live outside the Notebook (shared card)", _shared_card)
+
+
+def _seq_widgets():
+    assert win.seq_beauty_fmt_var.get() == "PNG 8bit"
+    assert win.seq_depth_bit_var.get() == "8bit PNG"
+    assert win.depth_bit_var.get() == "16bit PNG"
+    # the combobox values
+    found = {"fmt": None, "bit": None}
+    def walk(w):
+        for c in w.winfo_children():
+            if isinstance(c, ttk.Combobox):
+                tv = str(c.cget("textvariable"))
+                if tv == str(win.seq_beauty_fmt_var):
+                    found["fmt"] = list(c.cget("values"))
+                if tv == str(win.seq_depth_bit_var):
+                    found["bit"] = list(c.cget("values"))
+            walk(c)
+    walk(win.root)
+    assert found["fmt"] == ["PNG 8bit", "JPG 8bit", "EXR 16bit (float)"], found
+    assert found["bit"] == ["8bit PNG", "16bit PNG", "EXR float"], found
+    return found
+
+
+step("seq tab has format + depth-bit comboboxes", _seq_widgets)
+
+
+def _transfer():
+    win.beauty_fmt_var.set("EXR 16bit (float)")
+    win.depth_bit_var.set("EXR float")
+    win._transfer_from_image_tab()
+    assert win.seq_beauty_fmt_var.get() == "EXR 16bit (float)"
+    assert win.seq_depth_bit_var.get() == "EXR float"
+    return win.status_var.get()
+
+
+step("_transfer_from_image_tab copies format/depth bit", _transfer)
+
+
+def _roundtrip():
+    win.seq_beauty_fmt_var.set("JPG 8bit")
+    win.seq_depth_bit_var.set("16bit PNG")
+    win._save_ui_state()
+    p = win._settings_path()
+    assert os.path.isfile(p) and not os.path.isfile(p + ".tmp")
+    win.seq_beauty_fmt_var.set("PNG 8bit")
+    win.seq_depth_bit_var.set("8bit PNG")
+    win._load_ui_state()
+    assert win.seq_beauty_fmt_var.get() == "JPG 8bit"
+    assert win.seq_depth_bit_var.get() == "16bit PNG"
+    # corrupt file must not break the panel
+    with open(p, "w", encoding="utf-8") as f:
+        f.write("[1,2,3]")
+    win._load_ui_state()
+    with open(p, "w", encoding="utf-8") as f:
+        f.write("{not json")
+    win._load_ui_state()
+    os.remove(p)
+    return True
+
+
+step("settings save/load round-trip (+corrupt file tolerated)", _roundtrip)
+
+
+def _busy():
+    win._set_busy(True)
+    assert win._is_busy()
+    assert "disabled" in win.capture_btn.state() and "disabled" in win.seq_btn.state()
+    win._set_busy(False)
+    assert not win._is_busy()
+    assert "disabled" not in win.capture_btn.state()
+    # guarded impl returning False -> busy cleared, hooks run
+    calls = []
+    def impl():
+        win._restore_hooks.append(lambda: calls.append("hook"))
+        return False
+    win._run_guarded(impl)
+    assert calls == ["hook"] and not win._is_busy()
+    # guarded impl raising -> busy cleared, hooks run, exception propagates
+    calls[:] = []
+    def impl2():
+        win._restore_hooks.append(lambda: calls.append("hook2"))
+        raise RuntimeError("boom")
+    try:
+        win._run_guarded(impl2)
+        raised = False
+    except RuntimeError:
+        raised = True
+    assert raised and calls == ["hook2"] and not win._is_busy()
+    # busy -> second click refused
+    win._set_busy(True)
+    win._run_guarded(lambda: (_ for _ in ()).throw(AssertionError("must not run")))
+    win._set_busy(False)
+    return True
+
+
+step("busy guard / restore hooks", _busy)
+
+
+def _mrq_early():
+    win.out_var.set("")
+    r = win._on_mrq_impl()
+    assert r is False, r
+    return win.status_var.get()
+
+
+step("_on_mrq_impl early return (no output dir)", _mrq_early)
+
+
+def _seq_early():
+    r = win._on_seq_render_impl()
+    assert r is False, r
+    return win.status_var.get()
+
+
+step("_on_seq_render_impl early return (no sequencer open)", _seq_early)
+
+
+def _make_scene_seq():
+    at = unreal.AssetToolsHelpers.get_asset_tools()
+    p = "/Game/SmokeSeq"
+    if unreal.EditorAssetLibrary.does_asset_exist(p + "/SEQ_SmokeUI"):
+        unreal.EditorAssetLibrary.delete_asset(p + "/SEQ_SmokeUI")
+    seq = at.create_asset("SEQ_SmokeUI", p, unreal.LevelSequence, unreal.LevelSequenceFactoryNew())
+    ext = unreal.MovieSceneSequenceExtensions
+    ext.set_display_rate(seq, unreal.FrameRate(24, 1))
+    ext.set_playback_start(seq, 0)
+    ext.set_playback_end(seq, 48)
+    b1 = ext.add_possessable(seq, cam)
+    b2 = ext.add_possessable(seq, cam2)
+    cct = ext.add_track(seq, unreal.MovieSceneCameraCutTrack)
+    s1 = cct.add_section(); s1.set_range(0, 24); s1.set_camera_binding_id(ext.get_binding_id(seq, b1))
+    s2 = cct.add_section(); s2.set_range(24, 48); s2.set_camera_binding_id(ext.get_binding_id(seq, b2))
+    return seq
+
+
+seq = step("create 2-cut LevelSequence (cam@0-23, cam2@24-47)", _make_scene_seq)
+
+
+def _cut_lookup():
+    # get_bound_objects needs the Sequencer UI; headless it may return nothing -> None is acceptable,
+    # but when it resolves it must pick the right camera per frame.
+    a = ui.CaptureWindow._camera_cut_camera_for_frame(seq, 5)
+    b = ui.CaptureWindow._camera_cut_camera_for_frame(seq, 30)
+    res = {"f5": a.get_actor_label() if a else None, "f30": b.get_actor_label() if b else None}
+    if a is not None:
+        assert res["f5"] == "SmokeCam" and res["f30"] == "SmokeCam2", res
+    # fallback path must still return a camera (never raise)
+    c = win._sequence_camera_at(seq, 30)
+    res["fallback_f30"] = c.get_actor_label() if c else None
+    assert c is not None
+    return res
+
+
+step("_camera_cut_camera_for_frame / _sequence_camera_at", _cut_lookup)
+
+
+def _cleanup():
+    ui.close_all_windows()
+    for a in (cube, cam, cam2):
+        if a:
+            eas.destroy_actor(a)
+    if unreal.EditorAssetLibrary.does_asset_exist("/Game/SmokeSeq/SEQ_SmokeUI"):
+        unreal.EditorAssetLibrary.delete_asset("/Game/SmokeSeq/SEQ_SmokeUI")
+    return True
+
+
+step("cleanup", _cleanup)
+
+n_fail = sum(1 for r in RES if r[1] == "FAIL")
+with open(os.path.join(OUTD, "smoke_ui_result_%s.json" % VSHORT), "w", encoding="utf-8") as f:
+    json.dump({"engine": ver, "results": RES}, f, indent=1, ensure_ascii=False)
+P("SUMMARY engine=%s steps=%d fail=%d" % (ver, len(RES), n_fail))
