@@ -422,8 +422,8 @@ class CaptureWindow(object):
         r = self._row(camf, " ")
         ttk.Radiobutton(r, text="指定", variable=self.res_mode,
                         value="override").pack(side="left")
-        self.w_var = tk.StringVar(master=self.root, value="3840")
-        self.h_var = tk.StringVar(master=self.root, value="2160")
+        self.w_var = tk.StringVar(master=self.root, value="1920")
+        self.h_var = tk.StringVar(master=self.root, value="1080")
         self._entry(r, self.w_var, 6).pack(side="left", padx=(8, 2))
         ttk.Label(r, text="×").pack(side="left")
         self.h_entry = self._entry(r, self.h_var, 6)

@@ -38,8 +38,8 @@ CONFIG = {
 
     # 解像度: use_camera_resolution=True ならカメラのアスペクト維持
     "use_camera_resolution": False,
-    "override_width": 3840,
-    "override_height": 2160,
+    "override_width": 1920,
+    "override_height": 1080,
     "base_height": 1080,           # use_camera_resolution 時の基準高さ
 
     "aa_factor": 2,                # 1 / 2 / 4

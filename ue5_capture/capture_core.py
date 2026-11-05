@@ -138,8 +138,8 @@ class CaptureSettings(object):
     def __init__(self):
         self.camera_actor = None          # unreal.CameraActor / CineCameraActor
         self.use_camera_resolution = True  # True: カメラのアスペクト維持 / False: override
-        self.override_width = 3840
-        self.override_height = 2160
+        self.override_width = 1920
+        self.override_height = 1080
         self.base_height = 1080            # use_camera_resolution 時の基準高さ
         self.aa_factor = 2                 # 1 / 2 / 4 （Spatial Supersample 倍率）
         self.output_dir = ""               # 出力フォルダ
