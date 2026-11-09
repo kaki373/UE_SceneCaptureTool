@@ -842,7 +842,8 @@ def resolve_name_template(template, **tokens):
     vals = _D((k, _safe_name(v) if v is not None else "") for k, v in tokens.items())
     try:
         s = str(template or DEFAULT_NAME_TEMPLATE).format_map(vals)
-    except (ValueError, IndexError):
+    except Exception:
+        # "{level.x}" "{0}" "{a" など書式として壊れたテンプレートは文字どおりに使う
         s = str(template)
     s = _safe_name(s)
     s = re.sub(r"_{2,}", "_", s).strip("_")
@@ -855,21 +856,21 @@ def latest_take_number(output_dir, name_body):
     if not output_dir or not os.path.isdir(output_dir) or not name_body:
         return 0
     mx = 0
-    pre = name_body + "_"
-    fpat = re.compile(r"_(\d{3})(?=[._])")
-    dpat = re.compile(r"^" + re.escape(pre) + r"(\d{3})$")
+    fpat = _take_file_pattern(name_body, None)
+    dpat = re.compile(r"^" + re.escape(name_body) + r"_(\d{3})$")
     for f in os.listdir(output_dir):
-        if not f.startswith(pre):
-            continue
         full = os.path.join(output_dir, f)
-        if os.path.isdir(full):
-            m = dpat.match(f)
-            if m:
-                mx = max(mx, int(m.group(1)))
-        else:
-            for m in fpat.finditer(f[len(pre) - 1:]):
-                mx = max(mx, int(m.group(1)))
+        m = (dpat if os.path.isdir(full) else fpat).match(f)
+        if m:
+            mx = max(mx, int(m.group(1)))
     return mx
+
+
+def _take_file_pattern(name_body, take_str):
+    """name_body_<素材名>_NNN(.ext | .frame.ext | _tag…) に一致する正規表現。素材名に "_" は無いので、
+    名前本体が別の名前の接頭辞（A と A_B）でも相手のファイルには一致しない。take_str=None なら任意の NNN。"""
+    take = re.escape(take_str) if take_str else r"\d{3}"
+    return re.compile(r"^" + re.escape(name_body) + r"_[A-Za-z0-9]+_(" + take + r")(?=[._]|$)")
 
 
 def delete_take_outputs(output_dir, name_body, take_str):
@@ -881,12 +882,11 @@ def delete_take_outputs(output_dir, name_body, take_str):
     n = 0
     if not output_dir or not os.path.isdir(output_dir) or not name_body:
         return 0
-    pre = name_body + "_"
     sub = os.path.join(output_dir, "%s_%s" % (name_body, take_str))
     if os.path.isdir(sub):
         shutil.rmtree(sub, ignore_errors=True)
         n += 1
-    fpat = re.compile(r"^" + re.escape(pre) + r".+_" + re.escape(take_str) + r"(\.|$)")
+    fpat = _take_file_pattern(name_body, take_str)
     dpat = re.compile(r"_" + re.escape(take_str) + r"(_|$)")
     for f in os.listdir(output_dir):
         full = os.path.join(output_dir, f)
@@ -898,18 +898,22 @@ def delete_take_outputs(output_dir, name_body, take_str):
                 except OSError:
                     pass
         elif dpat.search(f) and f != os.path.basename(sub):
+            removed_here = 0
             for g in os.listdir(full):
-                if g.startswith(pre):
+                if fpat.match(g):
                     try:
                         os.remove(os.path.join(full, g))
-                        n += 1
+                        removed_here += 1
                     except OSError:
                         pass
-            try:
-                if not os.listdir(full):
-                    os.rmdir(full)
-            except OSError:
-                pass
+            n += removed_here
+            # 自分が空にしたフォルダだけ畳む（他の名前の空フォルダには触れない）
+            if removed_here:
+                try:
+                    if not os.listdir(full):
+                        os.rmdir(full)
+                except OSError:
+                    pass
     return n
 
 

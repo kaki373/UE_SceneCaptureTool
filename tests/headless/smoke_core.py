@@ -564,6 +564,27 @@ def _naming():
     assert os.path.exists(os.path.join(d, "Other_Beauty_005.png")) and os.path.isdir(os.path.join(d, "Shot_003"))
     n = core.delete_take_outputs(d, "Shot", "003")
     assert n == 1 and not os.path.isdir(os.path.join(d, "Shot_003"))
+    # prefix collision: "A" must not see or delete "A_B" outputs; empty foreign folders survive
+    for f in ["A_Beauty_001.png", "A_B_Beauty_004.png", "A_B_Depth_001.exr"]:
+        open(os.path.join(d, f), "wb").close()
+    os.makedirs(os.path.join(d, "Depth_001"), exist_ok=True)      # empty, not ours
+    os.makedirs(os.path.join(d, "Normal_001"), exist_ok=True)
+    open(os.path.join(d, "Normal_001", "A_B_Normal_001.0001.png"), "wb").close()
+    assert core.latest_take_number(d, "A") == 1
+    assert core.latest_take_number(d, "A_B") == 4
+    n = core.delete_take_outputs(d, "A", "001")
+    assert n == 1, n
+    assert not os.path.exists(os.path.join(d, "A_Beauty_001.png"))
+    assert os.path.exists(os.path.join(d, "A_B_Depth_001.exr"))
+    assert os.path.isdir(os.path.join(d, "Depth_001")) and os.path.isdir(os.path.join(d, "Normal_001"))
+    assert os.path.exists(os.path.join(d, "Normal_001", "A_B_Normal_001.0001.png"))
+    n = core.delete_take_outputs(d, "A_B", "001")
+    assert n == 2 and not os.path.isdir(os.path.join(d, "Normal_001")), n
+    assert os.path.exists(os.path.join(d, "A_B_Beauty_004.png"))
+    # broken templates never raise
+    assert rn("{level.x}", level="L") == "level.x"
+    assert rn("{0}_{camera}", camera="C") == "0_camera"
+    assert rn("{level", level="L") == "level"
     return {"cut_untitled": core.detect_cut_number(), "level": core.level_name()}
 
 
