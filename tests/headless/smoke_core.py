@@ -540,6 +540,71 @@ step("destroy far cube / SceneCapture2D left (expect 0)", _rest)
 # ===================================================================================
 
 
+def _naming():
+    rn = core.resolve_name_template
+    assert rn("{level}_{cut}_{camera}", level="LV_047_MASTER", cut="047", camera="CamA") == "LV_047_MASTER_047_CamA"
+    assert rn("{level}_{cut}_{camera}", level="Untitled", cut="", camera="Cam A") == "Untitled_Cam_A"
+    assert rn("{nope}", level="x") == "capture"
+    assert rn("", level="L", cut="1", camera="C") == "L_1_C"
+    assert rn("{seq}-{camera}", seq="CIN_01A_047", camera="Cam") == "CIN_01A_047-Cam"
+    d = os.path.join(OUT, "naming")
+    os.makedirs(d, exist_ok=True)
+    for f in ["Shot_Beauty_001.png", "Shot_Depth_002.exr", "Other_Beauty_005.png"]:
+        open(os.path.join(d, f), "wb").close()
+    os.makedirs(os.path.join(d, "Shot_003"), exist_ok=True)
+    os.makedirs(os.path.join(d, "Beauty_002"), exist_ok=True)
+    open(os.path.join(d, "Beauty_002", "Shot_Beauty_002.0001.png"), "wb").close()
+    assert core.latest_take_number(d, "Shot") == 3
+    assert core.latest_take_number(d, "Other") == 5
+    assert core.latest_take_number(d, "None") == 0
+    n = core.delete_take_outputs(d, "Shot", "002")
+    assert n == 2, n
+    assert not os.path.exists(os.path.join(d, "Beauty_002"))
+    assert not os.path.exists(os.path.join(d, "Shot_Depth_002.exr"))
+    assert os.path.exists(os.path.join(d, "Other_Beauty_005.png")) and os.path.isdir(os.path.join(d, "Shot_003"))
+    n = core.delete_take_outputs(d, "Shot", "003")
+    assert n == 1 and not os.path.isdir(os.path.join(d, "Shot_003"))
+    return {"cut_untitled": core.detect_cut_number(), "level": core.level_name()}
+
+
+step("N1 resolve_name_template / latest_take_number / delete_take_outputs", _naming)
+
+
+def _cut_detect():
+    # 人間のレベル構成を模す: /Game/SmokeCut/01_047_Forest/{LV_047_Environment, LV_047_Lighting}
+    # を永続レベルのサブレベル（LevelStreamingDynamic）として足し、親フォルダ名とサブレベル名に
+    # 共通する番号 047 が返ることを見る。
+    world = core._get_editor_world()
+    made = []
+    for nm in ("LV_047_Environment", "LV_047_Lighting"):
+        pkg = "/Game/SmokeCut/01_047_Forest/" + nm
+        if unreal.EditorAssetLibrary.does_asset_exist(pkg):
+            unreal.EditorAssetLibrary.delete_asset(pkg)
+        sl = unreal.EditorLevelUtils.create_new_streaming_level(
+            unreal.LevelStreamingDynamic, pkg, False)
+        assert sl is not None, "create_new_streaming_level returned None for " + pkg
+        made.append(pkg)
+    cut = core.detect_cut_number(world)
+    res = {"cut": cut, "levels": [core._level_package(l) for l in unreal.EditorLevelUtils.get_levels(world)]}
+    for pkg in made:
+        try:
+            lv = None
+            for l in unreal.EditorLevelUtils.get_levels(world):
+                if core._level_package(l) == pkg:
+                    lv = l
+            if lv is not None:
+                unreal.EditorLevelUtils.remove_level_from_world(lv)
+        except Exception as e:
+            P("  remove_level_from_world: %s" % e)
+        if unreal.EditorAssetLibrary.does_asset_exist(pkg):
+            unreal.EditorAssetLibrary.delete_asset(pkg)
+    assert cut == "047", res
+    return res
+
+
+step("N2 detect_cut_number from 01_047_Forest/LV_047_* sublevels", _cut_detect)
+
+
 step("cleanup", _cleanup)
 
 n_fail = sum(1 for r in RES if r[1] == "FAIL")

@@ -119,12 +119,73 @@ def _seq_widgets():
 step("seq tab has format + depth-bit comboboxes", _seq_widgets)
 
 
+def _name_widgets():
+    assert win.name_tpl_var.get() == core.DEFAULT_NAME_TEMPLATE == "{level}_{cut}_{camera}"
+    assert win.seq_name_tpl_var.get() == core.DEFAULT_NAME_TEMPLATE
+    assert win.overwrite_var.get() is False and win.seq_overwrite_var.get() is False
+    # Untitled world, no sublevels -> cut is empty and collapses away
+    win.cam_var.set("SmokeCam")
+    body = win._resolve_name(win.name_tpl_var.get(), win._current_camera(), None)
+    assert body == "Untitled_SmokeCam", body
+    body2 = win._resolve_name("{seq}_{camera}", "Cam X", None)
+    assert body2 == "Cam_X", body2
+    win._update_name_preview()
+    assert win.name_preview_var.get().startswith("→ Untitled_SmokeCam_"), win.name_preview_var.get()
+    assert "素材名" in win.seq_name_preview_var.get()
+    # the preview follows the template (trace)
+    win.name_tpl_var.set("X_{camera}")
+    win.root.update()
+    assert win.name_preview_var.get().startswith("→ X_SmokeCam_"), win.name_preview_var.get()
+    win.name_tpl_var.set(core.DEFAULT_NAME_TEMPLATE)
+    s = win._collect_settings()
+    assert s.name_body == "Untitled_SmokeCam", s.name_body
+    assert core.out_basename(s, "Beauty", "001") == "Untitled_SmokeCam_Beauty_001"
+    return body
+
+
+step("name template widgets / _resolve_name / preview / out_basename", _name_widgets)
+
+
+def _name_migration():
+    p = win._settings_path()
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump({"name_usecustom": True, "name_custom": "MyShot", "name_usecam": True,
+                   "seq_usecustom": True, "seq_custom": "SeqX"}, f)
+    win._load_ui_state()
+    assert win.name_tpl_var.get() == "MyShot_{camera}", win.name_tpl_var.get()
+    assert win.seq_name_tpl_var.get() == "SeqX_{seq}", win.seq_name_tpl_var.get()
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump({"name_usecustom": False, "name_custom": "", "name_usecam": True}, f)
+    win.name_tpl_var.set("Z")
+    win._load_ui_state()
+    assert win.name_tpl_var.get() == "Z"      # no custom name -> keep current/default
+    win.name_tpl_var.set("{cut}_{camera}"); win.overwrite_var.set(True)
+    win.seq_name_tpl_var.set("{seq}"); win.seq_overwrite_var.set(True)
+    win._save_ui_state()
+    win.name_tpl_var.set(""); win.overwrite_var.set(False)
+    win.seq_name_tpl_var.set(""); win.seq_overwrite_var.set(False)
+    win._load_ui_state()
+    assert win.name_tpl_var.get() == "{cut}_{camera}" and win.overwrite_var.get() is True
+    assert win.seq_name_tpl_var.get() == "{seq}" and win.seq_overwrite_var.get() is True
+    win.name_tpl_var.set(core.DEFAULT_NAME_TEMPLATE); win.overwrite_var.set(False)
+    win.seq_name_tpl_var.set(core.DEFAULT_NAME_TEMPLATE); win.seq_overwrite_var.set(False)
+    os.remove(p)
+    return True
+
+
+step("name template settings migration + round-trip", _name_migration)
+
+
 def _transfer():
     win.beauty_fmt_var.set("EXR 16bit (float)")
     win.depth_bit_var.set("EXR float")
+    win.name_tpl_var.set("T_{camera}"); win.overwrite_var.set(True)
     win._transfer_from_image_tab()
     assert win.seq_beauty_fmt_var.get() == "EXR 16bit (float)"
     assert win.seq_depth_bit_var.get() == "EXR float"
+    assert win.seq_name_tpl_var.get() == "T_{camera}" and win.seq_overwrite_var.get() is True
+    win.name_tpl_var.set(core.DEFAULT_NAME_TEMPLATE); win.overwrite_var.set(False)
+    win.seq_name_tpl_var.set(core.DEFAULT_NAME_TEMPLATE); win.seq_overwrite_var.set(False)
     return win.status_var.get()
 
 

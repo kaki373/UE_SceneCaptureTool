@@ -146,6 +146,7 @@ class CaptureSettings(object):
         self.take_suffix = None            # ファイル名の通し番号(例 "001")。None なら日時を使う
         self.name_prefix = ""              # 任意名（空なら付けない）
         self.name_include_camera = True    # カメラ名をファイル名に含めるか
+        self.name_body = ""                # 解決済みの名前本体（テンプレート方式。空なら上 2 つで組む）
 
         self.do_color = True
         self.do_depth = False
@@ -759,15 +760,173 @@ def _safe_name(s):
     return "".join(c if (c.isalnum() or c in "._-") else "_" for c in str(s)).strip("_")
 
 
+NAME_TOKENS = ("level", "cut", "camera", "seq")
+DEFAULT_NAME_TEMPLATE = "{level}_{cut}_{camera}"
+
+
+def level_name(world=None):
+    """永続レベル（開いているマップ）の名前。Untitled なら "Untitled"。"""
+    world = world or _get_editor_world()
+    try:
+        return world.get_name()
+    except Exception:
+        return ""
+
+
+def _digit_groups(name):
+    return re.findall(r"\d+", str(name))
+
+
+def _level_package(level):
+    # "/Game/.../LV_047_Environment.LV_047_Environment:PersistentLevel" -> package 部分
+    return str(level.get_path_name()).split(".")[0]
+
+
+def detect_cut_number(world=None):
+    """サブレベル群からカット番号を推定する。
+    サブレベルの親フォルダ名（例 01_047_Forest）とサブレベル名（LV_047_Environment）に
+    共通する数字列を各サブレベルから取り、多数決で選ぶ。表示状態が取れるときは
+    表示中のサブレベルだけを数える（MASTER が複数カットを束ねる構成への対応）。
+    サブレベルが無ければ永続レベル名の数字列（LV_047_MASTER → 047）。見つからなければ ""。"""
+    world = world or _get_editor_world()
+    try:
+        levels = list(unreal.EditorLevelUtils.get_levels(world))
+    except Exception:
+        levels = []
+    try:
+        persistent_pkg = str(world.get_path_name()).split(".")[0]
+    except Exception:
+        persistent_pkg = ""
+    votes = {}
+    visible_votes = {}
+    for lv in levels:
+        try:
+            pkg = _level_package(lv)
+        except Exception:
+            continue
+        if not pkg or pkg == persistent_pkg:
+            continue
+        folder = pkg.rsplit("/", 1)[0].rsplit("/", 1)[-1]
+        name = pkg.rsplit("/", 1)[-1]
+        common = [g for g in _digit_groups(folder) if g in set(_digit_groups(name))]
+        cands = common or _digit_groups(folder)
+        if not cands:
+            continue
+        # 同じ数字が複数あるとき（01_047 と LV_047）は長い方＝カット番号を優先
+        cand = max(cands, key=len)
+        votes[cand] = votes.get(cand, 0) + 1
+        vis = None
+        try:
+            sl = unreal.GameplayStatics.get_streaming_level(world, pkg)
+            if sl is not None:
+                vis = bool(sl.is_level_visible())
+        except Exception:
+            vis = None
+        if vis:
+            visible_votes[cand] = visible_votes.get(cand, 0) + 1
+    pool = visible_votes or votes
+    if pool:
+        return max(sorted(pool), key=lambda k: pool[k])
+    for g in _digit_groups(level_name(world)):
+        if len(g) >= 2:
+            return g
+    return ""
+
+
+def resolve_name_template(template, **tokens):
+    """"{level}_{cut}_{camera}" 形式のテンプレートを解決し、ファイル名に安全な名前本体を返す。
+    未知のトークンや空の値は消え、余った区切りの "_" は畳む。全部空なら "capture"。"""
+    class _D(dict):
+        def __missing__(self, k):
+            return ""
+    vals = _D((k, _safe_name(v) if v is not None else "") for k, v in tokens.items())
+    try:
+        s = str(template or DEFAULT_NAME_TEMPLATE).format_map(vals)
+    except (ValueError, IndexError):
+        s = str(template)
+    s = _safe_name(s)
+    s = re.sub(r"_{2,}", "_", s).strip("_")
+    return s or "capture"
+
+
+def latest_take_number(output_dir, name_body):
+    """output_dir 内で name_body に属する既存テイクの最大番号（無ければ 0）。
+    ファイル name_body_素材_NNN.* と、テイク毎サブフォルダ name_body_NNN を見る。"""
+    if not output_dir or not os.path.isdir(output_dir) or not name_body:
+        return 0
+    mx = 0
+    pre = name_body + "_"
+    fpat = re.compile(r"_(\d{3})(?=[._])")
+    dpat = re.compile(r"^" + re.escape(pre) + r"(\d{3})$")
+    for f in os.listdir(output_dir):
+        if not f.startswith(pre):
+            continue
+        full = os.path.join(output_dir, f)
+        if os.path.isdir(full):
+            m = dpat.match(f)
+            if m:
+                mx = max(mx, int(m.group(1)))
+        else:
+            for m in fpat.finditer(f[len(pre) - 1:]):
+                mx = max(mx, int(m.group(1)))
+    return mx
+
+
+def delete_take_outputs(output_dir, name_body, take_str):
+    """「上書き」用: name_body のテイク take_str の既存出力を消す。
+    対象はテイク毎サブフォルダ name_body_NNN（丸ごと）、直下の name_body_*_NNN.* ファイル、
+    直下の素材サブフォルダ *_NNN / *_NNN_* の中の name_body_* ファイル（空になれば削除）。
+    他の名前のファイルには触れない。消した数を返す。"""
+    import shutil
+    n = 0
+    if not output_dir or not os.path.isdir(output_dir) or not name_body:
+        return 0
+    pre = name_body + "_"
+    sub = os.path.join(output_dir, "%s_%s" % (name_body, take_str))
+    if os.path.isdir(sub):
+        shutil.rmtree(sub, ignore_errors=True)
+        n += 1
+    fpat = re.compile(r"^" + re.escape(pre) + r".+_" + re.escape(take_str) + r"(\.|$)")
+    dpat = re.compile(r"_" + re.escape(take_str) + r"(_|$)")
+    for f in os.listdir(output_dir):
+        full = os.path.join(output_dir, f)
+        if os.path.isfile(full):
+            if fpat.match(f):
+                try:
+                    os.remove(full)
+                    n += 1
+                except OSError:
+                    pass
+        elif dpat.search(f) and f != os.path.basename(sub):
+            for g in os.listdir(full):
+                if g.startswith(pre):
+                    try:
+                        os.remove(os.path.join(full, g))
+                        n += 1
+                    except OSError:
+                        pass
+            try:
+                if not os.listdir(full):
+                    os.rmdir(full)
+            except OSError:
+                pass
+    return n
+
+
 def out_basename(settings, pass_type, take):
-    """ファイル名（拡張子なし）を 任意名_カメラ名_素材名_NNN で組む。
-    任意名(name_prefix) と カメラ名(name_include_camera) は設定で含める/含めないを切替。"""
+    """ファイル名（拡張子なし）を 名前本体_素材名_NNN で組む。
+    名前本体は settings.name_body（テンプレート解決済み）。空なら旧式の
+    任意名(name_prefix)_カメラ名(name_include_camera) で組む（capture_tool.py 互換）。"""
     parts = []
-    pre = (settings.name_prefix or "").strip()
-    if pre:
-        parts.append(_safe_name(pre))
-    if settings.name_include_camera and settings.camera_actor is not None:
-        parts.append(_safe_name(settings.camera_actor.get_actor_label()))
+    body = (getattr(settings, "name_body", "") or "").strip()
+    if body:
+        parts.append(_safe_name(body))
+    else:
+        pre = (settings.name_prefix or "").strip()
+        if pre:
+            parts.append(_safe_name(pre))
+        if settings.name_include_camera and settings.camera_actor is not None:
+            parts.append(_safe_name(settings.camera_actor.get_actor_label()))
     parts.append(pass_type)
     parts.append(str(take))
     return "_".join(parts)

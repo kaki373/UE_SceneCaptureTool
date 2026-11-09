@@ -104,6 +104,16 @@ _MP4_RATE_PRESETS = {
 }
 
 
+
+_NAME_TIP = ("ファイル名テンプレート。使えるトークン:\n"
+             "  {level}  永続レベル名（例 LV_047_MASTER）\n"
+             "  {cut}    カット番号（表示中サブレベルの親フォルダ名とサブレベル名に共通の番号。例 047）\n"
+             "  {camera} カメラ名（映像はカメラカット先頭のカメラ）\n"
+             "  {seq}    シーケンス名\n"
+             "空のトークンは消え、区切りの _ は詰める。出力は 名前_素材名_NNN")
+_OVERWRITE_TIP = ("ON: テイク番号を進めず、この名前の最新テイク（無ければ 001）の既存出力を消して\n"
+                  "同じ番号で出し直す。OFF: 既存を残して次の番号で出す")
+
 class CaptureWindow(object):
     def __init__(self):
         if not _HAS_TK:
@@ -451,15 +461,16 @@ class CaptureWindow(object):
         ttk.Button(r, text="…", width=3, command=self._browse).pack(
             side="left", padx=(6, 0))
         r = self._row(outf, "ファイル名")
-        self.name_usecustom_var = tk.BooleanVar(master=self.root, value=False)
-        self._check(r, "任意名", self.name_usecustom_var).pack(side="left")
-        self.name_custom_var = tk.StringVar(master=self.root, value="")
-        self._entry(r, self.name_custom_var, 16).pack(
-            side="left", fill="x", expand=True, padx=(4, 10))
-        self.name_usecam_var = tk.BooleanVar(master=self.root, value=True)
-        self._check(r, "カメラ名", self.name_usecam_var).pack(side="left")
-        ttk.Label(outf, text="[任意名]_[カメラ名]_素材名_NNN",
+        self.name_tpl_var = tk.StringVar(master=self.root, value=core.DEFAULT_NAME_TEMPLATE)
+        e = self._entry(r, self.name_tpl_var, 26)
+        e.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        self._tip(e, _NAME_TIP)
+        self.overwrite_var = tk.BooleanVar(master=self.root, value=False)
+        self._check(r, "上書き", self.overwrite_var, _OVERWRITE_TIP).pack(side="left")
+        self.name_preview_var = tk.StringVar(master=self.root, value="")
+        ttk.Label(outf, textvariable=self.name_preview_var,
                   style="Sub.TLabel").pack(anchor="w", padx=(80, 0))
+        self.name_tpl_var.trace_add("write", lambda *a: self._update_name_preview())
 
         # ---- 出力素材 ----
         matf = self._card(body, "出力素材")
@@ -647,13 +658,16 @@ class CaptureWindow(object):
                    command=lambda: self._browse(self.seq_out_var)).pack(
             side="left", padx=(6, 0))
         r = self._row(outf, "ファイル名")
-        self.seq_usecustom_var = tk.BooleanVar(master=self.root, value=False)
-        self._check(r, "任意名", self.seq_usecustom_var).pack(side="left")
-        self.seq_custom_var = tk.StringVar(master=self.root, value="")
-        self._entry(r, self.seq_custom_var, 16).pack(
-            side="left", fill="x", expand=True, padx=(4, 0))
-        ttk.Label(outf, text="[任意名]_[シーケンス名]_素材名_NNN.フレーム番号",
+        self.seq_name_tpl_var = tk.StringVar(master=self.root, value=core.DEFAULT_NAME_TEMPLATE)
+        e = self._entry(r, self.seq_name_tpl_var, 26)
+        e.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        self._tip(e, _NAME_TIP)
+        self.seq_overwrite_var = tk.BooleanVar(master=self.root, value=False)
+        self._check(r, "上書き", self.seq_overwrite_var, _OVERWRITE_TIP).pack(side="left")
+        self.seq_name_preview_var = tk.StringVar(master=self.root, value="")
+        ttk.Label(outf, textvariable=self.seq_name_preview_var,
                   style="Sub.TLabel").pack(anchor="w", padx=(80, 0))
+        self.seq_name_tpl_var.trace_add("write", lambda *a: self._update_name_preview())
         r = self._row(outf, " ")
         self.seq_subdir_var = tk.BooleanVar(master=self.root, value=True)
         self._check(r, "テイク毎のサブフォルダに出力", self.seq_subdir_var,
@@ -783,8 +797,8 @@ class CaptureWindow(object):
         self.seq_w_var.set(str(W))
         self.seq_h_var.set(str(H))
         self.seq_out_var.set(self.out_var.get())
-        self.seq_usecustom_var.set(self.name_usecustom_var.get())
-        self.seq_custom_var.set(self.name_custom_var.get())
+        self.seq_name_tpl_var.set(self.name_tpl_var.get())
+        self.seq_overwrite_var.set(self.overwrite_var.get())
         self.seq_warm_var.set(self.mrq_warmup_var.get())
         self.seq_ts_var.set(self.mrq_ts_var.get())
         self.seq_near_var.set(self.near_var.get())
@@ -1012,8 +1026,17 @@ class CaptureWindow(object):
                     unreal.log_warning("[SceneCapture] filmback 復元失敗: %s" % e)
         # 途中で例外が出ても _run_guarded / _finalize が必ず戻す
         self._restore_hooks.append(_restore_fb)
-        # この Capture の通し番号（全出力に _NNN を付与。設定違いを上書きしない）
-        suf = "%03d" % core.next_take_number(out)
+        # 名前本体（テンプレート解決）と通し番号。通常は次の番号を振り、設定違いを上書きしない。
+        # 「上書き」ON ではこの名前の最新テイクの既存出力を消して同じ番号で出し直す。
+        name_body = self._resolve_name(self.name_tpl_var.get(), cam, self._current_sequence())
+        if self.overwrite_var.get():
+            suf = "%03d" % (core.latest_take_number(out, name_body) or 1)
+            removed = core.delete_take_outputs(out, name_body, suf)
+            if removed:
+                unreal.log("[SceneCapture] 上書き: %s テイク %s の既存出力 %d 件を削除"
+                           % (name_body, suf, removed))
+        else:
+            suf = "%03d" % core.next_take_number(out)
         # シーケンサーを開いていれば MRQ 側も「その現在フレーム」で固定する
         # （PIE はエディタの評価ポーズを引き継がないため、SceneCapture 系=現在
         #   フレーム / MRQ 系=フレーム0 とズレる。カメラはツール指定のまま）。
@@ -1030,6 +1053,7 @@ class CaptureWindow(object):
         #    Beauty+Matte の合成は MRQ Beauty 完了後に行う。
         s = self._collect_settings()
         s.camera_actor = cam
+        s.name_body = name_body
         s.use_camera_resolution = False
         s.override_width, s.override_height = W, H
         s.do_behind_matte = False           # Matteの奥は下の MRQ near-clip ジョブで行う
@@ -1802,6 +1826,7 @@ class CaptureWindow(object):
         except Exception:
             self.seq_name_var.set(seq.get_name())
         self._sync_seq_h()
+        self._update_name_preview()
 
     def _seq_camera_aspect(self):
         """現在のシーケンスのカメラカットに束縛されたカメラのアスペクト比。
@@ -1986,14 +2011,20 @@ class CaptureWindow(object):
                     wants["objid"] = (False, False)
                     objid_needed = False
 
-        take_str = "%03d" % core.next_take_number(base_out)
-        parts = []
-        if self.seq_usecustom_var.get():
-            c = self.seq_custom_var.get().strip()
-            if c:
-                parts.append(core._safe_name(c))
-        parts.append(core._safe_name(seq.get_name()))
-        name_body = "_".join(parts)
+        # 名前本体: テンプレートを レベル/カット/カメラカット先頭のカメラ/シーケンス で解決
+        seq_cam = None
+        try:
+            seq_cam = self._sequence_camera_at(seq, cs_eff)
+        except Exception as e:
+            unreal.log_warning("[SceneCapture] 先頭カメラの解決に失敗（名前はカメラ無しで組む）: %s" % e)
+        name_body = self._resolve_name(self.seq_name_tpl_var.get(), seq_cam, seq)
+        if self.seq_overwrite_var.get():
+            take_str = "%03d" % (core.latest_take_number(base_out, name_body) or 1)
+            removed = core.delete_take_outputs(base_out, name_body, take_str)
+            if removed:
+                seq_notes.append("上書き: テイク %s の既存出力 %d 件を削除" % (take_str, removed))
+        else:
+            take_str = "%03d" % core.next_take_number(base_out)
         final_out = base_out
         if self.seq_subdir_var.get():
             final_out = os.path.join(base_out, "%s_%s" % (name_body, take_str))
@@ -2902,6 +2933,7 @@ class CaptureWindow(object):
         """カメラを切り替えたら Override の維持をリセット（新カメラ基準にする）。"""
         self._saved_override_wh = None
         self._update_cam_res()
+        self._update_name_preview()
 
     def _on_width_change(self, *a):
         """幅が変わったら解像度表示を更新し、Override+アスペクト維持なら高さ(=W/asp)を自動算出。"""
@@ -2968,6 +3000,60 @@ class CaptureWindow(object):
             self.cam_res_var.set("(取得失敗)")
             unreal.log_warning("[SceneCapture] カメラ解像度表示の更新に失敗: %s" % e)
 
+    def _resolve_name(self, template, camera, seq):
+        """ファイル名テンプレートを 現在のレベル名 / カット番号 / カメラ / シーケンス で解決する。
+        camera はアクターでもラベル文字列でもよい。失敗したトークンは空になる（例外は出さない）。"""
+        label = ""
+        if camera is not None:
+            try:
+                label = camera if isinstance(camera, str) else camera.get_actor_label()
+            except Exception:
+                label = ""
+        lvl = cut = ""
+        try:
+            world = core._get_editor_world()
+            lvl = core.level_name(world)
+            cut = core.detect_cut_number(world)
+        except Exception as e:
+            unreal.log_warning("[SceneCapture] レベル名/カット番号の取得に失敗: %s" % e)
+        sname = ""
+        if seq is not None:
+            try:
+                sname = seq.get_name()
+            except Exception:
+                sname = ""
+        return core.resolve_name_template(template, level=lvl, cut=cut, camera=label, seq=sname)
+
+    def _update_name_preview(self):
+        """ファイル名欄の下に解決後の名前を出す（画像=選択カメラ、映像=カメラカット先頭のカメラ）。
+        映像側のカメラはログを出さない静かな解決（_camera_cut_camera_actors）で済ませる。"""
+        seq = None
+        try:
+            seq = self._current_sequence()
+        except Exception:
+            seq = None
+        if hasattr(self, "name_preview_var"):
+            try:
+                body = self._resolve_name(self.name_tpl_var.get(), self._current_camera(), seq)
+                self.name_preview_var.set("→ %s_素材名_NNN" % body)
+            except Exception as e:
+                self.name_preview_var.set("(名前の解決に失敗: %s)" % e)
+        if not hasattr(self, "seq_name_preview_var"):
+            return
+        cam = None
+        if seq is not None:
+            try:
+                import capture_mrq
+                cams = capture_mrq._camera_cut_camera_actors(seq, core._get_editor_world())
+                cam = cams[0] if cams else None
+            except Exception:
+                cam = None
+        try:
+            body = self._resolve_name(self.seq_name_tpl_var.get(), cam, seq)
+            self.seq_name_preview_var.set("→ %s_素材名_NNN.フレーム番号" % body)
+        except Exception as e:
+            self.seq_name_preview_var.set("(名前の解決に失敗: %s)" % e)
+
     def _refresh_cameras(self):
         """現在のレベルのカメラを取得し直してプルダウンを更新する。"""
         prev = self.cam_var.get()
@@ -2980,6 +3066,7 @@ class CaptureWindow(object):
             self.cam_combo.current(0)
         self.status_var.set("Cameras refreshed: %d" % len(self._cameras))
         self._update_cam_res()
+        self._update_name_preview()
 
     # ----------------------------------------------------------- 設定の保持
     def _settings_path(self):
@@ -3000,9 +3087,8 @@ class CaptureWindow(object):
                 "overscan_y": self.overscan_y_var.get(),
                 "aspect_lock": self.aspect_lock_var.get(),
                 "out": self.out_var.get(),
-                "name_usecustom": self.name_usecustom_var.get(),
-                "name_custom": self.name_custom_var.get(),
-                "name_usecam": self.name_usecam_var.get(),
+                "name_tpl": self.name_tpl_var.get(),
+                "overwrite": self.overwrite_var.get(),
                 "depth": self.depth_var.get(),
                 "depth_auto": self.depth_auto_var.get(),
                 "seq_depth_auto": self.seq_depth_auto_var.get(),
@@ -3045,8 +3131,8 @@ class CaptureWindow(object):
                 "seq_fog": self.seq_fog_var.get(),
                 "seq_exposure_lock": self.seq_exposure_lock_var.get(),
                 "seq_out": self.seq_out_var.get(),
-                "seq_usecustom": self.seq_usecustom_var.get(),
-                "seq_custom": self.seq_custom_var.get(),
+                "seq_name_tpl": self.seq_name_tpl_var.get(),
+                "seq_overwrite": self.seq_overwrite_var.get(),
                 "seq_near": self.seq_near_var.get(),
                 "seq_far": self.seq_far_var.get(),
                 "seq_depth_bit": self.seq_depth_bit_var.get(),
@@ -3092,9 +3178,13 @@ class CaptureWindow(object):
         _setvar(self.overscan_y_var, "overscan_y")
         _setvar(self.aspect_lock_var, "aspect_lock")
         _setvar(self.out_var, "out")
-        _setvar(self.name_usecustom_var, "name_usecustom")
-        _setvar(self.name_custom_var, "name_custom")
-        _setvar(self.name_usecam_var, "name_usecam")
+        if "name_tpl" in st:
+            _setvar(self.name_tpl_var, "name_tpl")
+        elif st.get("name_usecustom") and str(st.get("name_custom", "")).strip():
+            # 旧設定（任意名 + カメラ名トグル）からの移行。任意名が無ければ新既定のまま
+            self.name_tpl_var.set(str(st["name_custom"]).strip()
+                                  + ("_{camera}" if st.get("name_usecam", True) else ""))
+        _setvar(self.overwrite_var, "overwrite")
         _setvar(self.depth_var, "depth")
         _setvar(self.normal_var, "normal")
         _setvar(self.cloudmatte_var, "cloudmatte")
@@ -3171,8 +3261,11 @@ class CaptureWindow(object):
         _setvar(self.seq_fog_var, "seq_fog")
         _setvar(self.seq_exposure_lock_var, "seq_exposure_lock")
         _setvar(self.seq_out_var, "seq_out")
-        _setvar(self.seq_usecustom_var, "seq_usecustom")
-        _setvar(self.seq_custom_var, "seq_custom")
+        if "seq_name_tpl" in st:
+            _setvar(self.seq_name_tpl_var, "seq_name_tpl")
+        elif st.get("seq_usecustom") and str(st.get("seq_custom", "")).strip():
+            self.seq_name_tpl_var.set(str(st["seq_custom"]).strip() + "_{seq}")
+        _setvar(self.seq_overwrite_var, "seq_overwrite")
         _setvar(self.seq_near_var, "seq_near")
         _setvar(self.seq_far_var, "seq_far")
         if st.get("seq_depth_bit") in ("8bit PNG", "16bit PNG", "EXR float"):
@@ -3188,8 +3281,8 @@ class CaptureWindow(object):
         s.override_height = self._int_var(self.h_var, s.override_height)
         s.aa_factor = {"1x": 1, "2x": 2, "4x": 4}.get(self.aa_var.get(), 2)
         s.output_dir = self.out_var.get().strip()
-        s.name_prefix = self.name_custom_var.get().strip() if self.name_usecustom_var.get() else ""
-        s.name_include_camera = self.name_usecam_var.get()
+        s.name_body = self._resolve_name(self.name_tpl_var.get(), s.camera_actor,
+                                         self._current_sequence())
         s.fog_off = self.fog_off_var.get()
         s.do_color = False                 # 旧 Color(SceneCapture) は廃止。Beauty は MRQ で出す。
         s.do_depth = self.depth_var.get()
