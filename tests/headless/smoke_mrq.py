@@ -778,6 +778,71 @@ def _vl_grab_no_viewport():
 step("VL6 begin_viewport_grab without a viewport raises and restores camera PP", _vl_grab_no_viewport)
 
 
+def _cvar_map(job):
+    cv = job.get_configuration().find_setting_by_class(unreal.MoviePipelineConsoleVariableSetting)
+    return {str(e.get_editor_property("name")): e.get_editor_property("value")
+            for e in cv.get_editor_property("cvars")}
+
+
+def _vc_seq_job():
+    real = unreal.get_editor_subsystem(unreal.MoviePipelineQueueSubsystem)
+    name = mrq._EXPOSURE_OFFSET_CVAR
+    out = {}
+    try:
+        for key, ev in (("ev+1.75", 1.75), ("ev-2.5", -2.5), ("none", None), ("zero", 0.0)):
+            fs = _FakeSub(real)
+            mrq._start_sequence_render(fs, scene_seq, os.path.join(OUTD, "smoke_mrq_vc"), 640, 360,
+                                       "Smoke", "001", True, False, 18, 4, 8, None, None,
+                                       None, None, None, None, None,
+                                       None, "Beauty", False, None, None, viewport_look=True,
+                                       exposure_offset_ev=ev)
+            out[key] = _cvar_map(real.get_queue().get_jobs()[0]).get(name)
+            mrq._KEEP.clear()
+            for j in list(real.get_queue().get_jobs()):
+                real.get_queue().delete_job(j)
+        # 静止画ジョブ（render_beauty）には露出合わせを入れない
+        fs = _FakeSub(real)
+        mrq._start_render(fs, cam, os.path.join(OUTD, "smoke_mrq_vc"), 640, 360,
+                          False, "png", False, 1, 4, 8, "Smoke", None, None, 0.0,
+                          False, None, viewport_look=True)
+        out["still"] = _cvar_map(real.get_queue().get_jobs()[0]).get(name)
+    finally:
+        mrq._KEEP.clear()
+        for j in list(real.get_queue().get_jobs()):
+            real.get_queue().delete_job(j)
+        mrq._delete_temp_sequence()
+    _ok(name == "r.ExposureOffset", name)
+    _ok(abs(out["ev+1.75"] - 1.75) < 1e-6 and abs(out["ev-2.5"] + 2.5) < 1e-6, out)
+    _ok(out["none"] is None and out["zero"] is None and out["still"] is None, out)
+    return out
+
+
+step("VC2 render_sequence job: exposure_offset_ev -> r.ExposureOffset cvar only when given",
+     _vc_seq_job)
+
+
+def _vc_seq_passthrough():
+    seen = {}
+    orig = mrq._start_sequence_render
+
+    def fake(*a, **k):
+        seen["ev"] = k.get("exposure_offset_ev")
+        raise RuntimeError("stop before MRQ")
+    mrq._start_sequence_render = fake
+    try:
+        mrq.render_sequence(scene_seq, os.path.join(OUTD, "smoke_mrq_vcp"), 640, 360,
+                            "Smoke", "001", viewport_look=True, exposure_offset_ev=-1.25)
+    except RuntimeError:
+        pass
+    finally:
+        mrq._start_sequence_render = orig
+    _ok(seen.get("ev") == -1.25 and mrq._KEEP == {}, (seen, mrq._KEEP))
+    return seen
+
+
+step("VC3 render_sequence passes exposure_offset_ev through to the job builder", _vc_seq_passthrough)
+
+
 
 def _cleanup():
     for a in (cube, cam, sun):

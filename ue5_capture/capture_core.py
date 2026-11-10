@@ -446,6 +446,75 @@ def finish_viewport_grab_file(src_png, dst_path):
     return dst_path
 
 
+def _srgb_decode(a):
+    """sRGB 符号値 0..1 → 表示リニア 0..1。"""
+    return _np.where(a <= 0.04045, a / 12.92, ((a + 0.055) / 1.055) ** 2.4)
+
+
+def _srgb_encode(a):
+    a = _np.clip(a, 0.0, 1.0)
+    return _np.where(a <= 0.0031308, a * 12.92, 1.055 * a ** (1.0 / 2.4) - 0.055)
+
+
+def exposure_offset_ev(ref, probe, clamp_ev=4.0, deadband_ev=0.1, lo=0.06, hi=0.94):
+    """ビューポート撮影 ref と MRQ 近似 probe（同サイズ HxWx3 の 8bit sRGB 配列）の
+    露出差 [EV]。両方が中間調（sRGB 符号値で lo〜hi）の画素で
+    log2(リニア輝度 ref / リニア輝度 probe) の中央値を取る（白飛び/黒つぶれ・
+    フォグ等の局所差に引っ張られない）。±clamp_ev で制限、|EV|<deadband_ev は 0。
+    返り値 dict: ev（適用値）/ raw_ev（制限前）/ n（使った画素数）/
+    resid（probe を ev だけ明るくした画と ref の平均絶対差 0..255。露出以外の差の目安）。
+    中間調の画素が少なすぎる（全体の 1% 未満）と None。
+    ⚠ 表示リニア（トーンカーブ後）の比なので、トーンカーブの傾きが 1 でない分だけ
+    シーンリニアの露出差とはずれる。"""
+    r = _np.asarray(ref, dtype=_np.float64)[..., :3] / 255.0
+    p = _np.asarray(probe, dtype=_np.float64)[..., :3] / 255.0
+    if r.shape != p.shape:
+        raise ValueError("ref/probe のサイズが違います: %s / %s" % (r.shape, p.shape))
+    w = _np.array([0.2126, 0.7152, 0.0722])
+    rl, pl = _srgb_decode(r), _srgb_decode(p)
+    yr, yp = rl @ w, pl @ w
+    lo_l, hi_l = float(_srgb_decode(_np.float64(lo))), float(_srgb_decode(_np.float64(hi)))
+    m = (yr > lo_l) & (yr < hi_l) & (yp > lo_l) & (yp < hi_l)
+    n = int(m.sum())
+    if n < max(16, int(0.01 * m.size)):
+        return None
+    raw = float(_np.median(_np.log2(yr[m] / yp[m])))
+    ev = max(-float(clamp_ev), min(float(clamp_ev), raw))
+    if abs(ev) < float(deadband_ev):
+        ev = 0.0
+    corr = _srgb_encode(pl * (2.0 ** ev))
+    resid = float(_np.mean(_np.abs(corr - r))) * 255.0
+    return {"ev": ev, "raw_ev": raw, "n": n, "resid": resid}
+
+
+def refine_exposure_ev(x0, m0, x1, m1, clamp_ev=4.0, deadband_ev=0.1):
+    """露出合わせの試し撮り 2 本から次の EV を割線法で求める。
+    x = 試し撮りに当てた EV、m = そのときの ref との測定差（exposure_offset_ev の raw_ev）。
+    表示リニアの差はトーンカーブで縮む/伸びる（傾き s）ので m(x) = 0 となる x を
+    s = (m0 - m1) / (x1 - x0) で外挿する。傾きが 0.25〜4 の外（ノイズ・単調でない）は
+    x1 + m1 に留める。返り値 (適用 EV, 制限前 EV)。"""
+    s = (float(m0) - float(m1)) / (float(x1) - float(x0))
+    raw = (float(x1) + float(m1) / s) if 0.25 <= s <= 4.0 else float(x1) + float(m1)
+    ev = max(-float(clamp_ev), min(float(clamp_ev), raw))
+    if abs(ev) < float(deadband_ev):
+        ev = 0.0
+    return ev, raw
+
+
+def estimate_exposure_offset_files(ref_path, probe_path, **kw):
+    """exposure_offset_ev のファイル版（probe は ref のサイズへ合わせてから比較）。
+    numpy/PIL が無ければ None。"""
+    if not (_HAS_NUMPY and _HAS_PIL):
+        return None
+    with _PILImage.open(ref_path) as a:
+        ref = a.convert("RGB")
+    with _PILImage.open(probe_path) as b:
+        probe = b.convert("RGB")
+    if probe.size != ref.size:
+        probe = probe.resize(ref.size, _PILImage.BILINEAR)
+    return exposure_offset_ev(_np.asarray(ref), _np.asarray(probe), **kw)
+
+
 def get_camera_settings(camera_actor):
     """カメラの Transform / FOV / アスペクト / PostProcess を取得。
     aspect_ratio が未設定(≒0)のカメラは filmback (sensor w/h) から算出する。"""

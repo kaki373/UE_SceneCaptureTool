@@ -269,6 +269,11 @@ _HQ_CVARS = [
 ]
 
 
+# 最終露出の EV オフセット（SceneView で AutoExposureBias に加算。5.7/5.8 の MRQ ジョブ内 cvar で効くことを実測）。
+# ビューポートのルックの露出合わせで、ビューポート撮影との差をメインジョブへ足す。
+_EXPOSURE_OFFSET_CVAR = "r.ExposureOffset"
+
+
 def _job_cvars(viewport_look=False):
     """全ジョブ共通の cvar。パネルの「露出固定」やスクリプトが unreal モジュール属性
     `_ue5capture_extra_cvars` に置いた追加分（例 [("r.EyeAdaptationQuality", 0)]）を
@@ -1714,10 +1719,13 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
                     geomask_material=None,
                     backing_actors=None, backing_white=False, use_exr=False,
                     sky_matte=False, pp_materials_off=False,
-                    image_format=None, also_png=False, viewport_look=False):
+                    image_format=None, also_png=False, viewport_look=False,
+                    exposure_offset_ev=None):
     """開いている/指定の LevelSequence を MRQ でレンダリング（非同期）。
     viewport_look=True は「ビューポートのルック」の MRQ 近似（render_beauty と同じ規則。
     カメラはカメラカットのカメラ、レベル可視性はシーケンス自身のまま）。
+    exposure_offset_ev を渡すとジョブ内 cvar（_EXPOSURE_OFFSET_CVAR・自動復元）で
+    最終露出をその EV だけずらす（ビューポートのルックの露出合わせ）。
     一時シーケンスは作らず job.sequence に直接指定し、カメラはシーケンスの
     カメラカットトラックに従う。fps はシーケンスの Display Rate。
     静止画と違いモーションブラーは殺さない（切ると動きがストロボ状になる）。
@@ -1824,7 +1832,8 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
                                       sky_matte=sky_matte,
                                       pp_materials_off=pp_materials_off,
                                       image_format=image_format, also_png=also_png,
-                                      viewport_look=viewport_look)
+                                      viewport_look=viewport_look,
+                                      exposure_offset_ev=exposure_offset_ev)
     except Exception:
         _restore_scene()
         if near_clip_cm is not None:
@@ -1847,7 +1856,7 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
                            geomask_material=None,
                            backing=False, use_exr=False, sky_matte=False,
                            pp_materials_off=False, image_format=None, also_png=False,
-                           viewport_look=False):
+                           viewport_look=False, exposure_offset_ev=None):
     queue = sub.get_queue()
     _backup_and_clear_queue(queue)
     job = queue.allocate_new_job(unreal.MoviePipelineExecutorJob)
@@ -2012,6 +2021,9 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
         except Exception as e:
             _warn("backing: トーンカーブ無効化に失敗（Tが非線形になる）: %s" % e)
         _log("backing render (exposure locked / bloom+screen traces off / linear)")
+    if exposure_offset_ev:
+        pairs.append((_EXPOSURE_OFFSET_CVAR, float(exposure_offset_ev)))
+        _log("exposure offset %+.2f EV (%s)" % (float(exposure_offset_ev), _EXPOSURE_OFFSET_CVAR))
     cv = cfg.find_or_add_setting_by_class(unreal.MoviePipelineConsoleVariableSetting)
     cv.set_editor_property("cvars", _cv_entries(pairs))   # レンダ後にエンジンが自動復元
     cmds = []

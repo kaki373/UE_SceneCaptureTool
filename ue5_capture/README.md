@@ -83,6 +83,8 @@ Beauty 合成、の順で全パスが揃う。Matte / ObjectID の対象はパ�
 - **ビューポートのルック**：Beauty をビューポートの見た目で撮る。画像タブはカメラをパイロットして
   ビューポートを W×H で撮影（HighResShot）、撮れない時（EXR 等）は MRQ 近似。映像タブは MRQ 近似のみ
   （高品質 cvar / Game Override なし）。パイロット中でなければカメラの PP ウェイトを一時 0。Fog OFF・露出固定と排他。
+  映像タブの Beauty は先頭フレームのビューポート撮影と MRQ 試し撮りの露出差（EV）を測って自動補正（`r.ExposureOffset`）。
+  参照画像は `<名前>_ViewportRef_<テイク>.png` として残る。フォグ等の露出以外の差は補正しない。
 - **MRQ 品質**：Warmup（Lumen/影の収束。**32 以上推奨**。低いと暗くなる）、Temporal サンプル数、EXR。
 
 ## VDB雲（HeterogeneousVolume）のマット / ObjectID

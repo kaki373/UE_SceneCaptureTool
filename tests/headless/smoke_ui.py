@@ -392,6 +392,30 @@ def _cut_lookup():
 step("_camera_cut_camera_for_frame / _sequence_camera_at", _cut_lookup)
 
 
+def _vpcal_no_viewport():
+    # コマンドレットにはビューポートが無い → 露出合わせは同期的に諦めて on_done(None, 理由)。
+    # 一時物を残さず、カメラ PP / 非表示も戻っていること
+    d = os.path.join(OUTD, "smoke_ui_vpcal")
+    os.makedirs(os.path.join(d, ui._VPCAL_PROBE_DIR), exist_ok=True)   # 前回の残骸を模す
+    cam.camera_component.set_editor_property("post_process_blend_weight", 1.0)
+    got = []
+    win._restore_hooks = []
+    win._seq_vp_calibrate(seq, 5, 0, 1920, 1080, 4, 8, False, [cube], d, "Smoke", "001",
+                          lambda r, why: got.append((r, why)))
+    assert len(got) == 1 and got[0][0] is None and "ビューポート撮影" in got[0][1], got
+    assert not os.path.isdir(os.path.join(d, ui._VPCAL_PROBE_DIR))
+    assert not os.path.isfile(os.path.join(d, ui._VPCAL_REF_TMP))
+    assert not any("ViewportRef" in f for f in os.listdir(d)), os.listdir(d)
+    w = float(cam.camera_component.get_editor_property("post_process_blend_weight"))
+    assert w == 1.0 and cube.is_temporarily_hidden_in_editor() is False, w
+    n_hooks = len(win._restore_hooks)
+    win._run_restore_hooks()
+    return {"why": got[0][1], "hooks": n_hooks}
+
+
+step("VC4 _seq_vp_calibrate without a viewport -> on_done(None, reason), nothing left", _vpcal_no_viewport)
+
+
 def _cleanup():
     ui.close_all_windows()
     for a in (cube, cam, cam2):
