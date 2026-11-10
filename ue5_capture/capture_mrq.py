@@ -158,7 +158,8 @@ def _clear_sequence(seq):
         b.remove()
 
 
-def _create_temp_sequence(camera_actor, fps=24, scene_sequence=None, scene_frame=None):
+def _create_temp_sequence(camera_actor, fps=24, scene_sequence=None, scene_frame=None,
+                          level_visibility=False):
     """対象カメラを 1 フレームのカメラカットにした一時 LevelSequence を作成して返す。
 
     scene_sequence / scene_frame を渡すと、そのシーケンスをサブシーケンスとして
@@ -167,7 +168,9 @@ def _create_temp_sequence(camera_actor, fps=24, scene_sequence=None, scene_frame
     （=フレーム0 の姿勢）へ戻るため、埋め込みで PIE 側にも同フレームを評価させる
     （2026-07-13 実測: マスク=現在フレーム / Beauty=フレーム0 のズレ）。
     カメラカットはこの一時シーケンス（ルート）側のみ＝ツールで選んだカメラが使われる
-    （ルートのカメラカットはサブシーケンス内のカメラカットより優先される）。"""
+    （ルートのカメラカットはサブシーケンス内のカメラカットより優先される）。
+    level_visibility=True でレベル可視性トラックを足し、サブレベルの表示をエディタの
+    現在の表示に合わせる（ビューポートのルック）。"""
     ext = unreal.MovieSceneSequenceExtensions
     if _delete_temp_sequence():
         at = unreal.AssetToolsHelpers.get_asset_tools()
@@ -239,6 +242,12 @@ def _create_temp_sequence(camera_actor, fps=24, scene_sequence=None, scene_frame
     sec.set_range(0, 1)
     binding_id = ext.get_binding_id(seq, binding)
     sec.set_camera_binding_id(binding_id)
+    if level_visibility:
+        try:
+            _add_level_visibility_track(seq, *_editor_level_visibility())
+        except Exception as e:
+            _warn("viewport look: レベル可視性トラックを作れません（サブレベル表示は既定のまま）: %s"
+                  % e)
     unreal.EditorAssetLibrary.save_loaded_asset(seq)
     full = _TMP_PKG + "/" + _TMP_NAME + "." + _TMP_NAME
     return seq, full
@@ -260,11 +269,75 @@ _HQ_CVARS = [
 ]
 
 
-def _job_cvars():
+def _job_cvars(viewport_look=False):
     """全ジョブ共通の cvar。パネルの「露出固定」やスクリプトが unreal モジュール属性
     `_ue5capture_extra_cvars` に置いた追加分（例 [("r.EyeAdaptationQuality", 0)]）を
-    ジョブ生成時に合流させる。属性は reload をまたいで残る。"""
-    return list(_HQ_CVARS) + list(getattr(unreal, "_ue5capture_extra_cvars", None) or [])
+    ジョブ生成時に合流させる。属性は reload をまたいで残る。
+    viewport_look=True（ビューポートのルックの MRQ 近似）は _HQ_CVARS を入れない。"""
+    hq = [] if viewport_look else list(_HQ_CVARS)
+    return hq + list(getattr(unreal, "_ue5capture_extra_cvars", None) or [])
+
+
+def _set_game_overrides(cfg):
+    go = cfg.find_or_add_setting_by_class(unreal.MoviePipelineGameOverrideSetting)
+    go.set_editor_property("use_high_quality_shadows", True)
+    go.set_editor_property("use_lod_zero", True)
+    go.set_editor_property("flush_grass_streaming", True)
+    go.set_editor_property("flush_streaming_managers", True)
+    _set_texture_streaming_full(go)
+
+
+def _viewport_look_pp(cameras, skipped=0):
+    """ビューポートのルック（MRQ 近似）: パイロット中でないカメラのポスプロウェイトを
+    一時 0 にする。エディタワールドから変えられないカメラ（スポーナブル等）は数だけ記録。"""
+    saved = _core.zero_camera_pp_weights(cameras)
+    _log("viewport look (MRQ 近似): HQ cvar / GameOverride なし・カメラPP 0 にした %d 台%s"
+         % (len(saved), (" / 解決できず変更しないカメラ %d 台（スポーナブル等）" % skipped)
+            if skipped else ""))
+    return saved
+
+
+def _editor_level_visibility(world=None):
+    """エディタで今ロード済みのサブレベルを (表示中, 非表示) の短いパッケージ名に分ける。"""
+    world = world or _editor_world()
+    vis, hid = [], []
+    persistent = world.get_path_name().split(".")[0]
+    try:
+        levels = list(unreal.EditorLevelUtils.get_levels(world))
+    except Exception:
+        levels = []
+    for lv in levels:
+        try:
+            pkg = lv.get_path_name().split(".")[0]
+            if not pkg or pkg == persistent:
+                continue
+            sl = unreal.GameplayStatics.get_streaming_level(world, pkg)
+            if sl is None:
+                continue
+            (vis if sl.is_level_visible() else hid).append(pkg.rsplit("/", 1)[-1])
+        except Exception:
+            continue
+    return vis, hid
+
+
+def _add_level_visibility_track(seq, visible, hidden):
+    """一時シーケンスにレベル可視性トラックを足し、レンダ中のサブレベル表示を
+    エディタの現在の表示に合わせる（名前は短いパッケージ名。PIE 接頭辞はエンジンが補う）。"""
+    if not (visible or hidden):
+        return None
+    ext = unreal.MovieSceneSequenceExtensions
+    tr = ext.add_track(seq, unreal.MovieSceneLevelVisibilityTrack)
+    for names, mode in ((visible, unreal.LevelVisibility.VISIBLE),
+                        (hidden, unreal.LevelVisibility.HIDDEN)):
+        if not names:
+            continue
+        sec = tr.add_section()
+        sec.set_range(0, 1)
+        sec.set_visibility(mode)
+        sec.set_level_names([unreal.Name(n) for n in names])
+    _log("viewport look: サブレベル表示をエディタに合わせる（表示 %d / 非表示 %d）"
+         % (len(visible), len(hidden)))
+    return tr
 
 
 # Raw Lighting Direct 用: GI/スカイライト/AO を切って直接光のみにする ShowFlag cvar
@@ -413,6 +486,8 @@ def _restore_saved_scene(st):
         _run("players", lambda: _restore_autoplay_players(st["players"]))
     if st.get("cam"):
         _run("cam", lambda: _restore_cameras_aspect(st["cam"]))
+    if st.get("ppw"):
+        _run("ppw", lambda: _core.restore_camera_pp_weights(st["ppw"]))
 
 
 def _start_visible_cloud_mode(st, cloud_matte_actors, cloud_backing, cloud_sources_off):
@@ -469,8 +544,11 @@ def render_beauty(camera_actor, output_dir, width, height,
                   cloud_backing=None, cloud_sources_off=False,
                   geomask_material=None,
                   backing_actors=None, backing_white=False, sky_matte=False,
-                  pp_materials_off=False):
+                  pp_materials_off=False, viewport_look=False):
     """対象カメラを MRQ で Beauty レンダリング（非同期）。executor を返す。
+    viewport_look=True は「ビューポートのルック」の MRQ 近似: _HQ_CVARS と
+    GameOverride を使わず、パイロット中でなければカメラのポスプロウェイトを 0 にし、
+    一時シーケンスのレベル可視性トラックでサブレベル表示をエディタに合わせる。
     cloud_visible=True（要 cloud_matte_actors）は可視雲モード: 何も隠さず PIE 側で
     全ジオメトリを白発光材へ差し替え、EXR の RGB=W(=T×素板レベル)・α=全投影雲αを
     1ジョブで出す（geomask_material を渡すと GeoMask PP パスも同乗）。
@@ -506,7 +584,7 @@ def render_beauty(camera_actor, output_dir, width, height,
         raise RuntimeError("MRQ は既にレンダリング中です。完了までお待ちください（多重起動防止）。")
     if matte_material is not None and not matte_actors:
         raise RuntimeError("Matte パスには対象アクターが必要です。")
-    _warn_if_spawnable_camera(camera_actor)
+    spawnable = _warn_if_spawnable_camera(camera_actor)
 
     # シーン状態の変更（レンダ後・起動失敗時に必ず復元）: 非表示指定 / マットレンダ
     # モード / auto-play プレイヤー停止（PIE 中に勝手に再生されるとカメラ・シーンが
@@ -544,6 +622,9 @@ def render_beauty(camera_actor, output_dir, width, height,
                      if c is not None]
         if st["cam"]:
             _log("カメラのアスペクト拘束を一時解除（静止画）")
+        if viewport_look:
+            st["ppw"] = _viewport_look_pp([] if spawnable else [camera_actor],
+                                          skipped=1 if spawnable else 0)
 
         return _start_render(sub, camera_actor, output_dir, width, height,
                              use_exr, image_format, also_png,
@@ -557,7 +638,8 @@ def render_beauty(camera_actor, output_dir, width, height,
                              cloud_sources_off=cloud_sources_off,
                              geomask_material=geomask_material,
                              backing=bool(backing_actors), sky_matte=sky_matte,
-                             pp_materials_off=pp_materials_off)
+                             pp_materials_off=pp_materials_off,
+                             viewport_look=viewport_look)
     except Exception:
         # セットアップ/起動に失敗したら状態を巻き戻す（次回レンダを塞がない）
         _restore_scene()
@@ -579,10 +661,12 @@ def _start_render(sub, camera_actor, output_dir, width, height,
                   light_pass=False, light_direct=False, cloud_matte=False,
                   cloud_visible=False, cloud_sources_off=False,
                   geomask_material=None,
-                  backing=False, sky_matte=False, pp_materials_off=False):
+                  backing=False, sky_matte=False, pp_materials_off=False,
+                  viewport_look=False):
     seq, seq_path = _create_temp_sequence(camera_actor,
                                           scene_sequence=scene_sequence,
-                                          scene_frame=scene_frame)
+                                          scene_frame=scene_frame,
+                                          level_visibility=viewport_look)
 
     queue = sub.get_queue()
     _backup_and_clear_queue(queue)
@@ -676,14 +760,10 @@ def _start_render(sub, camera_actor, output_dir, width, height,
         camset.set_editor_property("overscan_percentage", float(overscan))
         _log("overscan = %.1f%%" % (float(overscan) * 100.0))
 
-    go = cfg.find_or_add_setting_by_class(unreal.MoviePipelineGameOverrideSetting)
-    go.set_editor_property("use_high_quality_shadows", True)
-    go.set_editor_property("use_lod_zero", True)
-    go.set_editor_property("flush_grass_streaming", True)
-    go.set_editor_property("flush_streaming_managers", True)
-    _set_texture_streaming_full(go)
+    if not viewport_look:
+        _set_game_overrides(cfg)
 
-    pairs = _job_cvars() + [("r.MotionBlurQuality", 0)]   # 静止画はブラー無し
+    pairs = _job_cvars(viewport_look) + [("r.MotionBlurQuality", 0)]   # 静止画はブラー無し
     if matte_material is not None:
         pairs.append(("r.CustomDepth", 3))   # ステンシル書き込みに必要（自動復元）
     if fog_off == "bloom":
@@ -1505,6 +1585,12 @@ def _camera_cut_camera_actors(level_sequence, world):
     （CineCameraActor / 素の CameraActor の両方。スポーナブルは Sequencer が
     プレビュー用にスポーンした実体がワールドに居ても locate_bound_objects では
     解決できない＝既知の限界。呼び出し側でワールド走査にフォールバックする）。"""
+    return _camera_cut_cameras_with_count(level_sequence, world)[0]
+
+
+def _camera_cut_cameras_with_count(level_sequence, world=None):
+    """(解決できたカメラアクター, カメラカットが参照するバインディング数)。"""
+    world = world or _editor_world()
     ext = unreal.MovieSceneSequenceExtensions
     actors = []
     guids = []
@@ -1523,7 +1609,7 @@ def _camera_cut_camera_actors(level_sequence, world):
             for o in ext.locate_bound_objects(level_sequence, b, world):
                 if isinstance(o, unreal.CameraActor) and o not in actors:
                     actors.append(o)
-    return actors
+    return actors, len(set(guids))
 
 
 def _first_cut_camera(level_sequence):
@@ -1628,8 +1714,10 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
                     geomask_material=None,
                     backing_actors=None, backing_white=False, use_exr=False,
                     sky_matte=False, pp_materials_off=False,
-                    image_format=None, also_png=False):
+                    image_format=None, also_png=False, viewport_look=False):
     """開いている/指定の LevelSequence を MRQ でレンダリング（非同期）。
+    viewport_look=True は「ビューポートのルック」の MRQ 近似（render_beauty と同じ規則。
+    カメラはカメラカットのカメラ、レベル可視性はシーケンス自身のまま）。
     一時シーケンスは作らず job.sequence に直接指定し、カメラはシーケンスの
     カメラカットトラックに従う。fps はシーケンスの Display Rate。
     静止画と違いモーションブラーは殺さない（切ると動きがストロボ状になる）。
@@ -1716,6 +1804,9 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
         # 全ジョブで適用する。メイン/BehindPlate 間でビュー矩形が食い違うと
         # per-frame 合成がズレるため（ミスマッチのカメラだけ触る）。
         st["cam"] = _set_cameras_fill_aspect(level_sequence, width, height)
+        if viewport_look:
+            cams, n_cut = _camera_cut_cameras_with_count(level_sequence)
+            st["ppw"] = _viewport_look_pp(cams, skipped=max(0, n_cut - len(cams)))
 
         return _start_sequence_render(sub, level_sequence, output_dir, width, height,
                                       name_body, take_str, do_png, do_mp4, mp4_crf,
@@ -1732,7 +1823,8 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
                                       backing=bool(backing_actors), use_exr=use_exr,
                                       sky_matte=sky_matte,
                                       pp_materials_off=pp_materials_off,
-                                      image_format=image_format, also_png=also_png)
+                                      image_format=image_format, also_png=also_png,
+                                      viewport_look=viewport_look)
     except Exception:
         _restore_scene()
         if near_clip_cm is not None:
@@ -1754,7 +1846,8 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
                            cloud_visible=False, cloud_sources_off=False,
                            geomask_material=None,
                            backing=False, use_exr=False, sky_matte=False,
-                           pp_materials_off=False, image_format=None, also_png=False):
+                           pp_materials_off=False, image_format=None, also_png=False,
+                           viewport_look=False):
     queue = sub.get_queue()
     _backup_and_clear_queue(queue)
     job = queue.allocate_new_job(unreal.MoviePipelineExecutorJob)
@@ -1849,16 +1942,12 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
     except Exception as e:
         _warn("AA を TSR に設定できません（エンジン既定の AA で続行）: %s" % e)
 
-    go = cfg.find_or_add_setting_by_class(unreal.MoviePipelineGameOverrideSetting)
-    go.set_editor_property("use_high_quality_shadows", True)
-    go.set_editor_property("use_lod_zero", True)
-    go.set_editor_property("flush_grass_streaming", True)
-    go.set_editor_property("flush_streaming_managers", True)
-    _set_texture_streaming_full(go)
+    if not viewport_look:
+        _set_game_overrides(cfg)
 
     # モーションブラーは切らない（切ると 24fps でストロボ状の動きになり、
     # MRQ のテンポラルサンプル蓄積ブラーも効かなくなる）→ _HQ_CVARS に含めていない。
-    pairs = _job_cvars()
+    pairs = _job_cvars(viewport_look)
     if (objid_material is not None or matte_material is not None
             or matte_sil_material is not None):
         # CustomDepth ステンシル書き込みには r.CustomDepth=3 が必要

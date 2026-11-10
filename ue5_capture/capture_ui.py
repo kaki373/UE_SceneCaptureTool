@@ -45,6 +45,20 @@ _EXPOSURE_LOCK_TIP = ("自動露出(Eye Adaptation)をレンダ中だけ切り�
                       "PPV/カメラは変更せずレンダ後に復元")
 
 
+# 「ビューポートのルック」: エディタのビューポートで見えている見た目（フォグ/露出/ポスプロ）で撮る
+_VIEWPORT_LOOK_TIP = ("ビューポートで見えているルック（フォグ/露出/ポスプロ）で Beauty を撮る。"
+                      "カメラをパイロットしてビューポートを指定解像度で撮影し、他の素材は従来どおり MRQ。"
+                      "撮れない時（EXR 形式など）は MRQ 近似（高品質 cvar / Game Override なし）。"
+                      "パイロット中でなければカメラ自身のポスプロ（露出補正・ビネット）は外す。"
+                      "Fog/グローなし・露出固定とは排他（ON の間は無効）")
+_SEQ_VIEWPORT_LOOK_TIP = ("ビューポートの見た目に近づけて Beauty を撮る MRQ 近似（完全一致ではない）。"
+                          "高品質 cvar / Game Override を使わず、パイロット中でないカメラの"
+                          "ポスプロ（露出補正・ビネット）を外す。他の素材は従来どおり。"
+                          "Fog/グローなし・露出固定とは排他（ON の間は無効）")
+# ビューポート撮影（HighResShot）の完了待ちの上限（秒）。シェーダ/ストリーミング待ちを含む
+_VIEWPORT_GRAB_TIMEOUT = 60.0
+
+
 def _apply_exposure_lock(on):
     """capture_mrq が全ジョブに合流させる追加 cvar（reload をまたいで残る属性）を設定。"""
     unreal._ue5capture_extra_cvars = list(_EXPOSURE_LOCK_CVARS) if on else []
@@ -482,12 +496,18 @@ class CaptureWindow(object):
                   "Beauty / Raw Lighting の形式。Matte系合成と ObjectID は常に PNG"
                   ).pack(side="left")
         self.fog_off_var = tk.BooleanVar(master=self.root, value=False)
-        self._check(r, "Fog/グローなし", self.fog_off_var,
-                    "フォグとポスプロのグロー(ブルーム)を切ってレンダする").pack(
-            side="left", padx=(14, 0))
+        self.fog_off_cb = self._check(r, "Fog/グローなし", self.fog_off_var,
+                                      "フォグとポスプロのグロー(ブルーム)を切ってレンダする")
+        self.fog_off_cb.pack(side="left", padx=(14, 0))
         self.exposure_lock_var = tk.BooleanVar(master=self.root, value=False)
-        self._check(r, "露出固定", self.exposure_lock_var, _EXPOSURE_LOCK_TIP).pack(
-            side="left", padx=(8, 0))
+        self.exposure_lock_cb = self._check(r, "露出固定", self.exposure_lock_var,
+                                            _EXPOSURE_LOCK_TIP)
+        self.exposure_lock_cb.pack(side="left", padx=(8, 0))
+        r = self._row(matf, " ")
+        self.viewport_look_var = tk.BooleanVar(master=self.root, value=False)
+        self._check(r, "ビューポートのルック", self.viewport_look_var,
+                    _VIEWPORT_LOOK_TIP).pack(side="left")
+        self.viewport_look_var.trace_add("write", lambda *a: self._sync_viewport_look())
 
         self._group(matf, "基本")
         self.beauty_var = tk.BooleanVar(master=self.root, value=True)
@@ -675,7 +695,7 @@ class CaptureWindow(object):
 
         # ---- 出力素材 ----
         # 画像タブと同じ並び: 形式 → Fog/露出 → 素材。連番の形式（Beauty / Raw Lighting）と
-        # MP4 レートを 1 行目に、Fog/露出固定を 2 行目に置く
+        # MP4 レートを 1 行目に、Fog/露出固定/ビューポートのルックを 2 行目に置く
         matf = self._card(body, "出力素材")
         r = self._row(matf, "形式")
         self.seq_beauty_fmt_var = tk.StringVar(master=self.root, value="PNG 8bit")
@@ -692,12 +712,17 @@ class CaptureWindow(object):
                   "MP4 はシーケンスの fps で ffmpeg エンコード").pack(side="left")
         r = self._row(matf, " ")
         self.seq_fog_var = tk.BooleanVar(master=self.root, value=False)
-        self._check(r, "Fog/グローなし", self.seq_fog_var,
-                    "フォグとポスプロのグロー(ブルーム)を切ってレンダする").pack(
-            side="left")
+        self.seq_fog_cb = self._check(r, "Fog/グローなし", self.seq_fog_var,
+                                      "フォグとポスプロのグロー(ブルーム)を切ってレンダする")
+        self.seq_fog_cb.pack(side="left")
         self.seq_exposure_lock_var = tk.BooleanVar(master=self.root, value=False)
-        self._check(r, "露出固定", self.seq_exposure_lock_var, _EXPOSURE_LOCK_TIP).pack(
-            side="left", padx=(8, 0))
+        self.seq_exposure_lock_cb = self._check(r, "露出固定", self.seq_exposure_lock_var,
+                                                _EXPOSURE_LOCK_TIP)
+        self.seq_exposure_lock_cb.pack(side="left", padx=(8, 0))
+        self.seq_viewport_look_var = tk.BooleanVar(master=self.root, value=False)
+        self._check(r, "ビューポートのルック", self.seq_viewport_look_var,
+                    _SEQ_VIEWPORT_LOOK_TIP).pack(side="left", padx=(8, 0))
+        self.seq_viewport_look_var.trace_add("write", lambda *a: self._sync_viewport_look())
 
         mtx = ttk.Frame(matf)
         mtx.pack(fill="x", pady=(4, 0))
@@ -782,12 +807,12 @@ class CaptureWindow(object):
         r = self._row(advf, " ")
         self._tip(ttk.Button(r, text="画像タブの設定をコピー",
                              command=self._transfer_from_image_tab),
-                  "解像度 / 出力先 / 任意名 / 形式 / 品質 / Depth / Fog を画像タブからコピーする"
+                  "解像度 / 出力先 / 任意名 / 形式 / 品質 / Depth / Fog / ルックを画像タブからコピーする"
                   ).pack(side="left")
         ttk.Frame(body, style="Body.TFrame", height=6).pack()
 
     def _transfer_from_image_tab(self):
-        """画像キャプチャタブの設定（解像度/出力先/任意名/形式/品質/Depth/Fog）を映像タブへコピー。"""
+        """画像キャプチャタブの設定（解像度/出力先/任意名/形式/品質/Depth/Fog/ルック）を映像タブへコピー。"""
         W = self._int_var(self.w_var, 1920)
         if self.mrq_camasp_var.get():
             asp = self._aspect_ratio()
@@ -808,7 +833,28 @@ class CaptureWindow(object):
         self.seq_normal_space_var.set(self.normal_space_var.get())
         self.seq_fog_var.set(self.fog_off_var.get())
         self.seq_exposure_lock_var.set(self.exposure_lock_var.get())
+        self.seq_viewport_look_var.set(self.viewport_look_var.get())
         self.status_var.set("画像キャプチャの設定を映像タブへ転送しました")
+
+    def _sync_viewport_look(self):
+        """「ビューポートのルック」と Fog/グローなし・露出固定の排他。ON にしたタブの
+        2 チェックを外して無効化し、OFF で有効に戻す（値は戻さない）。"""
+        for vp, pairs in (
+                ("viewport_look_var", (("fog_off_var", "fog_off_cb"),
+                                       ("exposure_lock_var", "exposure_lock_cb"))),
+                ("seq_viewport_look_var", (("seq_fog_var", "seq_fog_cb"),
+                                           ("seq_exposure_lock_var", "seq_exposure_lock_cb")))):
+            vpv = getattr(self, vp, None)
+            if vpv is None:
+                continue
+            on = bool(vpv.get())
+            for var_name, cb_name in pairs:
+                var, cb = getattr(self, var_name, None), getattr(self, cb_name, None)
+                if var is None or cb is None:
+                    continue
+                if on and var.get():
+                    var.set(False)
+                cb.state(["disabled"] if on else ["!disabled"])
 
     # ------------------------------------------------------------- handlers
     @staticmethod
@@ -969,6 +1015,7 @@ class CaptureWindow(object):
         # クリック時点の値を確定する（レンダ中にウィジェットを触っても、後続ジョブや
         # 後処理が途中から別の値を読まないように）
         fog_off = self.fog_off_var.get()
+        vp_look = self.viewport_look_var.get()
         keep_beauty0 = self.beauty_var.get()
         W = self._int_var(self.w_var, 1920)
         if self.mrq_camasp_var.get():
@@ -1142,6 +1189,21 @@ class CaptureWindow(object):
                                           or normal_pp_mat is not None)
         comp_beauty = (os.path.join(out, _name("Beauty") + ".png")
                        if img_fmt != "png" else beauty_path)
+        # ビューポートのルック: Beauty はビューポート撮影（経路A）。EXR は撮れないので
+        # 最初から MRQ 近似（経路B）。撮影結果は一時名で受け、チェーン完了時に Beauty 名へ
+        vp_try = vp_look and keep_beauty0 and (
+            img_fmt == "png" or (img_fmt == "jpg" and core._HAS_PIL))
+        vp = {"ok": False, "tmp": os.path.join(out, "_vplook_tmp.png")}
+        if vp_look and keep_beauty0 and not vp_try:
+            skip_notes.append("ビューポートのルック: %s は MRQ 近似で撮影" % img_fmt.upper())
+
+        def _place_vp_beauty():
+            if vp["ok"] and os.path.isfile(vp["tmp"]):
+                try:
+                    core.finish_viewport_grab_file(vp["tmp"], beauty_path)
+                except Exception as e:
+                    skip_notes.append("ビューポートのルック: Beauty の保存に失敗")
+                    unreal.log_warning("[SceneCapture] ビューポート撮影の保存失敗: %s" % e)
 
         # Beauty（MRQ）は Beauty 指定時・Matte 系合成・同一ジョブ深度・Raw Lighting Full
         # が要るときにレンダする（Raw Lighting Direct はメイン無しでも専用ジョブで出せる）
@@ -1348,6 +1410,7 @@ class CaptureWindow(object):
                     core.delete_temp_geomask_material()
             except Exception as e:
                 unreal.log_warning("[SceneCapture] 一時マテリアル削除失敗: %s" % e)
+            _place_vp_beauty()      # 撮影済みの Beauty は MRQ 側の失敗でも残す
             self._run_restore_hooks()
             _apply_exposure_lock(False)
             self._set_busy(False)
@@ -1361,6 +1424,7 @@ class CaptureWindow(object):
                 skip_notes.append("後処理エラー")
                 unreal.log_error("[SceneCapture] 後処理エラー: %s" % e)
             finally:
+                _place_vp_beauty()
                 self._run_restore_hooks()       # filmback / PropagateAlpha
                 _apply_exposure_lock(False)     # 露出固定の cvar を他スクリプトへ持ち越さない
                 self._set_busy(False)
@@ -1381,7 +1445,8 @@ class CaptureWindow(object):
             # Beauty のチェックが無い場合（合成のためだけにレンダした場合）も削除するが、
             # 合成がスキップされたときは唯一の成果物になるため残す。
             aux = comp_beauty if comp_beauty != beauty_path else None
-            keep_beauty = keep_beauty0 or bool(skip_notes)
+            # ビューポート撮影の Beauty があるときメインの MRQ Beauty は内部素材（後で置換）
+            keep_beauty = (keep_beauty0 and not vp["ok"]) or bool(skip_notes)
             # H5 合成: 白T + 黒ベール + 雲なしBeauty から可視雲αを作る
             cm_png = os.path.join(out, _name("CloudMatte") + ".png")
             if cloud_alpha_needed:
@@ -1701,42 +1766,73 @@ class CaptureWindow(object):
             # od は出力フォルダ（on_done の契約は (success, output_dir)）であって原因ではない
             _fail_finish("MRQ Beauty レンダ失敗（Output Log 参照）")
 
-        if not beauty_needed:
-            # Raw Lighting Direct のみ: メインジョブ無しで専用ジョブだけ回す
-            _run_jobs()
+        def _launch():
+            """メイン MRQ ジョブ（Beauty+同一ジョブの PP パス）以降のチェーンを開始する。
+            ビューポート撮影で Beauty が撮れていればメインは PP パス等が要るときだけ回す。"""
+            main_needed = beauty_needed
+            if vp["ok"]:
+                main_needed = (want_mfront or want_behind or depth_pp_mat is not None
+                               or normal_pp_mat is not None or want_rlfull)
+            if not main_needed:
+                # Raw Lighting Direct のみ / ビューポート撮影の Beauty のみ:
+                # メインジョブ無しで専用ジョブだけ回す
+                _run_jobs()
+                return True
+
+            # 静止画（時間凍結）の TS>1 は、同一ジョブの Matte/Depth PP パスが
+            # サブフレームの片方にしか写らず 50% に希釈される（TS=2 でマスク黒が
+            # sRGB(0.5)=187 になる実測）。凍結静止画はサブフレーム内容が同一で
+            # TS>1 に画質上の意味も無いため、PP パスがあるときは TS=1 に強制する。
+            ts_main = ts
+            if ts > 1 and (matte_mat_still is not None or depth_pp_mat is not None
+                           or normal_pp_mat is not None):
+                ts_main = 1
+                skip_notes.append("Matte/Depth/Normal 同一ジョブパスのため TS=1 で実行")
+
+            vp_mrq = vp_look and keep_beauty0 and not vp["ok"]
+            if vp_mrq:
+                unreal.log("[SceneCapture] ビューポートのルック: 経路B（MRQ 近似）で Beauty をレンダ")
+            self.status_var.set("MRQ Beauty レンダ中… (PIEに入ります / 完了まで待機)")
+            self.root.update()
+            try:
+                capture_mrq.render_beauty(cam, out, W, H, image_format=img_fmt,
+                                          also_png=aux_png,
+                                          light_pass=want_rlfull,
+                                          temporal_samples=ts_main, warmup=warm,
+                                          file_basename=_name("Beauty"),
+                                          hidden_actors=(None if matte_mat_still is not None
+                                                         else beauty_hidden),
+                                          matte_material=matte_mat_still,
+                                          matte_actors=(matte_prims if matte_mat_still is not None
+                                                        else None),
+                                          depth_material=depth_pp_mat,
+                                          normal_material=normal_pp_mat,
+                                          fog_off=fog_off,
+                                          scene_sequence=scene_seq,
+                                          scene_frame=scene_frame, on_done=_after_beauty,
+                                          viewport_look=vp_mrq)
+            except Exception as e:
+                _fail_finish("MRQ 起動失敗: %s" % e)
+                return False
             return True
 
-        # 静止画（時間凍結）の TS>1 は、同一ジョブの Matte/Depth PP パスが
-        # サブフレームの片方にしか写らず 50% に希釈される（TS=2 でマスク黒が
-        # sRGB(0.5)=187 になる実測）。凍結静止画はサブフレーム内容が同一で
-        # TS>1 に画質上の意味も無いため、PP パスがあるときは TS=1 に強制する。
-        ts_main = ts
-        if ts > 1 and (matte_mat_still is not None or depth_pp_mat is not None
-                       or normal_pp_mat is not None):
-            ts_main = 1
-            skip_notes.append("Matte/Depth/Normal 同一ジョブパスのため TS=1 で実行")
+        if not vp_try:
+            return _launch()
 
-        self.status_var.set("MRQ Beauty レンダ中… (PIEに入ります / 完了まで待機)")
+        def _grab_done(ok, err):
+            vp["ok"] = ok
+            if ok:
+                unreal.log("[SceneCapture] ビューポートのルック: 経路A（ビューポート撮影）で Beauty を取得 %d×%d"
+                           % (W, H))
+            else:
+                skip_notes.append("ビューポートのルック: ビューポート撮影に失敗し MRQ 近似で撮影")
+                unreal.log_warning("[SceneCapture] ビューポートのルック: ビューポート撮影失敗（%s）"
+                                   "→ 経路B（MRQ 近似）へ" % err)
+            _launch()
+
+        self.status_var.set("ビューポートのルック: ビューポートで Beauty を撮影中…")
         self.root.update()
-        try:
-            capture_mrq.render_beauty(cam, out, W, H, image_format=img_fmt,
-                                      also_png=aux_png,
-                                      light_pass=want_rlfull,
-                                      temporal_samples=ts_main, warmup=warm,
-                                      file_basename=_name("Beauty"),
-                                      hidden_actors=(None if matte_mat_still is not None
-                                                     else beauty_hidden),
-                                      matte_material=matte_mat_still,
-                                      matte_actors=(matte_prims if matte_mat_still is not None
-                                                    else None),
-                                      depth_material=depth_pp_mat,
-                                      normal_material=normal_pp_mat,
-                                      fog_off=fog_off,
-                                      scene_sequence=scene_seq,
-                                      scene_frame=scene_frame, on_done=_after_beauty)
-        except Exception as e:
-            _fail_finish("MRQ 起動失敗: %s" % e)
-            return False
+        self._viewport_grab(cam, W, H, vp["tmp"], beauty_hidden, _grab_done)
         return True
 
     # ------------------------------------------------------ sequence render
@@ -1895,6 +1991,7 @@ class CaptureWindow(object):
                 return False
         # クリック時点の値を確定（レンダ中にウィジェットを触っても後続ジョブに混ざらない）
         seq_fog = self.seq_fog_var.get()
+        seq_vp = self.seq_viewport_look_var.get()
         seq_fmt = {"PNG 8bit": "png", "JPG 8bit": "jpg",
                    "EXR 16bit (float)": "exr"}.get(self.seq_beauty_fmt_var.get(), "png")
         # Depth のビット深度: 8bit は Beauty と同一ジョブの PP パス（従来）。
@@ -2704,6 +2801,8 @@ class CaptureWindow(object):
             _run_skymatte(True, out)
             return True
 
+        if seq_vp and not only_direct:
+            seq_notes.append("ビューポートのルック: MRQ 近似")
         self.status_var.set("シーケンスレンダ中… (PIE / %d〜%dF @%gfps)"
                             % (cs_eff, ce_eff - 1, float(fps_num) / fps_den))
         self.root.update()
@@ -2732,12 +2831,77 @@ class CaptureWindow(object):
                 # 連番の形式（Beauty / Raw Lighting）。PNG 以外のときは合成・MP4 用の
                 # 内部 PNG も同時出力し、後処理の最後で片方を捨てる
                 image_format=seq_fmt, also_png=(seq_fmt != "png"),
+                # ビューポートのルックは Beauty を出すメインジョブだけ（MRQ 近似）
+                viewport_look=(seq_vp and not only_direct),
                 on_done=_after_main)
         except Exception as e:
             _cleanup_materials()
             self.status_var.set("シーケンスレンダ起動失敗: %s" % e)
             return False
         return True
+
+    def _viewport_grab(self, cam, W, H, path, hidden_actors, on_done):
+        """ビューポートのルック（経路A）: レベルビューポートでカメラを通して W×H を撮る。
+        Slate tick でファイル完成をポーリングし、完了/失敗/タイムアウトのいずれでも
+        ビューポート状態を戻してから on_done(ok, err) を呼ぶ。hidden_actors はマット系
+        出力時のクリーンプレート用（MRQ の Beauty と同じく撮影中だけエディタで隠す）。"""
+        import time
+        hid = []
+        for a in hidden_actors or []:
+            try:
+                if not a.is_temporarily_hidden_in_editor():
+                    a.set_is_temporarily_hidden_in_editor(True)
+                    hid.append(a)
+            except Exception:
+                pass
+
+        def _unhide():
+            for a in hid:
+                try:
+                    a.set_is_temporarily_hidden_in_editor(False)
+                except Exception:
+                    pass
+            hid[:] = []
+
+        state = {"h": None, "g": None, "t0": time.time(), "ended": False}
+
+        def _end(ok, err=None):
+            if state["ended"]:
+                return
+            state["ended"] = True
+            if state["h"] is not None:
+                unreal.unregister_slate_post_tick_callback(state["h"])
+                state["h"] = None
+            if state["g"] is not None:
+                state["g"]["restore"]()
+            _unhide()
+            if not ok:
+                try:
+                    if os.path.isfile(path):
+                        os.remove(path)
+                except Exception:
+                    pass
+            on_done(ok, err)
+
+        try:
+            state["g"] = core.begin_viewport_grab(cam, W, H, path)
+        except Exception as e:
+            _end(False, e)
+            return
+        # チェーン途中の例外でもビューポート/カメラ PP/非表示を残さない
+        self._restore_hooks.append(state["g"]["restore"])
+        self._restore_hooks.append(_unhide)
+
+        def _tick(dt):
+            try:
+                if state["g"]["poll"]():
+                    _end(True)
+                elif time.time() - state["t0"] > _VIEWPORT_GRAB_TIMEOUT:
+                    _end(False, "タイムアウト %.0f 秒" % _VIEWPORT_GRAB_TIMEOUT)
+            except Exception as e:
+                _end(False, e)
+
+        state["h"] = unreal.register_slate_post_tick_callback(_tick)
 
     def _run_ffmpeg_jobs(self, cmds, on_done):
         """ffmpeg を1本ずつ非同期実行し、全完了で on_done(ok)。
@@ -3115,6 +3279,7 @@ class CaptureWindow(object):
                 "mrq_camasp": self.mrq_camasp_var.get(),
                 "fog_off": self.fog_off_var.get(),
                 "exposure_lock": self.exposure_lock_var.get(),
+                "viewport_look": self.viewport_look_var.get(),
                 "vdb_mode": self.vdb_var.get(),
                 "seq_range_mode": self.seq_range_mode.get(),
                 "seq_start": self.seq_start_var.get(),
@@ -3130,6 +3295,7 @@ class CaptureWindow(object):
                 "seq_warm": self.seq_warm_var.get(), "seq_ts": self.seq_ts_var.get(),
                 "seq_fog": self.seq_fog_var.get(),
                 "seq_exposure_lock": self.seq_exposure_lock_var.get(),
+                "seq_viewport_look": self.seq_viewport_look_var.get(),
                 "seq_out": self.seq_out_var.get(),
                 "seq_name_tpl": self.seq_name_tpl_var.get(),
                 "seq_overwrite": self.seq_overwrite_var.get(),
@@ -3272,6 +3438,10 @@ class CaptureWindow(object):
             self.seq_depth_bit_var.set(st["seq_depth_bit"])
         if st.get("seq_beauty_fmt") in ("PNG 8bit", "JPG 8bit", "EXR 16bit (float)"):
             self.seq_beauty_fmt_var.set(st["seq_beauty_fmt"])
+        _setvar(self.viewport_look_var, "viewport_look")
+        _setvar(self.seq_viewport_look_var, "seq_viewport_look")
+        # 読込順に依らずビューポートのルックを優先（Fog/露出固定が同時 ON の設定でも外す）
+        self._sync_viewport_look()
 
     def _collect_settings(self):
         s = core.CaptureSettings()

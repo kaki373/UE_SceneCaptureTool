@@ -80,6 +80,9 @@ Beauty 合成、の順で全パスが揃う。Matte / ObjectID の対象はパ�
 - **anti-aliasing**：SceneCapture 系の Spatial Supersample 倍率（1x/2x/4x）。Beauty は MRQ の TSR+Temporal。
 - **Matte**：ON のとき Beauty から対象を**常に隠す**（クリーンプレート）。隠せば対象の影/AO も自動で消える。
 - **Fog OFF**：Beauty レンダ時に `r.Fog 0` / `r.VolumetricFog 0`。
+- **ビューポートのルック**：Beauty をビューポートの見た目で撮る。画像タブはカメラをパイロットして
+  ビューポートを W×H で撮影（HighResShot）、撮れない時（EXR 等）は MRQ 近似。映像タブは MRQ 近似のみ
+  （高品質 cvar / Game Override なし）。パイロット中でなければカメラの PP ウェイトを一時 0。Fog OFF・露出固定と排他。
 - **MRQ 品質**：Warmup（Lumen/影の収束。**32 以上推奨**。低いと暗くなる）、Temporal サンプル数、EXR。
 
 ## VDB雲（HeterogeneousVolume）のマット / ObjectID

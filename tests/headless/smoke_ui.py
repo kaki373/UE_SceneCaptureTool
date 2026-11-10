@@ -217,6 +217,88 @@ def _roundtrip():
 step("settings save/load round-trip (+corrupt file tolerated)", _roundtrip)
 
 
+def _vp_exclusive():
+    r = {}
+    for tab, vp, fog, exl, fcb, ecb in (
+            ("image", win.viewport_look_var, win.fog_off_var, win.exposure_lock_var,
+             win.fog_off_cb, win.exposure_lock_cb),
+            ("seq", win.seq_viewport_look_var, win.seq_fog_var, win.seq_exposure_lock_var,
+             win.seq_fog_cb, win.seq_exposure_lock_cb)):
+        assert vp.get() is False, tab
+        fog.set(True); exl.set(True)
+        vp.set(True); win.root.update()
+        on = (fog.get(), exl.get(), "disabled" in fcb.state(), "disabled" in ecb.state())
+        assert on == (False, False, True, True), (tab, on)
+        vp.set(False); win.root.update()
+        off = (fog.get(), exl.get(), "disabled" in fcb.state(), "disabled" in ecb.state())
+        # OFF で有効に戻すが値は戻さない
+        assert off == (False, False, False, False), (tab, off)
+        r[tab] = {"on": on, "off": off}
+    # 片方のタブの ON はもう片方に影響しない
+    win.seq_fog_var.set(True)
+    win.viewport_look_var.set(True)
+    assert win.seq_fog_var.get() is True and "disabled" not in win.seq_fog_cb.state()
+    win.viewport_look_var.set(False); win.seq_fog_var.set(False)
+    return r
+
+
+step("ビューポートのルック: exclusive with Fog/露出固定 on both tabs", _vp_exclusive)
+
+
+def _vp_settings():
+    p = win._settings_path()
+    win.viewport_look_var.set(True); win.seq_viewport_look_var.set(True)
+    win._save_ui_state()
+    with open(p, "r", encoding="utf-8") as f:
+        saved = json.load(f)
+    assert saved["viewport_look"] is True and saved["seq_viewport_look"] is True, saved
+    win.viewport_look_var.set(False); win.seq_viewport_look_var.set(False)
+    win._load_ui_state()
+    assert win.viewport_look_var.get() is True and win.seq_viewport_look_var.get() is True
+    # 設定に Fog/露出固定とルックが同時 ON → ルックが勝つ
+    saved.update({"fog_off": True, "exposure_lock": True, "seq_fog": True,
+                  "seq_exposure_lock": True})
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(saved, f)
+    win.viewport_look_var.set(False); win.seq_viewport_look_var.set(False)
+    win._load_ui_state()
+    got = (win.viewport_look_var.get(), win.fog_off_var.get(), win.exposure_lock_var.get(),
+           win.seq_viewport_look_var.get(), win.seq_fog_var.get(),
+           win.seq_exposure_lock_var.get(), "disabled" in win.fog_off_cb.state())
+    assert got == (True, False, False, True, False, False, True), got
+    # 転送: 画像タブのルックを映像タブへ
+    win.seq_viewport_look_var.set(False)
+    win._transfer_from_image_tab()
+    assert win.seq_viewport_look_var.get() is True
+    win.viewport_look_var.set(False)
+    win._transfer_from_image_tab()
+    assert win.seq_viewport_look_var.get() is False and "disabled" not in win.seq_fog_cb.state()
+    os.remove(p)
+    return got
+
+
+step("ビューポートのルック: settings round-trip / loaded Fog loses / transfer", _vp_settings)
+
+
+def _vp_grab_fallback():
+    # コマンドレットにはレベルビューポートが無い → 経路A は同期的に失敗して on_done(False)
+    cam.camera_component.set_editor_property("post_process_blend_weight", 1.0)
+    cube.set_is_temporarily_hidden_in_editor(False)
+    got = []
+    win._restore_hooks = []
+    path = os.path.join(OUTD, "smoke_ui_vp.png")
+    win._viewport_grab(cam, 64, 36, path, [cube], lambda ok, err: got.append((ok, str(err))))
+    w = float(cam.camera_component.get_editor_property("post_process_blend_weight"))
+    hidden = cube.is_temporarily_hidden_in_editor()
+    assert got and got[0][0] is False, got
+    assert w == 1.0 and hidden is False and not os.path.isfile(path), (w, hidden)
+    return got[0]
+
+
+step("ビューポートのルック: viewport grab without viewport -> on_done(False), state restored",
+     _vp_grab_fallback)
+
+
 def _busy():
     win._set_busy(True)
     assert win._is_busy()

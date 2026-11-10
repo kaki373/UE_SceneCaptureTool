@@ -267,6 +267,185 @@ def restore_camera_filmback(camera_actor, sw, sh):
     comp.set_editor_property("filmback", fb)
 
 
+# ----------------------------------------------------------------------------
+# 「ビューポートのルック」: ビューポートで見えている見た目で Beauty を撮る
+# ----------------------------------------------------------------------------
+def _same_actor(a, b):
+    try:
+        return a is not None and b is not None and a.get_path_name() == b.get_path_name()
+    except Exception:
+        return False
+
+
+def viewport_shows_camera_pp(camera_actor):
+    """レベルビューポートがこのカメラをパイロット中（Exact Camera View）なら True。
+    そのときユーザーはカメラ自身のポスプロ込みの見た目を見ている。"""
+    try:
+        les = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
+        return (_same_actor(les.get_pilot_level_actor(), camera_actor)
+                and bool(les.get_exact_camera_view()))
+    except Exception:
+        return False
+
+
+def zero_camera_pp_weights(cameras):
+    """パイロット中でないカメラの post_process_blend_weight を一時 0 にする（ビューポートの
+    見た目にはカメラ自身の露出補正・ビネット等が乗っていないため）。
+    変更した (component, 元の値) のリストを返す（restore_camera_pp_weights で戻す）。"""
+    saved = []
+    for cam in cameras or []:
+        try:
+            if viewport_shows_camera_pp(cam):
+                unreal.log("[SceneCapture] ビューポートのルック: %s はパイロット中のためカメラPPを維持"
+                           % cam.get_actor_label())
+                continue
+            comp = cam.camera_component
+            w = float(comp.get_editor_property("post_process_blend_weight"))
+            if w == 0.0:
+                continue
+            comp.set_editor_property("post_process_blend_weight", 0.0)
+            saved.append((comp, w))
+        except Exception as e:
+            unreal.log_warning("[SceneCapture] カメラPPウェイトを変更できません: %s" % e)
+    return saved
+
+
+def restore_camera_pp_weights(saved):
+    for comp, w in saved or []:
+        try:
+            comp.set_editor_property("post_process_blend_weight", float(w))
+        except Exception as e:
+            unreal.log_warning("[SceneCapture] カメラPPウェイト復元に失敗: %s" % e)
+
+
+def _take_high_res_screenshot(width, height, filename, delay):
+    """AutomationLibrary.take_high_res_screenshot（5.7/5.8 同一シグネチャ:
+    res_x, res_y, filename, camera, mask_enabled, capture_hdr, comparison_tolerance,
+    comparison_notes, delay, force_game_view）。camera=None で呼ぶのは、渡すと完了時に
+    エンジンがアクターロックを外し、ユーザーのパイロットまで解除するため。
+    戻り値は完了判定用のタスク（無い場合は None = HighResShot コマンドで代用）。"""
+    lib = getattr(unreal, "AutomationLibrary", None)
+    fn = getattr(lib, "take_high_res_screenshot", None) if lib else None
+    if fn is not None:
+        try:
+            return fn(int(width), int(height), filename, None, False, False,
+                      unreal.ComparisonTolerance.LOW, "", float(delay), False)
+        except TypeError:
+            return fn(int(width), int(height), filename, delay=float(delay),
+                      force_game_view=False)
+    unreal.SystemLibrary.execute_console_command(
+        None, 'HighResShot %dx%d filename="%s"' % (int(width), int(height), filename))
+    return None
+
+
+def begin_viewport_grab(camera_actor, width, height, filename, delay=0.5):
+    """レベルビューポートでカメラをパイロットし、ゲームビューで width×height の
+    HighResShot を撮り始める（非同期）。返り値の dict:
+      poll()    -> True=ファイル完成 / False=待機中（例外=失敗）
+      restore() -> パイロット・ゲームビュー・Exact Camera View・ビューポート視点・
+                   カメラPPウェイト・アスペクト拘束を元に戻す（冪等）
+    ビューポートが無い（コマンドレット）・別カメラにシネマティックロック中などで
+    パイロットできなければ restore 済みで RuntimeError。"""
+    import capture_mrq
+    les = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
+    ues = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem)
+    prev_pilot = les.get_pilot_level_actor()
+    prev_game = bool(les.editor_get_game_view())
+    prev_exact = bool(les.get_exact_camera_view())
+    keep_pp = viewport_shows_camera_pp(camera_actor)
+    vp_info = None
+    try:
+        r = ues.get_level_viewport_camera_info()
+        if r and len(r) == 2:
+            vp_info = r
+        elif r and len(r) == 3 and r[0]:
+            vp_info = (r[1], r[2])
+    except Exception:
+        vp_info = None
+    st = {"done": False, "pp": [], "asp": None, "piloted": False}
+
+    def restore():
+        if st["done"]:
+            return
+        st["done"] = True
+        restore_camera_pp_weights(st["pp"])
+        if st["asp"] is not None:
+            capture_mrq._restore_cameras_aspect([st["asp"]])
+        try:
+            if st["piloted"]:
+                if st.get("repilot"):
+                    les.pilot_level_actor(prev_pilot)
+                else:
+                    les.eject_pilot_level_actor()
+                    # シネマティックロック中は eject が自分のロックを外さないため直接解除
+                    les.pilot_level_actor(None)
+            les.set_exact_camera_view(prev_exact)
+            les.editor_set_game_view(prev_game)
+            if vp_info is not None and prev_pilot is None:
+                ues.set_level_viewport_camera_info(vp_info[0], vp_info[1])
+        except Exception as e:
+            unreal.log_warning("[SceneCapture] ビューポート状態の復元に失敗: %s" % e)
+
+    try:
+        if not keep_pp:
+            st["pp"] = zero_camera_pp_weights([camera_actor])
+        # 出力アスペクト≠filmback の黒帯を MRQ 側と同じ規則で防ぐ
+        st["asp"] = capture_mrq._fill_aspect_comp(camera_actor, width, height)
+        if not _same_actor(prev_pilot, camera_actor):
+            les.pilot_level_actor(camera_actor)
+            st["piloted"] = True
+            if not _same_actor(les.get_pilot_level_actor(), camera_actor):
+                raise RuntimeError("ビューポートでカメラをパイロットできません"
+                                   "（ビューポート無し / 別カメラにロック中）")
+            # パイロットが効いた＝直前のロックは通常パイロット（シネマティックではない）
+            st["repilot"] = prev_pilot is not None
+        les.set_exact_camera_view(True)
+        les.editor_set_game_view(True)
+        if st["piloted"]:
+            # 視点が飛んだ直後は自動露出・TSR/Lumen の履歴が落ち着いていないので長めに待つ
+            delay = max(float(delay), 2.0)
+        if os.path.isfile(filename):
+            os.remove(filename)
+        st["task"] = _take_high_res_screenshot(width, height, filename, delay)
+    except Exception:
+        restore()
+        raise
+    st["size"] = -1
+
+    def poll():
+        task = st.get("task")
+        if task is not None and not task.is_task_done():
+            return False
+        if not os.path.isfile(filename):
+            return False
+        # 書き込み途中を拾わないよう、サイズが 2 tick 続けて同じになるまで待つ
+        sz = os.path.getsize(filename)
+        if sz <= 0 or sz != st["size"]:
+            st["size"] = sz
+            return False
+        return True
+
+    st["poll"] = poll
+    st["restore"] = restore
+    return st
+
+
+def finish_viewport_grab_file(src_png, dst_path):
+    """HighResShot の PNG を Beauty の最終名・形式へ（α は捨てて RGB。JPG は変換）。"""
+    if _HAS_PIL:
+        from PIL import Image
+        with Image.open(src_png) as im0:
+            im = im0.convert("RGB")
+        if dst_path.lower().endswith(".jpg"):
+            im.save(dst_path, quality=95)
+        else:
+            im.save(dst_path)
+        os.remove(src_png)
+    else:
+        os.replace(src_png, dst_path)
+    return dst_path
+
+
 def get_camera_settings(camera_actor):
     """カメラの Transform / FOV / アスペクト / PostProcess を取得。
     aspect_ratio が未設定(≒0)のカメラは filmback (sensor w/h) から算出する。"""

@@ -595,6 +595,189 @@ def _l1_offset():
 step("L1 start_frame_offset exact at 29.97fps frame 400", _l1_offset)
 
 
+# ===================== ビューポートのルック（経路B: MRQ 近似） =====================
+def _cvar_names(job):
+    cv = job.get_configuration().find_setting_by_class(unreal.MoviePipelineConsoleVariableSetting)
+    return [str(e.get_editor_property("name")) for e in cv.get_editor_property("cvars")]
+
+
+def _settings_names(job):
+    return sorted(type(s).__name__ for s in job.get_configuration().get_all_settings())
+
+
+def _vl_still_job():
+    real = unreal.get_editor_subsystem(unreal.MoviePipelineQueueSubsystem)
+    out = {}
+    hq = set(n for n, _v in mrq._HQ_CVARS)
+    try:
+        for vl in (False, True):
+            fs = _FakeSub(real)
+            mat = core.create_temp_matte_material()
+            mrq._start_render(fs, cam, os.path.join(OUTD, "smoke_mrq_vl"), 640, 360,
+                              False, "png", False, 1, 4, 8, "Smoke", None, None, 0.0,
+                              False, None, matte_material=mat, viewport_look=vl)
+            job = real.get_queue().get_jobs()[0]
+            names = _cvar_names(job)
+            sets = _settings_names(job)
+            out[vl] = {"hq": sorted(hq & set(names)), "custom_depth": "r.CustomDepth" in names,
+                       "motion_blur": "r.MotionBlurQuality" in names,
+                       "game_override": "MoviePipelineGameOverrideSetting" in sets}
+            mrq._KEEP.clear()
+            for j in list(real.get_queue().get_jobs()):
+                real.get_queue().delete_job(j)
+            mrq._delete_temp_sequence()
+            core.delete_temp_matte_material()
+    finally:
+        mrq._KEEP.clear()
+        for j in list(real.get_queue().get_jobs()):
+            real.get_queue().delete_job(j)
+        mrq._delete_temp_sequence()
+        core.delete_temp_matte_material()
+    _ok(out[False]["hq"] and out[False]["game_override"], out)
+    _ok(out[True]["hq"] == [] and not out[True]["game_override"], out)
+    _ok(out[True]["custom_depth"] and out[True]["motion_blur"], out)   # パスに必須の cvar は残す
+    return out
+
+
+step("VL1 render_beauty job: viewport_look drops HQ cvars + GameOverride, keeps r.CustomDepth",
+     _vl_still_job)
+
+
+def _vl_seq_job():
+    real = unreal.get_editor_subsystem(unreal.MoviePipelineQueueSubsystem)
+    hq = set(n for n, _v in mrq._HQ_CVARS)
+    out = {}
+    try:
+        for vl in (False, True):
+            fs = _FakeSub(real)
+            mrq._start_sequence_render(fs, scene_seq, os.path.join(OUTD, "smoke_mrq_vls"), 640, 360,
+                                       "Smoke", "001", True, False, 18, 4, 8, None, None,
+                                       None, None, None, None, None,
+                                       None, "Beauty", False, None, None, viewport_look=vl)
+            job = real.get_queue().get_jobs()[0]
+            out[vl] = {"hq": sorted(hq & set(_cvar_names(job))),
+                       "game_override": "MoviePipelineGameOverrideSetting" in _settings_names(job)}
+            mrq._KEEP.clear()
+            for j in list(real.get_queue().get_jobs()):
+                real.get_queue().delete_job(j)
+    finally:
+        mrq._KEEP.clear()
+        for j in list(real.get_queue().get_jobs()):
+            real.get_queue().delete_job(j)
+    _ok(out[False]["hq"] and out[False]["game_override"], out)
+    _ok(out[True]["hq"] == [] and not out[True]["game_override"], out)
+    return out
+
+
+step("VL2 render_sequence job: viewport_look drops HQ cvars + GameOverride", _vl_seq_job)
+
+
+def _pp_w():
+    return float(cam.camera_component.get_editor_property("post_process_blend_weight"))
+
+
+def _vl_pp_still():
+    cam.camera_component.set_editor_property("post_process_blend_weight", 1.0)
+    seen = {}
+    orig = mrq._start_render
+
+    def fake(sub, cam_, *a, **k):
+        seen["during"] = _pp_w()
+        seen["viewport_look"] = k.get("viewport_look")
+        raise RuntimeError("stop before MRQ")
+    mrq._start_render = fake
+    try:
+        mrq.render_beauty(cam, os.path.join(OUTD, "smoke_mrq_vlpp"), 640, 360, viewport_look=True)
+    except RuntimeError:
+        pass
+    finally:
+        mrq._start_render = orig
+    seen["after_fail"] = _pp_w()
+    # 正常完了側の復元（_on_finished が呼ぶ _restore_saved_scene）
+    saved = core.zero_camera_pp_weights([cam])
+    seen["zeroed"] = _pp_w()
+    mrq._restore_saved_scene({"ppw": saved})
+    seen["after_ok"] = _pp_w()
+    _ok(seen["during"] == 0.0 and seen["viewport_look"] is True, seen)
+    _ok(seen["after_fail"] == 1.0 and seen["zeroed"] == 0.0 and seen["after_ok"] == 1.0, seen)
+    _ok(mrq._KEEP == {}, mrq._KEEP)
+    return seen
+
+
+step("VL3 render_beauty viewport_look: camera PP weight 0 during, restored (fail + ok paths)",
+     _vl_pp_still)
+
+
+def _vl_pp_seq():
+    cam.camera_component.set_editor_property("post_process_blend_weight", 0.7)
+    seen = {}
+    orig = mrq._start_sequence_render
+
+    def fake(*a, **k):
+        seen["during"] = round(_pp_w(), 3)
+        seen["viewport_look"] = k.get("viewport_look")
+        raise RuntimeError("stop before MRQ")
+    mrq._start_sequence_render = fake
+    try:
+        mrq.render_sequence(scene_seq, os.path.join(OUTD, "smoke_mrq_vlpps"), 640, 360,
+                            "Smoke", "001", viewport_look=True)
+    except RuntimeError:
+        pass
+    finally:
+        mrq._start_sequence_render = orig
+    seen["after"] = round(_pp_w(), 3)
+    seen["cut_cams"] = [a.get_actor_label() for a in
+                        mrq._camera_cut_cameras_with_count(scene_seq)[0]]
+    seen["cut_bindings"] = mrq._camera_cut_cameras_with_count(scene_seq)[1]
+    cam.camera_component.set_editor_property("post_process_blend_weight", 1.0)
+    _ok(seen["during"] == 0.0 and seen["after"] == 0.7 and seen["viewport_look"] is True, seen)
+    _ok(seen["cut_cams"] == ["SmokeCam"] and seen["cut_bindings"] == 1, seen)
+    return seen
+
+
+step("VL4 render_sequence viewport_look: camera-cut camera PP weight 0 during, restored",
+     _vl_pp_seq)
+
+
+def _vl_levelvis():
+    seq, full = mrq._create_temp_sequence(cam, level_visibility=True)
+    ext = unreal.MovieSceneSequenceExtensions
+    n_auto = len(ext.find_tracks_by_exact_type(seq, unreal.MovieSceneLevelVisibilityTrack))
+    vis = mrq._editor_level_visibility()
+    tr = mrq._add_level_visibility_track(seq, ["SubA", "SubB"], ["SubC"])
+    secs = [(str(s.get_visibility()), [str(n) for n in s.get_level_names()])
+            for s in tr.get_sections()]
+    none = mrq._add_level_visibility_track(seq, [], [])
+    mrq._delete_temp_sequence()
+    # 捨てプロジェクトの Untitled にはサブレベルが無い → 自動トラックは作らない
+    _ok(vis == ([], []) and n_auto == 0 and none is None, (vis, n_auto, none))
+    _ok(len(secs) == 2 and secs[0][1] == ["SubA", "SubB"] and secs[1][1] == ["SubC"], secs)
+    _ok("VISIBLE" in secs[0][0] and "HIDDEN" in secs[1][0], secs)
+    return {"editor_levels": vis, "sections": secs}
+
+
+step("VL5 level visibility track (names/visibility; none for a level without sublevels)",
+     _vl_levelvis)
+
+
+def _vl_grab_no_viewport():
+    cam.camera_component.set_editor_property("post_process_blend_weight", 1.0)
+    r = {"shows_pp": core.viewport_shows_camera_pp(cam)}
+    try:
+        core.begin_viewport_grab(cam, 64, 36, os.path.join(OUTD, "smoke_vp.png"))
+        r["raised"] = None
+    except Exception as e:
+        r["raised"] = "%s: %s" % (type(e).__name__, e)
+    r["pp_after"] = _pp_w()
+    doc = getattr(getattr(unreal, "AutomationLibrary", None), "take_high_res_screenshot", None)
+    r["thrs_doc"] = (doc.__doc__ or "").strip().splitlines()[0] if doc else None
+    _ok(r["shows_pp"] is False and r["raised"] and r["pp_after"] == 1.0, r)
+    return r
+
+
+step("VL6 begin_viewport_grab without a viewport raises and restores camera PP", _vl_grab_no_viewport)
+
+
 
 def _cleanup():
     for a in (cube, cam, sun):
