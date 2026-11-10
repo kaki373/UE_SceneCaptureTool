@@ -634,12 +634,13 @@ def _vl_still_job():
         mrq._delete_temp_sequence()
         core.delete_temp_matte_material()
     _ok(out[False]["hq"] and out[False]["game_override"], out)
-    _ok(out[True]["hq"] == [] and not out[True]["game_override"], out)
+    # viewport look の GameOverride は品質を上げない設定（中身は VC7）
+    _ok(out[True]["hq"] == [] and out[True]["game_override"], out)
     _ok(out[True]["custom_depth"] and out[True]["motion_blur"], out)   # パスに必須の cvar は残す
     return out
 
 
-step("VL1 render_beauty job: viewport_look drops HQ cvars + GameOverride, keeps r.CustomDepth",
+step("VL1 render_beauty job: viewport_look drops HQ cvars, neutral GameOverride, keeps r.CustomDepth",
      _vl_still_job)
 
 
@@ -665,11 +666,11 @@ def _vl_seq_job():
         for j in list(real.get_queue().get_jobs()):
             real.get_queue().delete_job(j)
     _ok(out[False]["hq"] and out[False]["game_override"], out)
-    _ok(out[True]["hq"] == [] and not out[True]["game_override"], out)
+    _ok(out[True]["hq"] == [] and out[True]["game_override"], out)
     return out
 
 
-step("VL2 render_sequence job: viewport_look drops HQ cvars + GameOverride", _vl_seq_job)
+step("VL2 render_sequence job: viewport_look drops HQ cvars, neutral GameOverride", _vl_seq_job)
 
 
 def _pp_w():
@@ -841,6 +842,110 @@ def _vc_seq_passthrough():
 
 
 step("VC3 render_sequence passes exposure_offset_ev through to the job builder", _vc_seq_passthrough)
+
+
+def _go(job):
+    go = job.get_configuration().find_setting_by_class(unreal.MoviePipelineGameOverrideSetting)
+    if go is None:
+        return None
+    return {k: str(go.get_editor_property(k)) for k in
+            ("cinematic_quality_settings", "texture_streaming", "use_lod_zero",
+             "use_high_quality_shadows", "override_view_distance_scale")}
+
+
+def _vc_game_override():
+    # 置かないと MRQ は Cinematic スカラビリティの一時 GameOverride を足す → viewport look は明示的に OFF で置く
+    real = unreal.get_editor_subsystem(unreal.MoviePipelineQueueSubsystem)
+    out = {}
+    try:
+        for key, vp in (("seq_vp", True), ("seq_hq", False)):
+            fs = _FakeSub(real)
+            mrq._start_sequence_render(fs, scene_seq, os.path.join(OUTD, "smoke_mrq_vc"), 640, 360,
+                                       "Smoke", "001", True, False, 18, 4, 8, None, None,
+                                       None, None, None, None, None,
+                                       None, "Beauty", False, None, None, viewport_look=vp)
+            out[key] = _go(real.get_queue().get_jobs()[0])
+            mrq._KEEP.clear()
+            for j in list(real.get_queue().get_jobs()):
+                real.get_queue().delete_job(j)
+        fs = _FakeSub(real)
+        mrq._start_render(fs, cam, os.path.join(OUTD, "smoke_mrq_vc"), 640, 360,
+                          False, "png", False, 1, 4, 8, "Smoke", None, None, 0.0,
+                          False, None, viewport_look=True)
+        out["still_vp"] = _go(real.get_queue().get_jobs()[0])
+    finally:
+        mrq._KEEP.clear()
+        for j in list(real.get_queue().get_jobs()):
+            real.get_queue().delete_job(j)
+        mrq._delete_temp_sequence()
+    for k in ("seq_vp", "still_vp"):
+        g = out[k]
+        _ok(g and g["cinematic_quality_settings"] == "False" and "NONE" in g["texture_streaming"]
+            and g["use_lod_zero"] == "False" and g["use_high_quality_shadows"] == "False"
+            and g["override_view_distance_scale"] == "False", out)
+    _ok(out["seq_hq"] and out["seq_hq"]["cinematic_quality_settings"] == "True", out)
+    return out
+
+
+step("VC7 viewport look jobs carry a GameOverride with Cinematic scalability OFF (HQ job keeps it ON)",
+     _vc_game_override)
+
+
+def _vc_analytic_exposure():
+    ext = unreal.MovieSceneSequenceExtensions
+    eas = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    r = {}
+    # レベルのカメラ（近似側でウェイト 0＝ビューポートと同じ）→ 0
+    ev, why = mrq.viewport_look_exposure(scene_seq, 0)
+    r["level"] = (ev, why)
+    _ok(ev == 0.0 and "level" in why, r)
+    # スポーナブルのカメラ（ウェイトを 0 にできない）: テンプレートの露出補正 +1.5（w=0.8）、
+    # unbound PPV の露出補正 +0.5 → -0.8×(1.5-0.5) = -0.8EV
+    at = unreal.AssetToolsHelpers.get_asset_tools()
+    p = "/Game/SmokeSeq"
+    if unreal.EditorAssetLibrary.does_asset_exist(p + "/SEQ_SmokeSpawn"):
+        unreal.EditorAssetLibrary.delete_asset(p + "/SEQ_SmokeSpawn")
+    seq = at.create_asset("SEQ_SmokeSpawn", p, unreal.LevelSequence, unreal.LevelSequenceFactoryNew())
+    ppv = eas.spawn_actor_from_class(unreal.PostProcessVolume, unreal.Vector(0, 0, 0))
+    try:
+        ext.set_playback_start(seq, 0)
+        ext.set_playback_end(seq, 24)
+        b = ext.add_spawnable_from_class(seq, unreal.CineCameraActor)
+        tpl = b.get_object_template()
+        cc = tpl.camera_component
+        s = cc.get_editor_property("post_process_settings")
+        s.set_editor_property("override_auto_exposure_bias", True)
+        s.set_editor_property("auto_exposure_bias", 1.5)
+        cc.set_editor_property("post_process_settings", s)
+        cc.set_editor_property("post_process_blend_weight", 0.8)
+        cct = ext.add_track(seq, unreal.MovieSceneCameraCutTrack)
+        sec = cct.add_section()
+        sec.set_range(0, 24)
+        sec.set_camera_binding_id(ext.get_binding_id(seq, b))
+        ppv.set_editor_property("unbound", True)
+        vs = ppv.get_editor_property("settings")
+        vs.set_editor_property("override_auto_exposure_bias", True)
+        vs.set_editor_property("auto_exposure_bias", 0.5)
+        ppv.set_editor_property("settings", vs)
+        ev, why = mrq.viewport_look_exposure(seq, 5)
+        r["spawnable"] = (round(ev, 4), why)
+        _ok(abs(ev + 0.8) < 1e-4 and "spawnable" in why, r)
+        # PPV を消すと基準は PostProcessSettings の既定値
+        eas.destroy_actor(ppv)
+        ppv = None
+        d = float(unreal.PostProcessSettings().get_editor_property("auto_exposure_bias"))
+        ev, why = mrq.viewport_look_exposure(seq, 5)
+        r["no_ppv"] = (round(ev, 4), d)
+        _ok(abs(ev + 0.8 * (1.5 - d)) < 1e-4, r)
+    finally:
+        if ppv is not None:
+            eas.destroy_actor(ppv)
+        unreal.EditorAssetLibrary.delete_asset(p + "/SEQ_SmokeSpawn")
+    return r
+
+
+step("VC8 viewport_look_exposure: level camera -> 0 / spawnable template bias vs PPV -> -w*(cam-base)",
+     _vc_analytic_exposure)
 
 
 

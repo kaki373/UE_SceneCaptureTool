@@ -292,14 +292,131 @@ def _set_game_overrides(cfg):
     _set_texture_streaming_full(go)
 
 
+def _set_viewport_look_overrides(cfg):
+    """ビューポートのルック: GameOverride を明示的に「何も上げない」設定で置く。
+    MRQ は設定に GameOverride が無いと既定値（Cinematic スカラビリティ・テクスチャ
+    ストリーミング無効・LOD0・高品質影…）の一時設定を自動で足すため、置かないと
+    エディタより高品質で描かれる（森 047 実測: sg.* 3→4 で r.VolumetricFog.GridPixelSize
+    8→4・HistoryMissSupersampleCount 4→16、光の筋がビューポートより細く鋭くなる）。"""
+    go = cfg.find_or_add_setting_by_class(unreal.MoviePipelineGameOverrideSetting)
+    for k, v in (("cinematic_quality_settings", False),
+                 ("texture_streaming", unreal.MoviePipelineTextureStreamingMethod.NONE),
+                 ("use_lod_zero", False), ("disable_hlods", False),
+                 ("use_high_quality_shadows", False), ("override_view_distance_scale", False),
+                 ("override_grass_cull_distance_scale", False),
+                 ("override_virtual_texture_feedback_factor", False)):
+        try:
+            go.set_editor_property(k, v)
+        except Exception as e:
+            _warn("viewport look: GameOverride.%s を設定できません: %s" % (k, e))
+
+
 def _viewport_look_pp(cameras, skipped=0):
     """ビューポートのルック（MRQ 近似）: パイロット中でないカメラのポスプロウェイトを
     一時 0 にする。エディタワールドから変えられないカメラ（スポーナブル等）は数だけ記録。"""
     saved = _core.zero_camera_pp_weights(cameras)
-    _log("viewport look (MRQ 近似): HQ cvar / GameOverride なし・カメラPP 0 にした %d 台%s"
+    _log("viewport look (MRQ 近似): HQ cvar なし・スカラビリティはエディタのまま・カメラPP 0 にした %d 台%s"
          % (len(saved), (" / 解決できず変更しないカメラ %d 台（スポーナブル等）" % skipped)
             if skipped else ""))
     return saved
+
+
+def _cut_section_at(level_sequence, frame):
+    """frame を含むカメラカットセクション（無ければ開始の最も早いもの）。"""
+    ext = unreal.MovieSceneSequenceExtensions
+    secs = []
+    for tr in (ext.find_tracks_by_exact_type(level_sequence, unreal.MovieSceneCameraCutTrack)
+               or []):
+        secs += list(tr.get_sections())
+    if not secs:
+        return None
+
+    def _start(s):
+        return s.get_start_frame() if s.has_start_frame() else -(2 ** 31)
+    for s in secs:
+        if (_start(s) <= frame
+                and (not s.has_end_frame() or frame < s.get_end_frame())):
+            return s
+    return min(secs, key=_start)
+
+
+def viewport_look_exposure(level_sequence, frame, world=None):
+    """ビューポートのルック（映像・MRQ 近似）の露出補正をレベルの値から決める（試し撮りなし）。
+    返り値 (EV, 根拠の1行)。ビューポートとレンダはどちらも同じ PPV を見るので、差が出るのは
+    カメラのポスプロだけ: レベルのカメラは近似側でウェイト 0（ビューポートと同じ）なので 0、
+    パイロット中のカメラは両方に乗るので 0、ウェイトを 0 にできないスポーナブルは
+    テンプレートの露出補正ぶんを打ち消す（core.viewport_look_exposure_offset）。
+    ⚠ PPV は unbound のものと、カメラ位置を含む有界のものだけを priority 順に合成する
+    （スポーナブルは位置が取れないので unbound のみ）。ブレンド半径の途中は扱わない。"""
+    world = world or _editor_world()
+    ext = unreal.MovieSceneSequenceExtensions
+    sec = _cut_section_at(level_sequence, frame)
+    if sec is None:
+        return 0.0, "カメラカット無し → 0EV"
+    guid = sec.get_camera_binding_id().get_editor_property("guid").export_text()
+    binding = next((b for b in ext.get_bindings(level_sequence)
+                    if b.get_id().export_text() == guid), None)
+    cam = None
+    if binding is not None:
+        cam = next((o for o in ext.locate_bound_objects(level_sequence, binding, world)
+                    if isinstance(o, unreal.CameraActor)), None)
+    comp = None
+    kind = "level"
+    if cam is not None:
+        comp = cam.camera_component
+        in_render = _core.viewport_shows_camera_pp(cam)    # 近似は非パイロットのカメラを 0 にする
+        in_view = in_render
+        label = cam.get_actor_label()
+    else:
+        kind = "spawnable"
+        label = str(binding.get_display_name()) if binding is not None else "?"
+        try:
+            # テンプレートの get_components_by_class は空を返す（5.7 実測）→ camera_component を直接読む
+            tpl = binding.get_object_template()
+            comp = tpl.camera_component if isinstance(tpl, unreal.CameraActor) else None
+        except Exception as e:
+            _warn("viewport look 露出: スポーナブル %s のテンプレートを読めません: %s" % (label, e))
+        in_render, in_view = True, False
+    if comp is None:
+        return 0.0, "カメラ %s の設定を読めない → 0EV" % label
+    s = comp.get_editor_property("post_process_settings")
+    w = float(comp.get_editor_property("post_process_blend_weight"))
+    ov = bool(s.get_editor_property("override_auto_exposure_bias"))
+    cam_bias = float(s.get_editor_property("auto_exposure_bias"))
+    loc = cam.get_actor_location() if cam is not None else None
+    vols, names = [], []
+    for v in unreal.GameplayStatics.get_all_actors_of_class(world, unreal.PostProcessVolume) or []:
+        try:
+            if not v.get_editor_property("enabled"):
+                continue
+            if not v.get_editor_property("unbound"):
+                if loc is None:
+                    continue
+                hit = v.encompasses_point(loc, 0.0)
+                if not (hit[0] if isinstance(hit, tuple) else hit):
+                    continue
+            vs = v.get_editor_property("settings")
+            vols.append((float(v.get_editor_property("priority")),
+                         float(v.get_editor_property("blend_weight")),
+                         bool(vs.get_editor_property("override_auto_exposure_bias")),
+                         float(vs.get_editor_property("auto_exposure_bias"))))
+            names.append("%s(bias %s%+.2f w%.2f)" % (v.get_actor_label(),
+                                                    "" if vols[-1][2] else "既定/",
+                                                    vols[-1][3], vols[-1][1]))
+        except Exception as e:
+            _warn("viewport look 露出: PPV を読めません: %s" % e)
+    base = _core.blend_exposure_bias(
+        unreal.PostProcessSettings().get_editor_property("auto_exposure_bias"), vols)
+    ev = _core.viewport_look_exposure_offset(base, ov, cam_bias, w, in_render, in_view)
+    other = [k for k in ("auto_exposure_method", "auto_exposure_apply_physical_camera_exposure",
+                         "camera_iso", "camera_shutter_speed", "depth_of_field_fstop")
+             if kind == "spawnable" and s.get_editor_property("override_" + k)]
+    info = ("F%d カメラ %s(%s・PP w%.2f・露出補正%s・レンダ%s/ビューポート%s) / PPV %s → 基準 %+.2f / %+.2fEV%s"
+            % (frame, label, kind, w, ("%+.2f" % cam_bias) if ov else "上書きなし",
+               "有" if in_render else "無", "有" if in_view else "無",
+               ", ".join(names) or "なし", base, ev,
+               (" ⚠ カメラが %s も上書き（補正していない）" % "/".join(other)) if other else ""))
+    return ev, info
 
 
 def _editor_level_visibility(world=None):
@@ -551,8 +668,8 @@ def render_beauty(camera_actor, output_dir, width, height,
                   backing_actors=None, backing_white=False, sky_matte=False,
                   pp_materials_off=False, viewport_look=False):
     """対象カメラを MRQ で Beauty レンダリング（非同期）。executor を返す。
-    viewport_look=True は「ビューポートのルック」の MRQ 近似: _HQ_CVARS と
-    GameOverride を使わず、パイロット中でなければカメラのポスプロウェイトを 0 にし、
+    viewport_look=True は「ビューポートのルック」の MRQ 近似: _HQ_CVARS を使わず
+    GameOverride は品質を上げない設定にし（エディタのスカラビリティのまま）、パイロット中でなければカメラのポスプロウェイトを 0 にし、
     一時シーケンスのレベル可視性トラックでサブレベル表示をエディタに合わせる。
     cloud_visible=True（要 cloud_matte_actors）は可視雲モード: 何も隠さず PIE 側で
     全ジオメトリを白発光材へ差し替え、EXR の RGB=W(=T×素板レベル)・α=全投影雲αを
@@ -765,7 +882,9 @@ def _start_render(sub, camera_actor, output_dir, width, height,
         camset.set_editor_property("overscan_percentage", float(overscan))
         _log("overscan = %.1f%%" % (float(overscan) * 100.0))
 
-    if not viewport_look:
+    if viewport_look:
+        _set_viewport_look_overrides(cfg)
+    else:
         _set_game_overrides(cfg)
 
     pairs = _job_cvars(viewport_look) + [("r.MotionBlurQuality", 0)]   # 静止画はブラー無し
@@ -1951,7 +2070,9 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
     except Exception as e:
         _warn("AA を TSR に設定できません（エンジン既定の AA で続行）: %s" % e)
 
-    if not viewport_look:
+    if viewport_look:
+        _set_viewport_look_overrides(cfg)
+    else:
         _set_game_overrides(cfg)
 
     # モーションブラーは切らない（切ると 24fps でストロボ状の動きになり、

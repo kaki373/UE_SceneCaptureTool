@@ -47,41 +47,21 @@ _EXPOSURE_LOCK_TIP = ("自動露出(Eye Adaptation)をレンダ中だけ切り�
 
 # 「ビューポートのルック」: エディタのビューポートで見えている見た目（フォグ/露出/ポスプロ）で撮る
 _VIEWPORT_LOOK_TIP = ("ビューポートで見えているルック（フォグ/露出/ポスプロ）で Beauty を撮る。"
-                      "カメラをパイロットしてビューポートを指定解像度で撮影し、他の素材は従来どおり MRQ。"
-                      "撮れない時（EXR 形式など）は MRQ 近似（高品質 cvar / Game Override なし）。"
+                      "ビューポートがこのカメラをパイロット中なら、そのビューポートを指定解像度で撮影"
+                      "（撮影中はエディタを前面に）。パイロットしていない時・EXR 形式は MRQ 近似"
+                      "（高品質 cvar なし・スカラビリティはエディタのまま）。他の素材は従来どおり MRQ。"
                       "パイロット中でなければカメラ自身のポスプロ（露出補正・ビネット）は外す。"
                       "Fog/グローなし・露出固定とは排他（ON の間は無効）")
 _SEQ_VIEWPORT_LOOK_TIP = ("ビューポートの見た目に近づけて Beauty を撮る MRQ 近似（完全一致ではない）。"
-                          "高品質 cvar / Game Override を使わず、パイロット中でないカメラの"
-                          "ポスプロ（露出補正・ビネット）を外す。"
-                          "Beauty を出すときは先頭フレームをビューポートで撮って同じフレームを"
-                          "MRQ で試し撮りし、明るさの差（EV）を自動で補正してからレンダする"
-                          "（参照画像 _ViewportRef_ を出力に残す。フォグ等の露出以外の差は残る）。"
+                          "高品質 cvar を使わずスカラビリティはエディタのまま、パイロット中でないカメラの"
+                          "ポスプロ（露出補正・ビネット）を外す。外せないカメラ（スポーナブル）の露出補正は"
+                          "レベルの値から求めて打ち消す（試し撮りなし）。"
                           "他の素材は従来どおり。"
                           "Fog/グローなし・露出固定とは排他（ON の間は無効）")
 # ビューポート撮影（HighResShot）の完了待ちの上限（秒）。シェーダ/ストリーミング待ちを含む
 _VIEWPORT_GRAB_TIMEOUT = 60.0
-# 映像タブの露出合わせ（ビューポート参照/MRQ 試し撮り）の幅。露出の比較には十分
-_VPCAL_WIDTH = 640
-# 試し撮りの最大本数（1 本目=補正なし、以降は割線法で詰める）と打ち切りの残差 [EV]
-_VPCAL_PROBES = 3
-_VPCAL_TOL = 0.05
-_VPCAL_REF_TMP = "_vpcal_ref_tmp.png"
-_VPCAL_PROBE_DIR = "_vpcal_probe"
 # 静止画のビューポート撮影の一時名（タイムアウト後に遅れて書かれると残るので次回開始時に消す）
 _VPLOOK_TMP = "_vplook_tmp.png"
-
-
-def _vpcal_cleanup(folder):
-    """露出合わせの一時物（参照撮影の一時 PNG・試し撮りフォルダ）を消す。"""
-    import shutil
-    try:
-        p = os.path.join(folder, _VPCAL_REF_TMP)
-        if os.path.isfile(p):
-            os.remove(p)
-    except OSError:
-        pass
-    shutil.rmtree(os.path.join(folder, _VPCAL_PROBE_DIR), ignore_errors=True)
 
 
 def _apply_exposure_lock(on):
@@ -1218,6 +1198,13 @@ class CaptureWindow(object):
         # 最初から MRQ 近似（経路B）。撮影結果は一時名で受け、チェーン完了時に Beauty 名へ
         vp_try = vp_look and keep_beauty0 and (
             img_fmt == "png" or (img_fmt == "jpg" and core._HAS_PIL))
+        # ビューポート撮影が見た目どおりなのは、ビューポートがすでにこのカメラを見続けている時だけ。
+        # その場でパイロットして数秒で撮ると、ボリュメトリックフォグ/Lumen の履歴が育っておらず
+        # 灰色で光の筋の無い画になる（森 047 実測: パイロット2秒後 vs 見続けた後で −0.6EV・差 11.6/255）。
+        # パイロットしていなければ MRQ 近似で撮る
+        if vp_try and not core.viewport_pilots(cam):
+            vp_try = False
+            skip_notes.append("ビューポートのルック: ビューポートがこのカメラをパイロットしていないため MRQ 近似で撮影")
         vp = {"ok": False, "tmp": os.path.join(out, _VPLOOK_TMP)}
         try:
             # 前回の撮影がタイムアウト後に書いた一時ファイルの残り
@@ -1225,7 +1212,8 @@ class CaptureWindow(object):
                 os.remove(vp["tmp"])
         except OSError:
             pass
-        if vp_look and keep_beauty0 and not vp_try:
+        if vp_look and keep_beauty0 and not (img_fmt == "png"
+                                             or (img_fmt == "jpg" and core._HAS_PIL)):
             skip_notes.append("ビューポートのルック: %s は MRQ 近似で撮影" % img_fmt.upper())
 
         def _place_vp_beauty():
@@ -2260,8 +2248,6 @@ class CaptureWindow(object):
             self._run_restore_hooks()
             _apply_exposure_lock(False)
             self._set_busy(False)
-            # 露出合わせの一時物（タイムアウト後に遅れて書かれた参照撮影など）は成果物に混ぜない
-            _vpcal_cleanup(out)
             # 成功時: 作業フォルダに残った成果物（素材サブフォルダ/MP4/JSON）を
             # final_out へ移し、作業フォルダごと削除。失敗時は診断用に残す
             if ok:
@@ -2874,171 +2860,25 @@ class CaptureWindow(object):
                 exposure_offset_ev=exposure_ev,
                 on_done=_after_main)
 
-        if not (seq_vp and not only_direct and (_need("beauty") or _need("mfront"))):
+        exposure_ev = None
+        if seq_vp and not only_direct and (_need("beauty") or _need("mfront")):
+            # ビューポートのルック: 露出の差はレベル/カメラの値から決める（試し撮りなし）
             try:
-                _launch_main()
+                exposure_ev, why = capture_mrq.viewport_look_exposure(seq, cs_eff)
+                unreal.log("[SceneCapture] ビューポートのルック 露出: %s" % why)
+                if exposure_ev:
+                    seq_notes.append("ビューポートのルック: 露出 %+.2fEV 補正（カメラの露出補正の打ち消し）"
+                                     % exposure_ev)
             except Exception as e:
-                _cleanup_materials()
-                self.status_var.set("シーケンスレンダ起動失敗: %s" % e)
-                return False
-            return True
-
-        # ビューポートのルック: 先頭フレームでビューポートと MRQ 試し撮りの露出差を測り、
-        # メインジョブへ EV オフセットとして足す。どこで失敗してもメインジョブは補正なしで出す
-        def _cal_done(r, why):
-            ev = None
-            if r is None:
-                seq_notes.append("ビューポートのルック: 露出合わせをスキップ（%s）" % why)
-            else:
-                ev = r["ev"] or None
-                clamp = (" / 測定 %+.2fEV を制限" % r["raw_ev"]
-                         if abs(r["raw_ev"]) > abs(r["ev"]) + 1e-6 and r["ev"] else "")
-                seq_notes.append(
-                    ("ビューポートのルック: 露出 %+.2fEV 補正%s（補正後の差 平均 %.1f/255）"
-                     % (r["ev"], clamp, r["resid"])) if ev else
-                    ("ビューポートのルック: 露出差 %+.2fEV は誤差内で補正なし（差 平均 %.1f/255）"
-                     % (r["raw_ev"], r["resid"])))
-            try:
-                _launch_main(ev)
-            except Exception as e:
-                seq_notes.append("起動失敗: %s" % e)
-                _final(False, out)
-
-        # メインジョブで Beauty に写らないもの（Matte の前の対象は main pass 外）を試し撮りでも隠す
-        cal_hidden = list(main_hidden or []) + (list(matte_prims) if matte_mat is not None
-                                                else [])
-        self._seq_vp_calibrate(seq, cs_eff, t_user, W, H, ts, warm, seq_fog, cal_hidden,
-                               out, name_body, take_str, _cal_done)
-        return True
-
-    def _seq_vp_calibrate(self, seq, frame, t_user, W, H, ts, warm, fog, hidden,
-                          out, name_body, take_str, on_done):
-        """映像タブのビューポートのルック: フレーム frame をカメラカットのカメラで
-        ビューポート撮影（参照。<名前>_ViewportRef_<テイク>.png として残す）し、同じ
-        フレームをメインと同じ TS/ウォームアップの MRQ 近似で縮小レンダ（試し撮り。
-        スポーナブルのカメラも効くようシーケンス自身を1フレームだけレンダ）して
-        露出差を測る。結果は on_done(r, None)（r は core.exposure_offset_ev の dict）、
-        失敗は on_done(None, 理由)。プレイヘッドは t_user へ戻す（復元フックにも登録）。"""
-        import shutil
-        import capture_mrq
-
-        def _restore_time():
-            if t_user is not None:
-                try:
-                    unreal.LevelSequenceEditorBlueprintLibrary.set_current_time(int(t_user))
-                except Exception:
-                    pass
-
-        self._restore_hooks.append(_restore_time)
-        ended = {"v": False}
-
-        def _end(r, why=None):
-            if ended["v"]:
-                return
-            ended["v"] = True
-            _restore_time()
-            shutil.rmtree(os.path.join(out, _VPCAL_PROBE_DIR), ignore_errors=True)
-            if r is None:
-                unreal.log_warning("[SceneCapture] ビューポートのルック: 露出合わせをスキップ: %s" % why)
-            on_done(r, why)
-
-        if not (core._HAS_NUMPY and core._HAS_PIL):
-            _end(None, "numpy/Pillow が無い")
-            return
-        cw = min(int(W), _VPCAL_WIDTH)
-        ch = max(16, int(round(cw * float(H) / max(1, int(W)))))
-        ref_tmp = os.path.join(out, _VPCAL_REF_TMP)
-        ref_path = os.path.join(out, "%s_ViewportRef_%s.png" % (name_body, take_str))
-        probe_dir = os.path.join(out, _VPCAL_PROBE_DIR)
+                exposure_ev = None
+                unreal.log_warning("[SceneCapture] ビューポートのルック: 露出の判定に失敗（補正なし）: %s" % e)
         try:
-            cam = self._sequence_camera_at(seq, frame)
+            _launch_main(exposure_ev or None)
         except Exception as e:
-            cam = None
-            unreal.log_warning("[SceneCapture] 露出合わせ: カメラ解決失敗: %s" % e)
-        if cam is None:
-            _end(None, "F%d のカメラを特定できない" % frame)
-            return
-
-        def _probe(ev, then):
-            """F frame を MRQ 近似（+ev）で試し撮りし、ref との比較結果で then(r) を呼ぶ。"""
-            sub = os.path.join(probe_dir, "ev%+.2f" % (ev or 0.0))
-
-            def _done(ok, od):
-                try:
-                    pngs = sorted(f for f in os.listdir(sub)
-                                  if f.lower().endswith(".png")) if os.path.isdir(sub) else []
-                    if not (ok and pngs):
-                        _end(None, "MRQ 試し撮りに失敗")
-                        return
-                    r = core.estimate_exposure_offset_files(ref_path,
-                                                            os.path.join(sub, pngs[0]))
-                except Exception as e:
-                    _end(None, "比較に失敗: %s" % e)
-                    return
-                if r is None:
-                    _end(None, "比較できる中間調が少ない")
-                    return
-                unreal.log("[SceneCapture] 露出合わせ: 試し撮り %+.2fEV に対する差 %+.3fEV"
-                           "（中間調 %d 画素・差 平均 %.1f/255）"
-                           % (ev or 0.0, r["raw_ev"], r["n"], r["resid"]))
-                then(r)
-
-            self.status_var.set("ビューポートのルック: 露出合わせの MRQ 試し撮り中… (F%d %d×%d%s)"
-                                % (frame, cw, ch, (" %+.2fEV" % ev) if ev else ""))
-            self.root.update()
-            try:
-                capture_mrq.render_sequence(
-                    seq, sub, cw, ch, name_body, take_str,
-                    do_png=True, do_mp4=False,
-                    temporal_samples=ts, warmup=warm,
-                    custom_start=frame, custom_end=frame + 1,
-                    hidden_actors=hidden or None, fog_off=fog,
-                    beauty_label="VpCalProbe", viewport_look=True,
-                    exposure_offset_ev=ev, on_done=_done)
-            except Exception as e:
-                _end(None, "MRQ 試し撮りを開始できない: %s" % e)
-
-        # 表示リニアの比はトーンカーブで圧縮/伸長される（実測: シーン露出 +2EV が明るい画では
-        # +1.06EV に見える）ので、測定値を当てて試し撮りし直し、割線法で詰める。
-        # 試し撮りは最大 _VPCAL_PROBES 本（残差 _VPCAL_TOL 以内で打ち切り）
-        hist = []          # (当てた EV, 測定差 raw_ev)
-
-        def _measured(x, r):
-            hist.append((x, r["raw_ev"]))
-            if len(hist) == 1:
-                if not r["ev"] or r["ev"] != r["raw_ev"]:
-                    # 誤差内 → 補正なし / 制限に当たるほどの差は詰めても合わない
-                    _end(r)
-                    return
-                nxt, raw = r["ev"], r["raw_ev"]
-            else:
-                if abs(r["raw_ev"]) <= _VPCAL_TOL:
-                    _end({"ev": x, "raw_ev": x, "n": r["n"], "resid": r["resid"]})
-                    return
-                (x0, m0), (x1, m1) = hist[-2], hist[-1]
-                nxt, raw = core.refine_exposure_ev(x0, m0, x1, m1)
-            if len(hist) >= _VPCAL_PROBES:
-                # 最後の外挿値は試し撮りで確かめずに使う。resid は最後の試し撮りの差
-                # （露出以外＝フォグ等の差の目安）
-                _end({"ev": nxt, "raw_ev": raw, "n": r["n"], "resid": r["resid"]})
-                return
-            _probe(nxt, lambda r2: _measured(nxt, r2))
-
-        def _grab_done(ok, err):
-            _restore_time()
-            if not ok:
-                _end(None, "ビューポート撮影に失敗: %s" % err)
-                return
-            try:
-                core.finish_viewport_grab_file(ref_tmp, ref_path)
-            except Exception as e:
-                _end(None, "参照画像の保存に失敗: %s" % e)
-                return
-            _probe(None, lambda r: _measured(0.0, r))
-
-        self.status_var.set("ビューポートのルック: 露出合わせのビューポート撮影中… (F%d)" % frame)
-        self.root.update()
-        self._viewport_grab(cam, cw, ch, ref_tmp, hidden, _grab_done)
+            _cleanup_materials()
+            self.status_var.set("シーケンスレンダ起動失敗: %s" % e)
+            return False
+        return True
 
     def _viewport_grab(self, cam, W, H, path, hidden_actors, on_done):
         """ビューポートのルック（経路A）: レベルビューポートでカメラを通して W×H を撮る。

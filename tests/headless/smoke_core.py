@@ -626,63 +626,32 @@ def _cut_detect():
 step("N2 detect_cut_number from 01_047_Forest/LV_047_* sublevels", _cut_detect)
 
 
-def _ev_estimator():
-    import numpy as np
-    from PIL import Image
-    rng = np.random.default_rng(7)
-
-    def enc(lin):
-        return np.round(core._srgb_encode(lin) * 255.0).astype(np.uint8)
-
-    # シーンリニアの中間調 + 白飛び/黒つぶれ領域（推定から除外されるべき）
-    lin = rng.uniform(0.02, 0.25, (120, 160, 3))
-    lin[:20] = 1.0
-    lin[-20:] = 0.0
+def _vp_exposure_math():
     r = {}
-    e = core.exposure_offset_ev(enc(lin * 2 ** 1.5), enc(lin))
-    assert e is not None and abs(e["ev"] - 1.5) < 0.15, e
-    r["+1.5"] = round(e["ev"], 3)
-    e2 = core.exposure_offset_ev(enc(lin), enc(lin * 2 ** 1.5))
-    assert abs(e2["ev"] + 1.5) < 0.15, e2
-    r["-1.5"] = round(e2["ev"], 3)
-    bright = rng.uniform(0.3, 0.9, (120, 160, 3))
-    e3 = core.exposure_offset_ev(enc(bright * 2 ** -5), enc(bright))
-    assert e3["ev"] == -4.0 and e3["raw_ev"] < -4.5, e3      # ±4EV に制限
-    r["clamp"] = (e3["ev"], round(e3["raw_ev"], 2))
-    e4 = core.exposure_offset_ev(enc(lin * 2 ** 0.05), enc(lin))
-    assert e4["ev"] == 0.0 and 0.0 < e4["raw_ev"] < 0.1, e4  # 誤差内は 0
-    r["tiny"] = (e4["ev"], round(e4["raw_ev"], 3))
-    assert core.exposure_offset_ev(np.zeros((50, 50, 3), np.uint8),
-                                   np.zeros((50, 50, 3), np.uint8)) is None
-    # 補正後の差: 露出だけの差なら小さく、露出以外の差（片側だけ霞）が混じると大きい
-    hazy = np.clip(lin * 2 ** 1.5 * 0.6 + 0.08, 0, 1)
-    e5 = core.exposure_offset_ev(enc(hazy), enc(lin))
-    assert e["resid"] < 3.0 and e5["resid"] > e["resid"] + 5.0, (e, e5)
-    r["resid"] = (round(e["resid"], 2), round(e5["resid"], 2))
-    # ファイル版: probe は ref のサイズへ合わせて比較
-    d = os.path.join(OUTD, "smoke_ev")
-    os.makedirs(d, exist_ok=True)
-    Image.fromarray(enc(lin * 2 ** 1.5)).save(os.path.join(d, "ref.png"))
-    Image.fromarray(enc(lin)).resize((320, 240), Image.NEAREST).save(os.path.join(d, "probe.png"))
-    e6 = core.estimate_exposure_offset_files(os.path.join(d, "ref.png"), os.path.join(d, "probe.png"))
-    assert abs(e6["ev"] - 1.5) < 0.15, e6
-    r["files"] = round(e6["ev"], 3)
-    # 割線法: 表示上の差 = 0.5×シーン差（トーンカーブで圧縮）→ 真の +2EV を復元
-    ev, raw = core.refine_exposure_ev(0.0, 1.0, 1.0, 0.5)
-    assert abs(ev - 2.0) < 1e-9 and abs(raw - 2.0) < 1e-9, (ev, raw)
-    ev, raw = core.refine_exposure_ev(0.0, -3.0, -3.0, 1.5)          # 傾き 1.5 → -2EV
-    assert abs(ev + 2.0) < 1e-9, (ev, raw)
-    ev, raw = core.refine_exposure_ev(0.0, 1.0, 1.0, 1.0)            # 傾き 0（範囲外）→ ev1+m1
-    assert ev == 2.0 and raw == 2.0, (ev, raw)
-    ev, raw = core.refine_exposure_ev(0.0, 3.0, 3.0, 2.0)            # 傾き 1/3 → 9EV は ±4 に制限
-    assert ev == 4.0 and abs(raw - 9.0) < 1e-9, (ev, raw)
-    ev, raw = core.refine_exposure_ev(1.0, 0.5, 1.5, 0.3)      # 2 回目以降（x0≠0）: 傾き 0.4 → 2.25EV
-    assert abs(ev - 2.25) < 1e-9, (ev, raw)
-    r["refine"] = "ok"
+    # PPV の露出補正の合成: priority の低い順に lerp、上書きしていない物は無視
+    b = core.blend_exposure_bias(1.0, [(0, 1.0, True, 2.0)])
+    assert abs(b - 2.0) < 1e-9, b
+    b = core.blend_exposure_bias(1.0, [(5, 0.5, True, 3.0), (0, 1.0, True, 2.0), (9, 1.0, False, -4.0)])
+    assert abs(b - 2.5) < 1e-9, b                 # 2.0 → lerp(2.0, 3.0, 0.5)
+    assert core.blend_exposure_bias(1.0, []) == 1.0
+    r["blend"] = b
+    f = core.viewport_look_exposure_offset
+    # レベルのカメラ（近似でウェイト 0）: レンダにもビューポートにも乗らない → 0
+    assert f(2.0, True, 3.5, 1.0, False, False) == 0.0
+    # パイロット中: 両方に乗る → 0
+    assert f(2.0, True, 3.5, 1.0, True, True) == 0.0
+    # スポーナブル: レンダにだけ乗る → -w×(cam-base)
+    assert abs(f(2.0, True, 3.5, 0.8, True, False) + 1.2) < 1e-9
+    # カメラが露出補正を上書きしていない → 0
+    assert f(2.0, False, 3.5, 1.0, True, False) == 0.0
+    # ウェイトは 0..1 にクランプ
+    assert abs(f(0.0, True, 1.0, 2.0, True, False) + 1.0) < 1e-9
+    r["spawnable"] = f(2.0, True, 3.5, 0.8, True, False)
     return r
 
 
-step("VC1 exposure_offset_ev: +1.5EV recovered / clamp ±4 / tiny -> 0 / resid / files", _ev_estimator)
+step("VC6 viewport look exposure math: PPV bias blend / -w*(cam-base) only when PP is in render but not viewport",
+     _vp_exposure_math)
 
 
 step("cleanup", _cleanup)
