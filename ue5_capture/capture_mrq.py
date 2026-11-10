@@ -158,8 +158,29 @@ def _clear_sequence(seq):
         b.remove()
 
 
+def _mrq_left_expansion_frames(temporal_samples, engine_warmup, render_warmup, handle_frames=0):
+    """MRQ がショットを前へ広げるフレーム数（UMoviePipeline::ExpandShot の LeftDeltaFrames と同じ式:
+    ハンドル + (TS>1 なら 1) + エンジンウォームアップ（レンダウォームアップがあれば最低 1））。
+    一時シーケンスはカメラカット=出力範囲なのでカメラカットのウォームアップ範囲が [0,0] の
+    退化範囲になり「空でない」扱い→ウォームアップ分も足される（5.8 ソースと森 047 の PIE 実測で確認）。"""
+    w = max(int(engine_warmup), 1 if int(render_warmup) > 0 else 0)
+    return int(handle_frames) + (1 if int(temporal_samples) > 1 else 0) + w
+
+
+def _expand_shifts_frozen_subsection(version=None):
+    """MRQ の前方拡張が再生速度 0 のサブセクションの内側時刻までずらすか（エンジン 5.8 以降）。
+    実測（同じ使い捨てプロジェクト・実 MRQ 静止画・PIE カメラ追跡）: 5.7.4 は補正なしでフレーム F、
+    5.8.2 は補正なしで F-L（補正ありで F）。5.7 に補正を入れると F+L になる。"""
+    v = version or unreal.SystemLibrary.get_engine_version()
+    try:
+        major, minor = (int(x) for x in v.split("-")[0].split(".")[:2])
+    except Exception:
+        return True
+    return (major, minor) >= (5, 8)
+
+
 def _create_temp_sequence(camera_actor, fps=24, scene_sequence=None, scene_frame=None,
-                          level_visibility=False):
+                          level_visibility=False, warmup_frames=0):
     """対象カメラを 1 フレームのカメラカットにした一時 LevelSequence を作成して返す。
 
     scene_sequence / scene_frame を渡すと、そのシーケンスをサブシーケンスとして
@@ -170,7 +191,9 @@ def _create_temp_sequence(camera_actor, fps=24, scene_sequence=None, scene_frame
     カメラカットはこの一時シーケンス（ルート）側のみ＝ツールで選んだカメラが使われる
     （ルートのカメラカットはサブシーケンス内のカメラカットより優先される）。
     level_visibility=True でレベル可視性トラックを足し、サブレベルの表示をエディタの
-    現在の表示に合わせる（ビューポートのルック）。"""
+    現在の表示に合わせる（ビューポートのルック）。
+    warmup_frames は MRQ がショットを前へ広げるフレーム数（_mrq_left_expansion_frames。
+    凍結オフセットの補正に使う。下記）。"""
     ext = unreal.MovieSceneSequenceExtensions
     if _delete_temp_sequence():
         at = unreal.AssetToolsHelpers.get_asset_tools()
@@ -215,8 +238,14 @@ def _create_temp_sequence(camera_actor, fps=24, scene_sequence=None, scene_frame
             tick = ext.get_tick_resolution(scene_sequence)
             disp = ext.get_display_rate(scene_sequence)
             # 1フレームの tick 数は 29.97/59.94fps で非整数（24000/29.97=800.8）なので
-            # 整数 tpf に丸めてから掛けず、有理数のまま計算して最後に1回だけ丸める
-            offset = int(round((n - inner_start) * tick.numerator * disp.denominator
+            # 整数 tpf に丸めてから掛けず、有理数のまま計算して最後に1回だけ丸める。
+            # MRQ（ExpandShot）はショットを L フレーム前へ広げ、サブセクションと内側の
+            # 再生範囲を同じだけ前へずらして時間を連続させる（再生速度 1 前提）。
+            # 再生速度 0 ではずらしだけが残り、内側が「n - L」で凍結される
+            # （森 047 実測: TS1 で L=W=32 → フレーム -32、TS8 で L=W+1）。先に +L しておく。
+            # 5.7 はこのずれが起きない（_expand_shifts_frozen_subsection が False → 呼び出し側が 0 を渡す）
+            offset = int(round((n - inner_start + max(0, int(warmup_frames)))
+                               * tick.numerator * disp.denominator
                                / float(tick.denominator * disp.numerator)))
             params = sub_sec.get_editor_property("parameters")
             tw = params.get_editor_property("time_scale")
@@ -788,7 +817,10 @@ def _start_render(sub, camera_actor, output_dir, width, height,
     seq, seq_path = _create_temp_sequence(camera_actor,
                                           scene_sequence=scene_sequence,
                                           scene_frame=scene_frame,
-                                          level_visibility=viewport_look)
+                                          level_visibility=viewport_look,
+                                          warmup_frames=(_mrq_left_expansion_frames(
+                                              temporal_samples, warmup, warmup)
+                                              if _expand_shifts_frozen_subsection() else 0))
 
     queue = sub.get_queue()
     _backup_and_clear_queue(queue)

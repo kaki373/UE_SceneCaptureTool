@@ -595,6 +595,94 @@ def _l1_offset():
 step("L1 start_frame_offset exact at 29.97fps frame 400", _l1_offset)
 
 
+def _l2_pose_after_mrq_warmup():
+    # 静止画の一時シーケンス（埋め込み＋時間凍結）が、MRQ のウォームアップ展開
+    # （サブセクション開始 -W・start_frame_offset -W フレーム。森 047 の PIE 実測と一致）の後も
+    # シーンのフレーム F のカメラ姿勢を評価すること。開始 100・29.97fps の possessable カメラで確かめる
+    ext = unreal.MovieSceneSequenceExtensions
+    eas = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    at = unreal.AssetToolsHelpers.get_asset_tools()
+    world = core._get_editor_world()
+    p = "/Game/SmokeSeq"
+    start, end, F, W = 100, 201, 150, 32
+    c = eas.spawn_actor_from_class(unreal.CineCameraActor, unreal.Vector(-5000, 0, 0))
+
+    def _eval(seq, frame):
+        r = unreal.LevelSequencePlayer.create_level_sequence_player(
+            world, seq, unreal.MovieSceneSequencePlaybackSettings())
+        player, actor = r if isinstance(r, tuple) else (r, None)
+        try:
+            player.set_playback_position(unreal.MovieSceneSequencePlaybackParams(
+                frame=unreal.FrameTime(unreal.FrameNumber(int(frame))),
+                position_type=unreal.MovieScenePositionType.FRAME,
+                update_method=unreal.UpdatePositionMethod.SCRUB))
+            return round(c.get_actor_location().x, 2)
+        finally:
+            player.stop()
+            if actor is not None:
+                eas.destroy_actor(actor)
+
+    def _mrq_expand(seq, w):
+        tick = ext.get_tick_resolution(seq)
+        disp = ext.get_display_rate(seq)
+        sec = ext.find_tracks_by_exact_type(seq, unreal.MovieSceneSubTrack)[0].get_sections()[0]
+        params = sec.get_editor_property("parameters")
+        off = params.get_editor_property("start_frame_offset").value
+        d = int(round(w * tick.numerator * disp.denominator / float(tick.denominator * disp.numerator)))
+        params.set_editor_property("start_frame_offset", unreal.FrameNumber(off - d))
+        sec.set_editor_property("parameters", params)
+        sec.set_range(-w, 1)
+        ext.set_playback_start(seq, -w)
+
+    r = {}
+    try:
+        if unreal.EditorAssetLibrary.does_asset_exist(p + "/SEQ_SmokePose"):
+            unreal.EditorAssetLibrary.delete_asset(p + "/SEQ_SmokePose")
+        s = at.create_asset("SEQ_SmokePose", p, unreal.LevelSequence, unreal.LevelSequenceFactoryNew())
+        ext.set_display_rate(s, unreal.FrameRate(30000, 1001))
+        ext.set_playback_start(s, start)
+        ext.set_playback_end(s, end)
+        b = ext.add_possessable(s, c)
+        sec = b.add_track(unreal.MovieScene3DTransformTrack).add_section()
+        sec.set_range(start, end)
+        chx = [ch for ch in sec.get_all_channels() if "Location.X" in str(ch.channel_name)][0]
+        chx.add_key(unreal.FrameNumber(start), 0.0)          # 表示レートのフレーム
+        chx.add_key(unreal.FrameNumber(end - 1), 1000.0)
+        r["scene@F"] = _eval(s, F)
+        # ExpandShot の前方拡張 L = ハンドル + (TS>1) + ウォームアップ
+        _ok(mrq._mrq_left_expansion_frames(1, W, W) == W
+            and mrq._mrq_left_expansion_frames(8, W, W) == W + 1
+            and mrq._mrq_left_expansion_frames(1, 0, 4) == 1, "left expansion formula")
+        # 補正するのは 5.8 以降だけ（5.7 は MRQ の拡張で凍結サブシーケンスがずれない＝実 MRQ で確認）
+        _ok(mrq._expand_shifts_frozen_subsection("5.7.4-51494982+++UE5+Release-5.7") is False
+            and mrq._expand_shifts_frozen_subsection("5.8.2-56702186+++UE5+Release-5.8") is True
+            and mrq._expand_shifts_frozen_subsection("6.0.0") is True, "version gate")
+        r["gate_this_engine"] = mrq._expand_shifts_frozen_subsection()
+        for ts in (1, 8):
+            L = mrq._mrq_left_expansion_frames(ts, W, W)
+            for key, w in (("fixed_ts%d" % ts, L), ("old_offset_ts%d" % ts, 0)):
+                seq, _full = mrq._create_temp_sequence(c, scene_sequence=s, scene_frame=F,
+                                                       warmup_frames=w)
+                _mrq_expand(seq, L)
+                r[key] = {"render_frame": _eval(seq, 0), "warmup_start": _eval(seq, -L)}
+                mrq._delete_temp_sequence()
+    finally:
+        eas.destroy_actor(c)
+        if unreal.EditorAssetLibrary.does_asset_exist(p + "/SEQ_SmokePose"):
+            unreal.EditorAssetLibrary.delete_asset(p + "/SEQ_SmokePose")
+    _ok(abs(r["scene@F"] - 500.0) < 1.0, r)
+    for ts in (1, 8):
+        fx = r["fixed_ts%d" % ts]
+        _ok(abs(fx["render_frame"] - r["scene@F"]) < 0.5 and abs(fx["warmup_start"] - r["scene@F"]) < 0.5, r)
+        # 補正なし（旧実装）はフレーム F-L の姿勢になる＝この手順で不具合を検出できる
+        _ok(abs(r["old_offset_ts%d" % ts]["render_frame"] - r["scene@F"]) > 50.0, r)
+    return r
+
+
+step("L3 still temp sequence keeps frame F camera pose after MRQ warm-up expansion (start 100, 29.97fps)",
+     _l2_pose_after_mrq_warmup)
+
+
 # ===================== ビューポートのルック（経路B: MRQ 近似） =====================
 def _cvar_names(job):
     cv = job.get_configuration().find_setting_by_class(unreal.MoviePipelineConsoleVariableSetting)
