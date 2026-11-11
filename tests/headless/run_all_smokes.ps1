@@ -5,7 +5,7 @@ param(
   [string[]]$Engines,
   [string]$Work = (Join-Path $env:TEMP "UE_SceneCaptureTool_smoke"),
   [string]$Site = "",
-  [string[]]$Scripts = @("smoke_core.py", "smoke_mrq.py", "smoke_ui.py")
+  [string[]]$Scripts = @("smoke_core.py", "smoke_mrq.py", "smoke_ui.py", "smoke_bg.py")
 )
 
 # powershell -File passes "a","b" as one string "a,b"

@@ -19,8 +19,15 @@ ue5_capture/
 ├── capture_core.py   # SceneCapture 系（Depth/Matte/ObjectID）・合成・命名・後処理
 ├── capture_mrq.py    # MRQ 経由の Beauty 高品質レンダ（PIE・非同期）
 ├── capture_ui.py     # tkinter GUI（UE の Slate tick に非ブロッキング統合）
+├── capture_bg.py     # バックグラウンドの待ち行列（ジョブ JSON・ワーカーのロック/生存確認/停止）
+├── capture_bg_worker.py # 裏のエディタ（-RenderOffScreen）で非表示パネルを使ってジョブを順に撮る
 └── README.md
 ```
+
+バックグラウンド: ジョブは `Saved/UE5Capture_bg/jobs/` の JSON（パネル設定のスナップショット＋
+レベル＋シーケンス）。ワーカーは `-ExecCmds="py capture_bg_worker.py"`（5.8 は `-ExecutePythonScript`
+の直後に終了するため）で起動し、`-nowrite`（ini を書かない）・オートセーブ無効（メモリ上のみ）。
+ロックは PID＋プロセス開始時刻で照合し、強制停止はコマンドラインの `-UE5CaptureBgWorker` も確認してから行う。
 
 ## 必要ライブラリ
 | ライブラリ | 用途 | 必須度 |

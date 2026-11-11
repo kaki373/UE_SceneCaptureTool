@@ -1064,6 +1064,16 @@ def resolve_name_template(template, **tokens):
     return s or "capture"
 
 
+def resolve_path_template(path, **tokens):
+    """出力フォルダのテンプレート。"{" を含む区切り（フォルダ名）だけを resolve_name_template で
+    解決する（同じトークン・同じ無害化・壊れた書式は文字どおり・空なら "capture"）。
+    トークンの無いパスは一切変えない。"""
+    if "{" not in (path or ""):
+        return path
+    parts = re.split(r"([\\/])", str(path))
+    return "".join(resolve_name_template(p, **tokens) if "{" in p else p for p in parts)
+
+
 def latest_take_number(output_dir, name_body):
     """output_dir 内で name_body に属する既存テイクの最大番号（無ければ 0）。
     ファイル name_body_素材_NNN.* と、テイク毎サブフォルダ name_body_NNN を見る。"""

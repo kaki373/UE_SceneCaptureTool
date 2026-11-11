@@ -27,12 +27,13 @@ import capture_core as core
 # tkinter は import 時点では失敗させない（呼び出し側で判定させる）
 try:
     import tkinter as tk
-    from tkinter import ttk, filedialog
+    from tkinter import ttk, filedialog, messagebox
     _HAS_TK = True
 except Exception:
     tk = None
     ttk = None
     filedialog = None
+    messagebox = None
     _HAS_TK = False
 
 
@@ -132,15 +133,37 @@ _NAME_TIP = ("ファイル名テンプレート。使えるトークン:\n"
              "空のトークンは消え、区切りの _ は詰める。出力は 名前_素材名_NNN")
 _OVERWRITE_TIP = ("ON: テイク番号を進めず、この名前の最新テイク（無ければ 001）の既存出力を消して\n"
                   "同じ番号で出し直す。OFF: 既存を残して次の番号で出す")
+_OUT_DIR_TIP = ("出力フォルダ。ファイル名と同じトークン {level} {cut} {camera} {seq} が使える\n"
+                "（例 D:\\Captures\\{level}\\{cut}）。撮る時に展開し、無ければ作る。\n"
+                "設定には展開前のまま保存する")
+_BG_TIP = ("別のエディタ（画面に出ない）を裏で起動してレンダする。このエディタはその間も使える。\n"
+           "保存済みのレベル/シーケンスを撮る（未保存の変更は写らない）。\n"
+           "2 台目のエディタぶんの VRAM/メモリが要る。複数回押すとキューに積んで順番に撮る"
+           "（キューリストで確認・中断）。\n"
+           "裏のエディタが動いている間は、そのジョブのレベル・シーケンス・参照アセットを手元で"
+           "保存できない（ファイルを掴んでいるため。キューが空になると裏のエディタは終了する）。\n"
+           "ビューポートのルックは MRQ 近似（ビューポートのパイロット状態は引き継がない）")
+# バックグラウンドの待ち行列の表示を更新する間隔（秒）
+_BG_POLL_SEC = 1.0
+# 動いているジョブも待ちも無い間の更新間隔（秒。Saved がネットワーク上でも tick を重くしない）
+_BG_IDLE_POLL_SEC = 5.0
+
 
 class CaptureWindow(object):
-    def __init__(self):
+    def __init__(self, headless=False, settings_path=None):
+        """headless=True: バックグラウンドのワーカーが使う非表示パネル（表示・tick 登録なし）。
+        settings_path: 設定ファイルの差し替え（ワーカーはジョブの設定スナップショットを読み、
+        ユーザーの UE5Capture_ui_settings.json には書かない）。"""
         if not _HAS_TK:
             raise ImportError("tkinter が利用できません。")
+        self._headless = bool(headless)
+        self._settings_override = settings_path
 
         self._cameras = core.list_cameras()
 
         self.root = _persistent_root()
+        if self._headless:
+            self.root.withdraw()  # 一度も表示しない（最初の update より前に withdraw）
         for child in self.root.winfo_children():
             child.destroy()      # 子ウィジェットの破棄は安全（ルートだけは破棄禁止）
         self.root.title("Scene Capture Tool")
@@ -149,7 +172,10 @@ class CaptureWindow(object):
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._build()
+        if self._headless:
+            return
         self.root.deiconify()
+        self._apply_topmost()       # 再表示でも設定どおり（ルートは使い回しなので前回の属性が残る）
         self._dark_titlebar()
         self._register_tick()
 
@@ -168,6 +194,11 @@ class CaptureWindow(object):
         self._build_shared_targets(outer)
         nb = ttk.Notebook(outer)
         nb.pack(fill="both", expand=True, padx=8, pady=(8, 0))
+        # ⚙: パネルの表示設定（タブ列の右端の空き。既定は従来どおり＝手前に固定しない）
+        self.topmost_var = tk.BooleanVar(master=self.root, value=False)
+        self._tip(ttk.Button(outer, text="⚙", width=2, style="Fold.TButton",
+                             command=self._open_settings_menu), "パネルの表示設定").place(
+            relx=1.0, x=-12, y=10, anchor="ne")
         tab_img = ttk.Frame(nb, style="Body.TFrame")
         tab_seq = ttk.Frame(nb, style="Body.TFrame")
         nb.add(tab_img, text="画像キャプチャ")
@@ -263,6 +294,34 @@ class CaptureWindow(object):
         # ホイールはページのスクロールに使う（コンボの値が意図せず変わるのを防ぐ）
         self.root.unbind_class("TCombobox", "<MouseWheel>")
 
+    def _open_settings_menu(self):
+        m = tk.Menu(self.root, tearoff=0, bg=_THEME["card"], fg=_THEME["fg"],
+                    activebackground=_THEME["accent"], activeforeground="#ffffff",
+                    selectcolor=_THEME["fg"])
+        m.add_checkbutton(label="手前に表示", variable=self.topmost_var,
+                          command=self._on_topmost_change)
+        try:
+            m.tk_popup(self.root.winfo_pointerx(), self.root.winfo_pointery())
+        finally:
+            m.grab_release()
+
+    def _on_topmost_change(self):
+        self._apply_topmost()
+        self._save_ui_state()
+
+    def _apply_topmost(self, win=None):
+        """「手前に表示」をパネル（と待ち行列ウィンドウ）へ反映。非表示パネル（ワーカー）は無視。"""
+        if getattr(self, "_headless", False):
+            return
+        on = bool(self.topmost_var.get())
+        bw = getattr(self, "_bg_win", None)
+        targets = [win] if win is not None else [self.root] + ([bw["top"]] if bw else [])
+        for w in targets:
+            try:
+                w.attributes("-topmost", on)
+            except Exception:
+                pass
+
     def _scrollable(self, parent):
         """縦スクロールする本文領域。中身を置くフレームを返す。"""
         canvas = tk.Canvas(parent, bg=_THEME["bg"], highlightthickness=0, borderwidth=0)
@@ -347,6 +406,8 @@ class CaptureWindow(object):
                 y = widget.winfo_rooty() + widget.winfo_height() + 4
                 tw = tk.Toplevel(self.root)
                 tw.wm_overrideredirect(True)
+                if getattr(self, "topmost_var", None) is not None and self.topmost_var.get():
+                    tw.attributes("-topmost", True)   # 手前に表示のパネルの下に隠れない
                 tw.wm_geometry("+%d+%d" % (x, y))
                 tk.Label(tw, text=text, justify="left", wraplength=380,
                          bg=_THEME["tip"], fg=_THEME["fg"], padx=8, pady=5,
@@ -476,7 +537,8 @@ class CaptureWindow(object):
         default_dir = os.path.normpath(
             os.path.join(unreal.Paths.project_saved_dir(), "Captures"))
         self.out_var = tk.StringVar(master=self.root, value=default_dir)
-        self._entry(r, self.out_var, 28).pack(side="left", fill="x", expand=True)
+        self._tip(self._entry(r, self.out_var, 28), _OUT_DIR_TIP).pack(
+            side="left", fill="x", expand=True)
         ttk.Button(r, text="…", width=3, command=self._browse).pack(
             side="left", padx=(6, 0))
         r = self._row(outf, "ファイル名")
@@ -630,6 +692,17 @@ class CaptureWindow(object):
         「設定をコピー」ボタンで画像タブの値を一括コピーできる。"""
         foot = ttk.Frame(frm, style="Body.TFrame")
         foot.pack(side="bottom", fill="x")
+        # バックグラウンド（裏のエディタで撮る・待ち行列）
+        bgr = ttk.Frame(foot, style="Body.TFrame")
+        bgr.pack(fill="x", padx=4, pady=(6, 0))
+        self.seq_bg_var = tk.BooleanVar(master=self.root, value=False)
+        self._check(bgr, "バックグラウンドでキュー", self.seq_bg_var, _BG_TIP).pack(side="left")
+        self._tip(ttk.Button(bgr, text="キューリスト", command=self._bg_open_window),
+                  "キューリスト（順番・状態・中断/取り消し）を開く").pack(
+            side="left", padx=(8, 0))
+        self.bg_status_var = tk.StringVar(master=self.root, value="")
+        ttk.Label(foot, textvariable=self.bg_status_var, style="Sub.TLabel",
+                  wraplength=520, justify="left").pack(fill="x", padx=6)
         self.seq_btn = ttk.Button(foot, text="シーケンスレンダ", style="Accent.TButton",
                                   command=self._on_seq_render)
         self.seq_btn.pack(fill="x", padx=4, pady=(6, 4))
@@ -678,7 +751,8 @@ class CaptureWindow(object):
         default_dir = os.path.normpath(
             os.path.join(unreal.Paths.project_saved_dir(), "Captures"))
         self.seq_out_var = tk.StringVar(master=self.root, value=default_dir)
-        self._entry(r, self.seq_out_var, 28).pack(side="left", fill="x", expand=True)
+        self._tip(self._entry(r, self.seq_out_var, 28), _OUT_DIR_TIP).pack(
+            side="left", fill="x", expand=True)
         ttk.Button(r, text="…", width=3,
                    command=lambda: self._browse(self.seq_out_var)).pack(
             side="left", padx=(6, 0))
@@ -888,9 +962,12 @@ class CaptureWindow(object):
 
     def _browse(self, var=None):
         var = var if var is not None else self.out_var
+        init = var.get() or "/"
+        if "{" in init:      # トークン入りはトークンより前の実在フォルダから選ぶ
+            init = os.path.dirname(init.split("{", 1)[0]) or "/"
         # parent を明示しないと tkinter._default_root（別ツールの withdraw 済み窓の
         # こともある）が親になり、ダイアログがエディタの背後に隠れて固まって見える
-        d = filedialog.askdirectory(parent=self.root, initialdir=var.get() or "/")
+        d = filedialog.askdirectory(parent=self.root, initialdir=init)
         if d:
             var.set(os.path.normpath(d))
 
@@ -1007,7 +1084,7 @@ class CaptureWindow(object):
         if cam is None:
             self.status_var.set("MRQ: カメラが選択されていません")
             return False
-        out = self.out_var.get().strip()
+        out = self._expand_out_dir(self.out_var.get().strip(), cam, self._current_sequence())
         if not out:
             self.status_var.set("MRQ: 出力先を指定してください")
             return False
@@ -1987,7 +2064,255 @@ class CaptureWindow(object):
         MRQ は PNG 連番（マスター）のみを出力し、MP4 はシーケンスの Display Rate で
         ffmpeg エンコードする（fps を確実に一致させるため）。余剰フレームは
         エンコード前にトリムする。素材ごとに PNG連番/MP4 を選択できる。"""
+        if not getattr(self, "_headless", False) and self.seq_bg_var.get():
+            self._bg_enqueue_seq()
+            return
         self._run_guarded(self._on_seq_render_impl)
+
+    # ---- バックグラウンド（裏のエディタ・待ち行列。capture_bg / capture_bg_worker） ----
+    def _bg_qdir(self):
+        import capture_bg
+        return capture_bg.queue_dir(
+            unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_saved_dir()))
+
+    def _bg_start_worker(self):
+        import capture_bg
+        engine = unreal.Paths.convert_relative_path_to_full(unreal.Paths.engine_dir())
+        uproject = unreal.Paths.convert_relative_path_to_full(unreal.Paths.get_project_file_path())
+        pid = capture_bg.launch_worker(self._bg_qdir(), capture_bg.default_engine_exe(engine),
+                                       os.path.normpath(uproject), capture_bg.worker_script_path())
+        unreal.log("[SceneCapture/BG] ワーカー起動 pid %d" % pid)
+        return pid
+
+    def _bg_enqueue_seq(self):
+        """映像タブの今の設定をジョブとして待ち行列へ追加し、ワーカーが居なければ起動する。"""
+        import capture_bg
+        seq = self._current_sequence()
+        if seq is None:
+            self.status_var.set("シーケンスレンダ: Sequencer でシーケンスを開いてください")
+            return
+        world = core._get_editor_world()
+        if world is None:        # PIE 中（手元でレンダ中）はエディタのワールドが取れない
+            self.status_var.set("バックグラウンド: 手元のレンダが終わってからキューに積んでください")
+            return
+        map_pkg = world.get_path_name().split(".")[0]
+        seq_pkg = seq.get_path_name().split(".")[0]
+        if map_pkg.startswith("/Temp/"):
+            self.status_var.set("バックグラウンド: 保存されていないレベルは撮れません（保存してから）")
+            return
+        dirty = []
+        for fn in ("get_dirty_map_packages", "get_dirty_content_packages"):
+            try:
+                dirty += [p.get_name() for p in getattr(unreal.EditorLoadingAndSavingUtils, fn)()]
+            except Exception:
+                pass
+        if dirty and not messagebox.askokcancel(
+                "バックグラウンドでキュー",
+                "未保存の変更があります。バックグラウンドは保存済みの状態を撮るため、"
+                "これらの変更は写りません。\n\n%s\n\nこのままキューに追加しますか？"
+                % "\n".join(dirty[:12] + (["…"] if len(dirty) > 12 else [])),
+                parent=self.root):
+            self.status_var.set("バックグラウンド: 取り消しました（未保存の変更あり）")
+            return
+        self._save_ui_state()
+        q = self._bg_qdir()
+        capture_bg.recover(q)
+        capture_bg.prune(q)
+        passes = [_SEQ_SHORT.get(k, lab) for k, lab, _p in _SEQ_OUTPUTS
+                  if any(v.get() for v in self.seq_out_vars[k])]
+        snap = self._ui_state_dict()
+        # 出力フォルダのトークンは今のレベル/カットで確定させる（後でエディタが別レベルを開いても同じ）
+        snap["seq_out"] = self._expand_out_dir(snap.get("seq_out") or "",
+                                               self._seq_first_camera(seq), seq)
+        job = capture_bg.enqueue(q, {
+            "kind": "sequence", "name": "%s  %s" % (seq.get_name(), "+".join(passes)),
+            "map_name": "/".join(map_pkg.split("/")[-2:]),   # 同名レベルを見分けるためフォルダも
+            "map": map_pkg, "sequence": seq_pkg, "settings": snap})
+        self._bg_open_window()
+        note = ""
+        if self.seq_viewport_look_var.get():
+            note = "（ビューポートのルックは MRQ 近似・パイロット状態は引き継がない）"
+        if capture_bg.live_worker(q) is None:
+            self._bg_start_worker()
+            self.status_var.set("バックグラウンド: 追加して裏のエディタを起動しました: %s%s"
+                                % (job["name"], note))
+        else:
+            self.status_var.set("バックグラウンド: キューに追加しました: %s%s" % (job["name"], note))
+        self._bg_last_poll = 0.0
+
+    def _bg_cancel_running(self):
+        import capture_bg
+        jid = capture_bg.request_cancel_running(self._bg_qdir())
+        self.status_var.set("バックグラウンド: 実行中のジョブを中断しています…" if jid
+                            else "バックグラウンド: 実行中のジョブはありません")
+        self._bg_last_poll = 0.0
+
+    def _bg_cancel_pending(self):
+        import capture_bg
+        q = self._bg_qdir()
+        n = capture_bg.cancel_pending(q, capture_bg.live_worker(q) is not None)
+        self.status_var.set("バックグラウンド: 待機中のジョブ %d 件を取り消しました" % n)
+        self._bg_last_poll = 0.0
+
+    def _bg_selected_job(self):
+        w = getattr(self, "_bg_win", None)
+        try:
+            sel = w["tree"].selection()
+        except Exception:
+            return None
+        if not sel:
+            return None
+        import capture_bg
+        return next((j for j in capture_bg.list_jobs(self._bg_qdir()) if j["id"] == sel[0]), None)
+
+    def _bg_cancel_selected(self):
+        import capture_bg
+        j = self._bg_selected_job()
+        q = self._bg_qdir()
+        if j is None or j.get("state") != "queued":
+            self.status_var.set("バックグラウンド: 待機中のジョブを選んでください")
+            return
+        capture_bg.cancel_job(q, j["id"], capture_bg.live_worker(q) is not None)
+        self.status_var.set("バックグラウンド: 取り消しました: %s" % j.get("name"))
+        self._bg_last_poll = 0.0
+
+    def _bg_open_output(self):
+        j = self._bg_selected_job()
+        out = ((j or {}).get("result") or {}).get("output_dir")
+        if not out or not os.path.isdir(out):
+            self.status_var.set("バックグラウンド: 出力のある完了済みジョブを選んでください")
+            return
+        os.startfile(out)
+
+    def _bg_open_window(self):
+        """待ち行列ウィンドウ（パネルと同じ配色の Toplevel）。開いていれば前に出すだけ。
+        中身は _bg_poll がキューのフォルダから更新する（他のエディタが積んだジョブも出る）。"""
+        if getattr(self, "_headless", False):
+            return
+        w = getattr(self, "_bg_win", None)
+        if w is not None:
+            try:
+                if w["top"].winfo_exists():
+                    w["top"].deiconify()
+                    return
+            except Exception:
+                pass
+        c = _THEME
+        top = tk.Toplevel(self.root)
+        top.title("キューリスト")
+        top.configure(bg=c["bg"])
+        top.geometry("620x300")
+        st = ttk.Style(self.root)
+        st.configure("BG.Treeview", background=c["field"], fieldbackground=c["field"],
+                     foreground=c["fg"], bordercolor=c["border"], rowheight=20)
+        st.configure("BG.Treeview.Heading", background=c["card"], foreground=c["sub"])
+        st.map("BG.Treeview", background=[("selected", c["accent"])],
+               foreground=[("selected", "#ffffff")])
+        tree = ttk.Treeview(top, style="BG.Treeview", selectmode="browse",
+                            columns=("state", "name", "map", "time"), show="headings")
+        for col, txt, wd in (("state", "状態", 70), ("name", "ジョブ", 280),
+                             ("map", "レベル", 120), ("time", "時間", 70)):
+            tree.heading(col, text=txt)
+            tree.column(col, width=wd, anchor="w", stretch=(col == "name"))
+        tree.pack(fill="both", expand=True, padx=8, pady=(8, 4))
+        bar = ttk.Frame(top, style="Body.TFrame")
+        bar.pack(fill="x", padx=8, pady=(0, 8))
+        for txt, fn, tip in (
+                ("実行中を中断", self._bg_cancel_running,
+                 "裏で実行中のジョブを中断する（応答が無ければ裏のエディタを停止）"),
+                ("選択を取り消し", self._bg_cancel_selected, "選んだ待機中のジョブを取り消す"),
+                ("待機中を全て取り消し", self._bg_cancel_pending, "まだ始まっていないジョブを全て取り消す"),
+                ("出力フォルダ", self._bg_open_output, "選んだ完了済みジョブの出力フォルダを開く")):
+            self._tip(ttk.Button(bar, text=txt, command=fn), tip).pack(side="left", padx=(0, 6))
+        top.protocol("WM_DELETE_WINDOW", top.withdraw)
+        self._bg_win = {"top": top, "tree": tree}
+        apply_top = getattr(self, "_apply_topmost", None)
+        if apply_top:
+            apply_top(top)
+        self._bg_last_poll = 0.0
+
+    def _bg_refresh_window(self, jobs, now):
+        w = getattr(self, "_bg_win", None)
+        if w is None:
+            return
+        try:
+            if not w["top"].winfo_exists() or w["top"].state() == "withdrawn":
+                return
+        except Exception:
+            return
+        names = {"running": "実行中", "queued": "待機中", "done": "完了", "failed": "失敗",
+                 "cancelled": "取り消し"}
+        tree = w["tree"]
+        import capture_bg
+        q = self._bg_qdir()
+        keep = set()
+        for j in jobs:
+            state = names.get(j.get("state"), j.get("state"))
+            if j.get("state") == "queued" and capture_bg.cancel_requested(q, j["id"]):
+                state = "取り消し"
+            if j.get("state") == "running":
+                t = "%d 秒" % (now - float(j.get("started") or now))
+            elif j.get("finished") and j.get("started"):
+                t = "%d 秒" % (float(j["finished"]) - float(j["started"]))
+            else:
+                t = ""
+            vals = (state, j.get("name") or "", j.get("map_name") or
+                    (j.get("map") or "").rsplit("/", 1)[-1], t)
+            if tree.exists(j["id"]):
+                tree.item(j["id"], values=vals)
+            else:
+                tree.insert("", "end", iid=j["id"], values=vals)
+            keep.add(j["id"])
+        for iid in tree.get_children():
+            if iid not in keep:
+                tree.delete(iid)
+
+    def _bg_poll(self):
+        """tick から 1 秒毎: 待ち行列の表示・完了の通知・死んだワーカーの後始末・中断の強制停止。"""
+        import time
+        now = time.time()
+        gap = _BG_IDLE_POLL_SEC if getattr(self, "_bg_idle", False) else _BG_POLL_SEC
+        if now - getattr(self, "_bg_last_poll", 0.0) < gap:
+            return
+        self._bg_last_poll = now
+        import capture_bg
+        q = self._bg_qdir()
+        if not os.path.isdir(q):
+            return
+        s = capture_bg.poll(q, now=now)
+        if s["needs_start"]:
+            self._bg_start_worker()
+            s["worker"] = "starting"
+        self._bg_idle = not (s["worker"] or s["running"] or s["waiting"])
+        parts = []
+        r = s["running"]
+        if r is not None:
+            parts.append("実行中: %s（%d 秒）" % (r.get("name"), now - float(r.get("started") or now)))
+        elif s["worker"] == "starting":
+            parts.append("裏のエディタを起動中…")
+        if s["waiting"]:
+            parts.append("待機 %d 件" % s["waiting"])
+        if s["start_blocked"]:
+            parts.append("裏のエディタが起動に失敗しました（Saved/UE5Capture_bg/logs）")
+        fin = sorted(s["finished"], key=lambda j: float(j.get("finished") or 0))
+        seen = getattr(self, "_bg_seen", None)
+        if seen is None:
+            seen = self._bg_seen = set(j["id"] for j in fin)   # 開いた時点の完了済みは通知しない
+        for j in fin:
+            if j["id"] in seen:
+                continue
+            seen.add(j["id"])
+            res = j.get("result") or {}
+            label = {"done": "完了", "failed": "失敗", "cancelled": "中断"}.get(j.get("state"), "")
+            self.status_var.set("バックグラウンド%s: %s %s" % (
+                label, j.get("name"), res.get("output_dir") if j.get("state") == "done"
+                else (j.get("message") or "")))
+        if fin:
+            last = fin[-1]
+            parts.append("直近: %s %s" % ({"done": "完了", "failed": "失敗", "cancelled": "中断"}.get(
+                last.get("state"), last.get("state")), last.get("name")))
+        self.bg_status_var.set(" / ".join(parts))
+        self._bg_refresh_window(capture_bg.list_jobs(q), now)
 
     def _on_seq_render_impl(self):
         """戻り値: 非同期チェーンを開始したら True（完了側の _final が後始末）。"""
@@ -1998,7 +2323,8 @@ class CaptureWindow(object):
             self.status_var.set("シーケンスレンダ: Sequencer でシーケンスを開いてください")
             return False
         self._refresh_sequence()
-        base_out = self.seq_out_var.get().strip()
+        base_out = self._expand_out_dir(self.seq_out_var.get().strip(),
+                                        self._seq_first_camera(seq), seq)
         if not base_out:
             self.status_var.set("シーケンスレンダ: 出力先を指定してください")
             return False
@@ -3207,6 +3533,26 @@ class CaptureWindow(object):
     def _resolve_name(self, template, camera, seq):
         """ファイル名テンプレートを 現在のレベル名 / カット番号 / カメラ / シーケンス で解決する。
         camera はアクターでもラベル文字列でもよい。失敗したトークンは空になる（例外は出さない）。"""
+        return core.resolve_name_template(template, **self._name_tokens(camera, seq))
+
+    @staticmethod
+    def _seq_first_camera(seq):
+        """カメラカット先頭のカメラ（ログを出さない静かな解決・名前プレビューと同じ）。"""
+        try:
+            import capture_mrq
+            cams = capture_mrq._camera_cut_camera_actors(seq, core._get_editor_world())
+            return cams[0] if cams else None
+        except Exception:
+            return None
+
+    def _expand_out_dir(self, path, camera, seq):
+        """出力フォルダのトークン（ファイル名と同じ {level}/{cut}/{camera}/{seq}）を展開する。
+        トークンが無ければそのまま（従来どおり）。設定には展開前の文字列を保存する。"""
+        if "{" not in (path or ""):
+            return path
+        return core.resolve_path_template(path, **self._name_tokens(camera, seq))
+
+    def _name_tokens(self, camera, seq):
         label = ""
         if camera is not None:
             try:
@@ -3226,7 +3572,7 @@ class CaptureWindow(object):
                 sname = seq.get_name()
             except Exception:
                 sname = ""
-        return core.resolve_name_template(template, level=lvl, cut=cut, camera=label, seq=sname)
+        return {"level": lvl, "cut": cut, "camera": label, "seq": sname}
 
     def _update_name_preview(self):
         """ファイル名欄の下に解決後の名前を出す（画像=選択カメラ、映像=カメラカット先頭のカメラ）。
@@ -3274,12 +3620,26 @@ class CaptureWindow(object):
 
     # ----------------------------------------------------------- 設定の保持
     def _settings_path(self):
+        if getattr(self, "_settings_override", None):
+            return self._settings_override
         return os.path.normpath(os.path.join(
             unreal.Paths.project_saved_dir(), "UE5Capture_ui_settings.json"))
 
     def _save_ui_state(self):
         try:
-            state = {
+            state = self._ui_state_dict()
+            # 途中で失敗しても空ファイルを残さない（tmp に書いて差し替え）
+            path = self._settings_path()
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+        except Exception as e:
+            unreal.log_warning("[SceneCapture] 設定保存に失敗: %s" % e)
+
+    def _ui_state_dict(self):
+        """パネルの全設定（設定ファイルとバックグラウンドのジョブで同じ形式）。"""
+        state = {
                 "camera": self.cam_var.get(),
                 "res_mode": self.res_mode.get(),
                 "w": self.w_var.get(), "h": self.h_var.get(),
@@ -3343,15 +3703,10 @@ class CaptureWindow(object):
                 "seq_far": self.seq_far_var.get(),
                 "seq_depth_bit": self.seq_depth_bit_var.get(),
                 "seq_beauty_fmt": self.seq_beauty_fmt_var.get(),
-            }
-            # 途中で失敗しても空ファイルを残さない（tmp に書いて差し替え）
-            path = self._settings_path()
-            tmp = path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(state, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, path)
-        except Exception as e:
-            unreal.log_warning("[SceneCapture] 設定保存に失敗: %s" % e)
+                "seq_bg": self.seq_bg_var.get(),
+                "topmost": self.topmost_var.get(),
+        }
+        return state
 
     def _load_ui_state(self):
         p = self._settings_path()
@@ -3480,6 +3835,9 @@ class CaptureWindow(object):
             self.seq_beauty_fmt_var.set(st["seq_beauty_fmt"])
         _setvar(self.viewport_look_var, "viewport_look")
         _setvar(self.seq_viewport_look_var, "seq_viewport_look")
+        _setvar(self.seq_bg_var, "seq_bg")
+        _setvar(self.topmost_var, "topmost")
+        self._apply_topmost()
         # 読込順に依らずビューポートのルックを優先（Fog/露出固定が同時 ON の設定でも外す）
         self._sync_viewport_look()
 
@@ -3490,7 +3848,8 @@ class CaptureWindow(object):
         s.override_width = self._int_var(self.w_var, s.override_width)
         s.override_height = self._int_var(self.h_var, s.override_height)
         s.aa_factor = {"1x": 1, "2x": 2, "4x": 4}.get(self.aa_var.get(), 2)
-        s.output_dir = self.out_var.get().strip()
+        s.output_dir = self._expand_out_dir(self.out_var.get().strip(), s.camera_actor,
+                                            self._current_sequence())
         s.name_body = self._resolve_name(self.name_tpl_var.get(), s.camera_actor,
                                          self._current_sequence())
         s.fog_off = self.fog_off_var.get()
@@ -3528,6 +3887,12 @@ class CaptureWindow(object):
                 self.root.update()
             except Exception:
                 _unregister_global_tick()
+                return
+            try:
+                self._bg_poll()
+            except Exception as e:
+                # 待ち行列の表示の失敗でパネルの tick を止めない（1 回だけ警告）
+                core._warn_once("bg_poll", "バックグラウンドの状態取得に失敗: %s" % e)
         unreal._ue5capture_tick_handle = unreal.register_slate_post_tick_callback(_tick)
 
     def _on_close(self):
@@ -3535,6 +3900,13 @@ class CaptureWindow(object):
         エディタごと落ちるため）。再表示は show() が deiconify する。"""
         self._save_ui_state()
         _unregister_global_tick()
+        try:
+            # tick が止まると更新も操作もできないので、キューリストも一緒に隠す
+            bw = getattr(self, "_bg_win", None)
+            if bw is not None:
+                bw["top"].withdraw()
+        except Exception:
+            pass
         try:
             self.root.withdraw()
         except Exception:

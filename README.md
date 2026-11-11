@@ -34,6 +34,7 @@ PNG / EXR で書き出す。映像タブは Sequencer で開いている LevelSe
 - **解像度**: カメラ設定（アスペクト表示）/ 指定（アスペクト維持トグルで幅⇄高さ自動）。出力名は **ファイル名テンプレート**（既定 `{level}_{cut}_{camera}`。`{level}`=永続レベル名、`{cut}`=表示中サブレベルの親フォルダ名とサブレベル名に共通する番号、`{camera}`=カメラ名（映像はカメラカット先頭のカメラ）、`{seq}`=シーケンス名）に `_素材名_NNN` を付けたもの。両タブとも同じ欄で、解決後の名前がその場に表示される。**上書き**トグル ON でテイク番号を進めず、同名の最新テイクの既存出力を消して同じ番号で出し直す。
 - **anti-aliasing**: Spatial Supersample (1x / 2x / 4x)。Beauty は MRQ の TSR/Temporal。
 - **シーケンスレンダ（映像タブ）**: Sequencer で開いている LevelSequence をカメラカットに従って MRQ レンダ。**素材（Beauty / Z-Depth / Normal / Beauty+Matte(Matteの前) / Matteの奥 / 雲マット / 空マット / ObjectID / Raw Lighting Full(Sun+GI+Sky) / Raw Lighting Direct）それぞれに PNG 連番と H.264 MP4 を個別指定**できる（Raw Lighting Direct は GI/スカイライト/AO を切った直射のみの専用ジョブ。Direct 以外と併用時は2本目ジョブとして自動チェーン。雲マット/空マットのみを選ぶとメインの Beauty ジョブを省略して専用ジョブチェーンから直接開始する）。MRQ は PNG 連番（マスター）を出力し、MP4 は **ffmpeg でシーケンスの Display Rate どおりに**エンコード（CRF プリセット 17/20/24/28 + 数値直接入力・音声なし・余剰フレームは自動トリム）。Matte 系の対象と ObjectID の対象は、タブの外（パネル下部）の「対象」カードにある **Matte targets / Object ID targets** を両タブで共用する（色↔名前の JSON マニフェスト付き。レンダ中のみ r.CustomDepth=3 に切替えて復元）。**連番の形式（PNG 8bit / JPG 8bit / EXR 16bit float。Beauty / Raw Lighting に適用、他は常に PNG）と Z-Depth のビット深度（8bit PNG = Beauty と同一ジョブの PP パス / 16bit PNG・EXR float = フレーム毎に SceneCapture で実測した厳密リニア。EXR は生 cm で MP4 と雲抜きなし）を画像タブと同じ欄で選べる**。フレーム範囲はシーケンス設定または指定。テイク毎サブフォルダ出力のトグルあり。詳細設定の「画像タブの設定をコピー」ボタンで画像タブの解像度 / 出力先 / 形式 / 品質 / Depth 設定を一括コピー。中間ファイル（内部素材・EXR・トリム前連番）はテイクフォルダ内の `_work_<take>` に集約し、成功時はまとめて削除される。雲マットのヘルパージョブはウォームアップを最大8に抑え、雲なしBG は半解像度でレンダしてコストを削る。
+- **バックグラウンドでキュー（映像タブ）**: チェックを入れてシーケンスレンダを押すと、画面に出ない 2 台目のエディタ（`-RenderOffScreen`）が同じ設定・同じ処理でレンダする。手元のエディタはその間も使え（別レベルを開いてもよい）、手元での通常キャプチャとも同時に動く。押すたびにキュー（`Saved/UE5Capture_bg/`）へ積まれ、1 台のワーカーが順番に撮り、空になると自分で終了する。**キューリスト**（積むと自動で開く・ボタンで再表示）で状態を見て、実行中の中断・選んだジョブ/待機中全ての取り消し・出力フォルダを開ける。撮るのは保存済みのレベル/シーケンス（未保存の変更があれば確認する）。2 台目のエディタぶんの VRAM/メモリが要る。**裏のエディタが動いている間は、そのジョブのレベル・シーケンス・参照アセットを手元で保存できない**（裏のエディタがファイルを開いているため。保存は失敗し「Unable to Check Out」ダイアログが出る。キューが空になって裏のエディタが終了すれば保存できる）。
 - **設定の保持**: 両タブの入力は `Saved/UE5Capture_ui_settings.json` に保存され、次回起動時に復元される。
 - GUI (tkinter) は UE の Slate tick に非ブロッキング統合。tkinter が無い環境は CONFIG ベースの CUI に自動フォールバック。
 
@@ -215,6 +216,8 @@ UE_SceneCaptureTool/
     ├── capture_core.py          # キャプチャロジック（Spawn・キャプチャ・後処理・破棄・合成）
     ├── capture_mrq.py           # Movie Render Queue による Beauty / Behind / シーケンスレンダ
     ├── capture_ui.py            # tkinter GUI（画像 / 映像タブ）
+    ├── capture_bg.py            # バックグラウンドの待ち行列・ワーカーの起動/生存確認/停止（unreal 非依存）
+    ├── capture_bg_worker.py     # 裏のエディタ内で待ち行列を順に処理するワーカー
     ├── capture_menu.py          # メニューバー登録（起動スクリプト / 手動の Startup Script から呼ばれる）
     ├── startup_menu.py          # ツールバーボタン登録（capture_menu から呼ばれる）
     └── README.md                # エディタ内詳細仕様

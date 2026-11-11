@@ -591,6 +591,22 @@ def _naming():
 step("N1 resolve_name_template / latest_take_number / delete_take_outputs", _naming)
 
 
+def _path_tokens():
+    rp = core.resolve_path_template
+    tk = dict(level="LV_047_MASTER", cut="047", camera="Cam A", seq="SEQ:1")
+    assert rp(r"D:\Out\plain", **tk) == r"D:\Out\plain"                 # no token: untouched
+    assert rp(r"D:\Out\{level}\{cut}", **tk) == r"D:\Out\LV_047_MASTER\047"
+    assert rp("X:/a/{cut}_{camera}/b", **tk) == "X:/a/047_Cam_A/b"     # same sanitising as names
+    assert rp(r"D:\Out\{seq}", **tk) == r"D:\Out\SEQ_1"                 # ':' is not kept
+    assert rp(r"D:\Out\{nope}", **tk) == r"D:\Out\capture"              # unknown token tolerated
+    assert rp(r"D:\Out\{level.x}", **tk) == r"D:\Out\level.x"           # broken format: literal
+    assert rp(r"D:\Out\{cut}", level="L", cut="", camera="", seq="") == r"D:\Out\capture"
+    return rp(r"D:\Out\{level}\{cut}", **tk)
+
+
+step("N1b resolve_path_template (output folder tokens)", _path_tokens)
+
+
 def _cut_detect():
     # 人間のレベル構成を模す: /Game/SmokeCut/01_047_Forest/{LV_047_Environment, LV_047_Lighting}
     # を永続レベルのサブレベル（LevelStreamingDynamic）として足し、親フォルダ名とサブレベル名に

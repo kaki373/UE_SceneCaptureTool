@@ -299,6 +299,68 @@ step("ビューポートのルック: viewport grab without viewport -> on_done(
      _vp_grab_fallback)
 
 
+def _out_dir_tokens():
+    plain = os.path.join(OUTD, "plain")
+    assert win._expand_out_dir(plain, "Cam", None) == plain
+    got = win._expand_out_dir(os.path.join(OUTD, "{level}", "{camera}"), "Cam A", None)
+    assert got == os.path.join(OUTD, "Untitled", "Cam_A"), got
+    # the stored setting keeps the unexpanded template
+    win.seq_out_var.set(os.path.join(OUTD, "{level}"))
+    assert win._ui_state_dict()["seq_out"].endswith("{level}")
+    win.seq_out_var.set(OUTD)
+    return got
+
+
+step("出力フォルダのトークン: 展開 / トークン無しは不変 / 設定は展開前", _out_dir_tokens)
+
+
+def _topmost():
+    p = win._settings_path()
+    assert win.topmost_var.get() is False                       # default: unchanged behaviour
+    assert int(win.root.attributes("-topmost")) == 0
+    win.topmost_var.set(True)
+    win._on_topmost_change()                                     # applies + saves
+    assert int(win.root.attributes("-topmost")) == 1
+    with open(p, "r", encoding="utf-8") as f:
+        assert json.load(f)["topmost"] is True
+    win.topmost_var.set(False)
+    win._load_ui_state()                                         # restore re-applies
+    got = (win.topmost_var.get(), int(win.root.attributes("-topmost")))
+    assert got == (True, 1), got
+    win.topmost_var.set(False)
+    win._on_topmost_change()
+    assert int(win.root.attributes("-topmost")) == 0
+    # the worker's hidden panel ignores the setting
+    win._headless = True
+    win.topmost_var.set(True)
+    win._apply_topmost()
+    assert int(win.root.attributes("-topmost")) == 0
+    win._headless = False
+    win.topmost_var.set(False)
+    os.remove(p)
+    return got
+
+
+step("⚙ 手前に表示: default off / apply / save / restore / headless ignores", _topmost)
+
+
+def _bg_window():
+    # queue window builds and follows the topmost setting; no jobs -> empty list
+    win._bg_open_window()
+    w = win._bg_win
+    win._bg_refresh_window([{"id": "000001_x", "state": "queued", "name": "S Beauty",
+                             "map": "/Game/M/L"}], 0.0)
+    rows = [w["tree"].item(i, "values") for i in w["tree"].get_children()]
+    assert rows and rows[0][0] == "待機中" and rows[0][2] == "L", rows
+    win._bg_refresh_window([], 0.0)
+    assert not w["tree"].get_children()
+    w["top"].withdraw()
+    return rows
+
+
+step("バックグラウンド: 待ち行列ウィンドウ build / refresh", _bg_window)
+
+
 def _busy():
     win._set_busy(True)
     assert win._is_busy()
