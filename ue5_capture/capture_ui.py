@@ -1176,6 +1176,9 @@ class CaptureWindow(object):
         name_body = self._resolve_name(self.name_tpl_var.get(), cam, self._current_sequence())
         if self.overwrite_var.get():
             suf = "%03d" % (core.latest_take_number(out, name_body) or 1)
+            if not self._confirm_overwrite(out, name_body, suf):
+                self.status_var.set("MRQ: 取り消しました（上書きしない）")
+                return False
             removed = core.delete_take_outputs(out, name_body, suf)
             if removed:
                 unreal.log("[SceneCapture] 上書き: %s テイク %s の既存出力 %d 件を削除"
@@ -2100,6 +2103,22 @@ class CaptureWindow(object):
         unreal.log("[SceneCapture/BG] ワーカー起動 pid %d" % pid)
         return pid
 
+    def _confirm_overwrite(self, out, name_body, take_str):
+        """「上書き」ON で消すことになる既存出力があれば、内容を見せて確認する。
+        無ければ聞かない。裏のワーカー（非表示パネル）は聞かない（キューに積む時に確認済み）。"""
+        if getattr(self, "_headless", False):
+            return True
+        names = []
+        n = core.delete_take_outputs(out, name_body, take_str, dry_run=True, found=names)
+        if not n:
+            return True
+        shown = names[:8] + (["… ほか %d 件" % (len(names) - 8)] if len(names) > 8 else [])
+        return bool(messagebox.askokcancel(
+            "上書きの確認",
+            "保存先に同じテイク（%s）の出力が %d 件あります。削除して上書きしますか？\n\n%s\n\n%s"
+            % (take_str, n, out, "\n".join(shown)),
+            icon="warning", parent=self.root))
+
     def _bg_enqueue_seq(self):
         """映像タブの今の設定をジョブとして待ち行列へ追加し、ワーカーが居なければ起動する。"""
         import capture_bg
@@ -2130,6 +2149,15 @@ class CaptureWindow(object):
                 parent=self.root):
             self.status_var.set("バックグラウンド: 取り消しました（未保存の変更あり）")
             return
+        if self.seq_overwrite_var.get():
+            # 裏のワーカーは聞けないので、積む時点で確認する（消すのはワーカーが撮る直前）
+            ow_cam = self._seq_first_camera(seq)
+            ow_out = self._expand_out_dir(self.seq_out_var.get().strip(), ow_cam, seq)
+            ow_name = self._resolve_name(self.seq_name_tpl_var.get(), ow_cam, seq)
+            ow_take = "%03d" % (core.latest_take_number(ow_out, ow_name) or 1)
+            if not self._confirm_overwrite(ow_out, ow_name, ow_take):
+                self.status_var.set("バックグラウンド: 取り消しました（上書きしない）")
+                return
         self._save_ui_state()
         q = self._bg_qdir()
         capture_bg.recover(q)
@@ -2483,6 +2511,9 @@ class CaptureWindow(object):
         name_body = self._resolve_name(self.seq_name_tpl_var.get(), seq_cam, seq)
         if self.seq_overwrite_var.get():
             take_str = "%03d" % (core.latest_take_number(base_out, name_body) or 1)
+            if not self._confirm_overwrite(base_out, name_body, take_str):
+                self.status_var.set("シーケンスレンダ: 取り消しました（上書きしない）")
+                return False
             removed = core.delete_take_outputs(base_out, name_body, take_str)
             if removed:
                 seq_notes.append("上書き: テイク %s の既存出力 %d 件を削除" % (take_str, removed))

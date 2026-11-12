@@ -557,6 +557,11 @@ def _naming():
     assert core.latest_take_number(d, "Shot") == 3
     assert core.latest_take_number(d, "Other") == 5
     assert core.latest_take_number(d, "None") == 0
+    # dry run (overwrite confirmation): counts and names the same targets, deletes nothing
+    names = []
+    assert core.delete_take_outputs(d, "Shot", "002", dry_run=True, found=names) == 2
+    assert sorted(names) == [os.path.join("Beauty_002", "Shot_Beauty_002.0001.png"), "Shot_Depth_002.exr"], names
+    assert os.path.exists(os.path.join(d, "Shot_Depth_002.exr")) and os.path.isdir(os.path.join(d, "Beauty_002"))
     n = core.delete_take_outputs(d, "Shot", "002")
     assert n == 2, n
     assert not os.path.exists(os.path.join(d, "Beauty_002"))

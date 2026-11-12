@@ -361,6 +361,39 @@ def _bg_window():
 step("バックグラウンド: 待ち行列ウィンドウ build / refresh", _bg_window)
 
 
+def _confirm_overwrite():
+    import tempfile
+    d = tempfile.mkdtemp(prefix="smoke_ow_")
+    asked = []
+    orig = ui.messagebox.askokcancel
+
+    def fake(title, msg, **kw):
+        asked.append(msg)
+        return fake.answer
+    ui.messagebox.askokcancel = fake
+    try:
+        assert win._confirm_overwrite(d, "Shot", "001") is True and not asked   # nothing to delete: no dialog
+        open(os.path.join(d, "Shot_Beauty_001.png"), "wb").close()
+        fake.answer = False
+        assert win._confirm_overwrite(d, "Shot", "001") is False
+        assert len(asked) == 1 and "Shot_Beauty_001.png" in asked[0] and "1 件" in asked[0], asked
+        assert os.path.exists(os.path.join(d, "Shot_Beauty_001.png"))            # asking deletes nothing
+        fake.answer = True
+        assert win._confirm_overwrite(d, "Shot", "001") is True and len(asked) == 2
+        assert win._confirm_overwrite(d, "Shot", "002") is True and len(asked) == 2  # other take: no dialog
+        win._headless = True                                                      # worker never asks
+        assert win._confirm_overwrite(d, "Shot", "001") is True and len(asked) == 2
+    finally:
+        win._headless = False
+        ui.messagebox.askokcancel = orig
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+    return len(asked)
+
+
+step("上書きの確認: 対象なしは聞かない / 対象ありは一覧つきで聞く / ワーカーは聞かない", _confirm_overwrite)
+
+
 def _busy():
     win._set_busy(True)
     assert win._is_busy()

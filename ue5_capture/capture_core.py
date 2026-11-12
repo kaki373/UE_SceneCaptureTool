@@ -1097,18 +1097,26 @@ def _take_file_pattern(name_body, take_str):
     return re.compile(r"^" + re.escape(name_body) + r"_[A-Za-z0-9]+_(" + take + r")(?=[._]|$)")
 
 
-def delete_take_outputs(output_dir, name_body, take_str):
+def delete_take_outputs(output_dir, name_body, take_str, dry_run=False, found=None):
     """「上書き」用: name_body のテイク take_str の既存出力を消す。
     対象はテイク毎サブフォルダ name_body_NNN（丸ごと）、直下の name_body_*_NNN.* ファイル、
     直下の素材サブフォルダ *_NNN / *_NNN_* の中の name_body_* ファイル（空になれば削除）。
-    他の名前のファイルには触れない。消した数を返す。"""
+    他の名前のファイルには触れない。消した数を返す。
+    dry_run=True なら消さずに数えるだけ（上書き前の確認用）。found にリストを渡すと対象の名前を足す。"""
     import shutil
     n = 0
     if not output_dir or not os.path.isdir(output_dir) or not name_body:
         return 0
+
+    def _note(name):
+        if found is not None:
+            found.append(name)
+
     sub = os.path.join(output_dir, "%s_%s" % (name_body, take_str))
     if os.path.isdir(sub):
-        shutil.rmtree(sub, ignore_errors=True)
+        _note(os.path.basename(sub) + os.sep)
+        if not dry_run:
+            shutil.rmtree(sub, ignore_errors=True)
         n += 1
     fpat = _take_file_pattern(name_body, take_str)
     dpat = re.compile(r"_" + re.escape(take_str) + r"(_|$)")
@@ -1116,8 +1124,10 @@ def delete_take_outputs(output_dir, name_body, take_str):
         full = os.path.join(output_dir, f)
         if os.path.isfile(full):
             if fpat.match(f):
+                _note(f)
                 try:
-                    os.remove(full)
+                    if not dry_run:
+                        os.remove(full)
                     n += 1
                 except OSError:
                     pass
@@ -1125,14 +1135,16 @@ def delete_take_outputs(output_dir, name_body, take_str):
             removed_here = 0
             for g in os.listdir(full):
                 if fpat.match(g):
+                    _note(os.path.join(f, g))
                     try:
-                        os.remove(os.path.join(full, g))
+                        if not dry_run:
+                            os.remove(os.path.join(full, g))
                         removed_here += 1
                     except OSError:
                         pass
             n += removed_here
             # 自分が空にしたフォルダだけ畳む（他の名前の空フォルダには触れない）
-            if removed_here:
+            if removed_here and not dry_run:
                 try:
                     if not os.listdir(full):
                         os.rmdir(full)
