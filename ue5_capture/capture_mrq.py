@@ -1471,8 +1471,13 @@ def _start_pie_level_shower():
         try:
             if state.get("asked") != pkg:
                 state["asked"] = pkg
+                state["asked_tick"] = state["ticks"]
                 unreal.GameplayStatics.load_stream_level(
                     pie, unreal.Name(pkg), True, True, unreal.LatentActionInfo())
+            elif state["ticks"] - state["asked_tick"] > 30:
+                # 読めないレベルで止まって残りを出せなくならないよう、諦めて次へ
+                _warn("サブレベルを表示できません（スキップ）: %s" % pkg)
+                pkgs.remove(pkg)
             else:
                 # ワールドへの追加は毎フレーム少しずつ進むので、撮り始める前に最後まで進める
                 unreal.GameplayStatics.flush_level_streaming(pie)
