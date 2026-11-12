@@ -66,8 +66,19 @@ _VPLOOK_TMP = "_vplook_tmp.png"
 
 
 def _apply_exposure_lock(on):
-    """capture_mrq が全ジョブに合流させる追加 cvar（reload をまたいで残る属性）を設定。"""
+    """capture_mrq が全ジョブに合流させる追加 cvar（reload をまたいで残る属性）を設定。
+    「モーションブラーなし」もここで一旦外す（映像タブは直後に _apply_no_motion_blur で入れ直す）。"""
     unreal._ue5capture_extra_cvars = list(_EXPOSURE_LOCK_CVARS) if on else []
+    unreal._ue5capture_no_motion_blur = False
+
+
+def _apply_no_motion_blur(on):
+    """映像タブの「モーションブラーなし」。_apply_exposure_lock の後に呼ぶ。
+    エンジンのブラーは cvar、時間サンプルのブレ（シャッター）は capture_mrq が PIE 側で止める。"""
+    if on:
+        unreal._ue5capture_extra_cvars = (list(getattr(unreal, "_ue5capture_extra_cvars", None) or [])
+                                          + [("r.MotionBlurQuality", 0)])
+    unreal._ue5capture_no_motion_blur = bool(on)
 
 
 _SEQ_OUTPUTS = [
@@ -136,6 +147,8 @@ _OVERWRITE_TIP = ("ON: テイク番号を進めず、この名前の最新テイ
 _OUT_DIR_TIP = ("出力フォルダ。ファイル名と同じトークン {level} {cut} {camera} {seq} が使える\n"
                 "（例 D:\\Captures\\{level}\\{cut}）。撮る時に展開し、無ければ作る。\n"
                 "設定には展開前のまま保存する")
+_NO_MBLUR_TIP = ("全素材をモーションブラーなしでレンダする。エンジンのブラーを切り、シャッターも閉じる" + chr(10) +
+                 "（時間サンプルは同じ時刻に揃うので、アンチエイリアスには効いたままブレだけ無くなる）")
 _BG_TIP = ("別のエディタ（画面に出ない）を裏で起動してレンダする。このエディタはその間も使える。\n"
            "保存済みのレベル/シーケンスを撮る（未保存の変更は写らない）。\n"
            "2 台目のエディタぶんの VRAM/メモリが要る。複数回押すとキューに積んで順番に撮る"
@@ -798,6 +811,9 @@ class CaptureWindow(object):
         self.seq_exposure_lock_cb = self._check(r, "露出固定", self.seq_exposure_lock_var,
                                                 _EXPOSURE_LOCK_TIP)
         self.seq_exposure_lock_cb.pack(side="left", padx=(8, 0))
+        self.seq_no_mblur_var = tk.BooleanVar(master=self.root, value=False)
+        self._check(r, "モーションブラーなし", self.seq_no_mblur_var,
+                    _NO_MBLUR_TIP).pack(side="left", padx=(8, 0))
         self.seq_viewport_look_var = tk.BooleanVar(master=self.root, value=False)
         self._check(r, "ビューポートのルック", self.seq_viewport_look_var,
                     _SEQ_VIEWPORT_LOOK_TIP).pack(side="left", padx=(8, 0))
@@ -2318,6 +2334,7 @@ class CaptureWindow(object):
         """戻り値: 非同期チェーンを開始したら True（完了側の _final が後始末）。"""
         import capture_mrq
         _apply_exposure_lock(self.seq_exposure_lock_var.get())
+        _apply_no_motion_blur(self.seq_no_mblur_var.get())
         seq = self._current_sequence()
         if seq is None:
             self.status_var.set("シーケンスレンダ: Sequencer でシーケンスを開いてください")
@@ -3695,6 +3712,7 @@ class CaptureWindow(object):
                 "seq_warm": self.seq_warm_var.get(), "seq_ts": self.seq_ts_var.get(),
                 "seq_fog": self.seq_fog_var.get(),
                 "seq_exposure_lock": self.seq_exposure_lock_var.get(),
+                "seq_no_mblur": self.seq_no_mblur_var.get(),
                 "seq_viewport_look": self.seq_viewport_look_var.get(),
                 "seq_out": self.seq_out_var.get(),
                 "seq_name_tpl": self.seq_name_tpl_var.get(),
@@ -3821,6 +3839,7 @@ class CaptureWindow(object):
         _setvar(self.seq_warm_var, "seq_warm"); _setvar(self.seq_ts_var, "seq_ts")
         _setvar(self.seq_fog_var, "seq_fog")
         _setvar(self.seq_exposure_lock_var, "seq_exposure_lock")
+        _setvar(self.seq_no_mblur_var, "seq_no_mblur")
         _setvar(self.seq_out_var, "seq_out")
         if "seq_name_tpl" in st:
             _setvar(self.seq_name_tpl_var, "seq_name_tpl")

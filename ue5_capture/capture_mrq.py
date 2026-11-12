@@ -622,6 +622,8 @@ def _restore_saved_scene(st):
         _run("pie_hider", st["pie_hider"]["stop"])
     if st.get("pie_levels"):
         _run("pie_levels", st["pie_levels"]["stop"])
+    if st.get("pie_mblur"):
+        _run("pie_mblur", st["pie_mblur"]["stop"])
     _run("hidden", _unhide)
     if st.get("matte"):
         _run("matte", lambda: _restore_matte_render_mode(st["matte"]))
@@ -1482,6 +1484,66 @@ def _start_pie_level_shower():
     return state
 
 
+def _start_pie_motion_blur_off():
+    """「モーションブラーなし」（unreal._ue5capture_no_motion_blur）のとき、PIE 側でシャッターを
+    閉じるウォッチャ。MRQ のシャッター角はポスプロの Motion Blur Amount で決まる（既定 0.5、
+    PPV → カメラの順に上書き。MoviePipeline.cpp）ので、PIE 側の全 PPV と全カメラで Amount を
+    0 に上書きする（スポーナブルは後から出るので毎 tick・冪等）。0 なら時間サンプルは全て同じ
+    時刻になり、エンジンのブラーも掛からない。PIE は破棄されるので復元不要。指定が無ければ None。
+    効かない場合: PPV が 1 つも無く、カメラのポスプロのウェイトも 0 のとき（既定の 0.5 が残る）。"""
+    if not getattr(unreal, "_ue5capture_no_motion_blur", False):
+        return None
+    state = {"h": None, "seen": False, "n": 0}
+
+    def _stop():
+        h = state.pop("h", None)
+        if h is not None:
+            try:
+                unreal.unregister_slate_post_tick_callback(h)
+            except Exception:
+                pass
+
+    def _zero(owner, prop):
+        s = owner.get_editor_property(prop)
+        if (s.get_editor_property("override_motion_blur_amount")
+                and s.get_editor_property("motion_blur_amount") == 0.0):
+            return 0
+        s.set_editor_property("override_motion_blur_amount", True)
+        s.set_editor_property("motion_blur_amount", 0.0)
+        owner.set_editor_property(prop, s)
+        return 1
+
+    def _tick(dt):
+        try:
+            pie = unreal.get_editor_subsystem(
+                unreal.UnrealEditorSubsystem).get_game_world()
+        except Exception:
+            pie = None
+        if pie is None:
+            if state["seen"]:
+                if not state["n"]:
+                    _warn("モーションブラーなし: PIE 側に PPV もカメラも見つからず、シャッターを閉じられませんでした")
+                _stop()        # PIE が終わった → 監視終了
+            return
+        state["seen"] = True
+        n = 0
+        try:
+            for a in unreal.GameplayStatics.get_all_actors_of_class(pie, unreal.PostProcessVolume):
+                n += _zero(a, "settings")
+            for a in unreal.GameplayStatics.get_all_actors_of_class(pie, unreal.CameraActor):
+                n += _zero(a.get_editor_property("camera_component"), "post_process_settings")
+        except Exception as e:
+            _core._warn_once("pie_mblur", "モーションブラーなし: PIE 側の設定に失敗: %s" % e)
+        if n:
+            if not state["n"]:
+                _log("モーションブラーなし: PIE 側でシャッターを閉じた（Motion Blur Amount 0）")
+            state["n"] += n
+
+    state["h"] = unreal.register_slate_post_tick_callback(_tick)
+    state["stop"] = _stop
+    return state
+
+
 def _start_pie_actor_hider(actors):
     """hidden_actors を PIE ワールド側でも隠すウォッチャ。LevelInstance 内包アクターは
     PIE で資産から再生成されるため、エディタ側の set_actor_hidden_in_game が伝搬しない
@@ -2028,6 +2090,7 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
     _KEEP["restore"] = _restore_scene
     try:
         st["pie_levels"] = _start_pie_level_shower()
+        st["pie_mblur"] = _start_pie_motion_blur_off()
         if matte_material is not None or matte_sil_material is not None:
             st["matte"] = _set_matte_render_mode(matte_actors)
         if hidden_actors:
