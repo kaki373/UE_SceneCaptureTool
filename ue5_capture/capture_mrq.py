@@ -620,6 +620,8 @@ def _restore_saved_scene(st):
 
     if st.get("pie_hider"):
         _run("pie_hider", st["pie_hider"]["stop"])
+    if st.get("pie_levels"):
+        _run("pie_levels", st["pie_levels"]["stop"])
     _run("hidden", _unhide)
     if st.get("matte"):
         _run("matte", lambda: _restore_matte_render_mode(st["matte"]))
@@ -749,6 +751,7 @@ def render_beauty(camera_actor, output_dir, width, height,
 
     _KEEP["restore"] = _restore_scene
     try:
+        st["pie_levels"] = _start_pie_level_shower()
         if hidden_actors:
             st["hidden"] = _hide_actors(hidden_actors)
             # PIE 側は元々 hidden だったものも含めて全指定を隠す（LevelInstance 内は
@@ -1389,6 +1392,96 @@ def _actor_pos_key(a):
             mesh, extent)
 
 
+def _editor_blueprint_levels_shown(world=None):
+    """エディタで表示中の『ブループリント』ストリーミング（LevelStreamingDynamic）の
+    サブレベルのパッケージ名。"""
+    world = world or _editor_world()
+    out = []
+    try:
+        levels = list(unreal.EditorLevelUtils.get_levels(world))
+    except Exception:
+        levels = []
+    for lv in levels:
+        try:
+            pkg = lv.get_path_name().split(".")[0]
+            sl = unreal.GameplayStatics.get_streaming_level(world, pkg)
+            if (sl is not None and sl.get_class().get_name() == "LevelStreamingDynamic"
+                    and sl.is_level_visible()):
+                out.append(pkg)
+        except Exception:
+            continue
+    return out
+
+
+def _start_pie_level_shower():
+    """エディタで表示中のブループリント ストリーミングのサブレベルを PIE 側でロード・表示する
+    ウォッチャ。MRQ はこの種のサブレベルを自動では出さない（レベル可視性トラックが無いと
+    ライトも背景も無い真っ黒になる。LV_029 で実測）。常時ロードのサブレベルは対象外
+    （元から出る）。ロード完了まで flush で待つ（ウォームアップより前に揃える）。
+    PIE は破棄されるので復元不要。対象が無ければ None。"""
+    pkgs = _editor_blueprint_levels_shown()
+    if not pkgs:
+        return None
+    state = {"h": None, "seen": False, "done": False, "ticks": 0, "asked": None}
+
+    def _stop():
+        h = state.pop("h", None)
+        if h is not None:
+            try:
+                unreal.unregister_slate_post_tick_callback(h)
+            except Exception:
+                pass
+
+    def _tick(dt):
+        try:
+            pie = unreal.get_editor_subsystem(
+                unreal.UnrealEditorSubsystem).get_game_world()
+        except Exception:
+            pie = None
+        if pie is None:
+            if state["seen"]:
+                if not state["done"]:
+                    _warn("サブレベルが表示される前にレンダが終わりました: %s" % ", ".join(pkgs))
+                _stop()        # PIE が終わった → 監視終了
+            return
+        state["seen"] = True
+        if state["done"]:
+            return
+        state["ticks"] += 1
+        pending = []
+        for pkg in pkgs:
+            try:
+                sl = unreal.GameplayStatics.get_streaming_level(pie, pkg)
+                if sl is not None and not sl.is_level_visible():
+                    pending.append(pkg)
+            except Exception as e:
+                _warn("サブレベルの状態を取得できません (%s): %s" % (pkg, e))
+        if not pending:
+            state["done"] = True
+            _log("ブループリント ストリーミングのサブレベル %d 個を PIE 側で表示（%d tick 目）"
+                 % (len(pkgs), state["ticks"]))
+            return
+        # 1 つずつ: Load Stream Level（表示込み・ロード完了までブロック）は潜在アクションで、
+        # Python からは uuid を変えられず、前のレベルの処理中に次を頼むと無視される（実測:
+        # 2 つ同時に頼むと片方しか出ない）。プロパティ should_be_loaded/visible を直接立てても
+        # PIE では読み込まれない（実測）
+        pkg = pending[0]
+        try:
+            if state.get("asked") != pkg:
+                state["asked"] = pkg
+                unreal.GameplayStatics.load_stream_level(
+                    pie, unreal.Name(pkg), True, True, unreal.LatentActionInfo())
+            else:
+                # ワールドへの追加は毎フレーム少しずつ進むので、撮り始める前に最後まで進める
+                unreal.GameplayStatics.flush_level_streaming(pie)
+        except Exception as e:
+            _warn("サブレベルを表示できません (%s): %s" % (pkg, e))
+
+    state["h"] = unreal.register_slate_post_tick_callback(_tick)
+    state["stop"] = _stop
+    return state
+
+
 def _start_pie_actor_hider(actors):
     """hidden_actors を PIE ワールド側でも隠すウォッチャ。LevelInstance 内包アクターは
     PIE で資産から再生成されるため、エディタ側の set_actor_hidden_in_game が伝搬しない
@@ -1934,6 +2027,7 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
 
     _KEEP["restore"] = _restore_scene
     try:
+        st["pie_levels"] = _start_pie_level_shower()
         if matte_material is not None or matte_sil_material is not None:
             st["matte"] = _set_matte_render_mode(matte_actors)
         if hidden_actors:
