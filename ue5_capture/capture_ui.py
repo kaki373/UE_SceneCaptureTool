@@ -313,10 +313,44 @@ class CaptureWindow(object):
                     selectcolor=_THEME["fg"])
         m.add_checkbutton(label="手前に表示", variable=self.topmost_var,
                           command=self._on_topmost_change)
+        m.add_separator()
+        m.add_command(label="設定ファイルを開く", command=self._open_settings_file)
         try:
             m.tk_popup(self.root.winfo_pointerx(), self.root.winfo_pointery())
         finally:
             m.grab_release()
+
+    def _open_settings_file(self):
+        """設定 JSON をメモ帳で開く（ffmpeg_path を手で書くため）。"""
+        import subprocess
+        self._save_ui_state()          # ファイルと ffmpeg_path の行を必ず用意する
+        path = self._settings_path()
+        try:
+            subprocess.Popen(["notepad.exe", path])
+        except Exception as e:
+            self.status_var.set("設定ファイルを開けません: %s（%s）" % (e, path))
+            return
+        self.status_var.set("ffmpeg_path に ffmpeg.exe のフルパスを書いて保存してください"
+                            "（他の項目はパネルが上書きします）")
+
+    def _reload_ffmpeg_path(self):
+        """設定 JSON の ffmpeg_path を読み直す（パネルを開いたまま手で書いた値を拾う）。
+        JSON として壊れた書き方（\\ を 1 本で書く・引用符ごと貼る）でも、実在する
+        ファイルを指していれば受け付ける。"""
+        import re
+        try:
+            with open(self._settings_path(), "r", encoding="utf-8") as f:
+                text = f.read()
+        except Exception:
+            return
+        m = re.search(r'"ffmpeg_path"\s*:\s*"+([^"\r\n]*)"+', text)
+        if not m:
+            return
+        raw = m.group(1).strip()
+        for cand in (raw, raw.replace("\\\\", "\\")):
+            if cand and os.path.isfile(cand):
+                self._ffmpeg_hint = os.path.normpath(cand)
+                return
 
     def _on_topmost_change(self):
         self._apply_topmost()
@@ -2427,10 +2461,12 @@ class CaptureWindow(object):
         mp4_any = any(m for _, m in wants.values())
         ffmpeg = None
         if mp4_any:
+            self._reload_ffmpeg_path()
             ffmpeg = core.find_ffmpeg(getattr(self, "_ffmpeg_hint", None))
             if not ffmpeg:
-                self.status_var.set("MP4 出力には ffmpeg が必要です（見つかりません。"
-                                    "設定 JSON の ffmpeg_path か PATH を確認）")
+                self.status_var.set("ffmpeg が見つからず MP4 を出力できません。右上の ⚙ →"
+                                    "「設定ファイルを開く」で ffmpeg_path に ffmpeg.exe の"
+                                    "パスを書いてください")
                 return False
             self._ffmpeg_hint = ffmpeg
             # libx264 + yuv420p は奇数の幅/高さを拒否する（spec E12）
@@ -3675,6 +3711,7 @@ class CaptureWindow(object):
 
     def _save_ui_state(self):
         try:
+            self._reload_ffmpeg_path()   # 手で書いた ffmpeg_path を上書きで消さない
             state = self._ui_state_dict()
             # 途中で失敗しても空ファイルを残さない（tmp に書いて差し替え）
             path = self._settings_path()

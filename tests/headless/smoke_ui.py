@@ -344,6 +344,42 @@ def _topmost():
 step("⚙ 手前に表示: default off / apply / save / restore / headless ignores", _topmost)
 
 
+def _ffmpeg_path_edit():
+    # a path typed into the settings JSON while the panel is open is picked up and survives saves
+    p = win._settings_path()
+    exe = os.path.join(os.path.dirname(p), "fake dir", "ffmpeg.exe")
+    os.makedirs(os.path.dirname(exe), exist_ok=True)
+    open(exe, "wb").close()
+    old = getattr(win, "_ffmpeg_hint", None)
+    got = []
+    forms = (json.dumps(exe),                    # valid JSON ("\\")
+             '"%s"' % exe,                       # single backslashes (invalid JSON)
+             '""%s""' % exe,                     # pasted with its own quotes
+             json.dumps(exe.replace("\\", "/")))
+    for form in forms:
+        win._ffmpeg_hint = None
+        with open(p, "w", encoding="utf-8") as f:
+            f.write('{\n  "topmost": false,\n  "ffmpeg_path": %s\n}\n' % form)
+        win._save_ui_state()                     # must not wipe the hand-written value
+        with open(p, "r", encoding="utf-8") as f:
+            saved = json.load(f)["ffmpeg_path"]
+        assert os.path.normpath(saved) == os.path.normpath(exe), (form, saved)
+        got.append(saved)
+    # a path that does not exist is ignored
+    win._ffmpeg_hint = None
+    with open(p, "w", encoding="utf-8") as f:
+        f.write('{"ffmpeg_path": "Z:\\\\nope\\\\ffmpeg.exe"}')
+    win._reload_ffmpeg_path()
+    assert win._ffmpeg_hint is None
+    win._ffmpeg_hint = old
+    os.remove(exe); os.rmdir(os.path.dirname(exe)); os.remove(p)
+    return len(got)
+
+
+step("設定ファイルの ffmpeg_path: 手書きを拾う / 保存で消さない / 壊れた書き方も可 / 無いパスは無視",
+     _ffmpeg_path_edit)
+
+
 def _bg_window():
     # queue window builds and follows the topmost setting; no jobs -> empty list
     win._bg_open_window()

@@ -60,7 +60,7 @@ PNG / EXR で書き出す。映像タブは Sequencer で開いている LevelSe
 | **numpy** | AA ダウンスケール / Depth 正規化 / マスク合成 | **必須** |
 | **Pillow (PIL)** | PNG / 16bit PNG の入出力、合成 | **必須** |
 | imageio | Z-Depth を **EXR (float)** で出力する場合のみ（OpenEXR + Imath / opencv-python でも可） | 任意 |
-| imageio-ffmpeg | 映像タブの MP4 エンコードに使う ffmpeg 本体（PATH 上の ffmpeg、設定 JSON の `ffmpeg_path` でも可） | 任意 |
+| imageio-ffmpeg | 映像タブの MP4 エンコードに使う ffmpeg 本体（PATH 上の ffmpeg でも可。手持ちの ffmpeg.exe を使うなら、パネル右上の ⚙ →「設定ファイルを開く」で `ffmpeg_path` にパスを書く） | 任意 |
 | tkinter (tcl/tk) | GUI。エンジン同梱 Python に入っている。無ければ CUI へ自動フォールバック | 任意 |
 
 版の下限は [`requirements.txt`](requirements.txt)。`Install.bat` が自動で入れる
