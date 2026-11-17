@@ -2025,26 +2025,32 @@ class CaptureWindow(object):
 
     def _seq_overscan(self, seq, start, end):
         """レンダ範囲 [start, end) で使うカメラの Overscan を (値, エラー文) で返す。
-        値は範囲の頭のカメラカットのもの。カットごとに値が違うと 1 つの解像度では撮れないので
-        エラーにする。プレイヘッドは元の位置へ戻す。"""
+        値は範囲の頭のもの。解像度は途中で変えられず、MRQ の画角もこの 1 つの値で広げるので、
+        カメラカットごとに違う・キーで変化する場合はエラーにする（各カットの頭・中・末尾を見る）。
+        プレイヘッドは元の位置へ戻す。"""
         lib = unreal.LevelSequenceEditorBlueprintLibrary
-        frames = [int(start)]
+        start, end = int(start), int(end)
+        cuts = [start]
         try:
             for tr in unreal.MovieSceneSequenceExtensions.find_tracks_by_exact_type(
                     seq, unreal.MovieSceneCameraCutTrack) or []:
                 for sec in tr.get_sections():
                     f = int(sec.get_start_frame())
                     if start < f < end:
-                        frames.append(f)
+                        cuts.append(f)
         except Exception as e:
             unreal.log_warning("[SceneCapture] カメラカットの列挙に失敗: %s" % e)
+        cuts = sorted(set(cuts))
+        frames = set()
+        for a, b in zip(cuts, cuts[1:] + [end]):
+            frames.update((a, (a + b - 1) // 2, max(a, b - 1)))
         try:
             keep = lib.get_current_time()
         except Exception:
             keep = None
         vals = []
         try:
-            for f in sorted(set(frames)):
+            for f in sorted(frames):
                 cam = self._sequence_camera_at(seq, f)
                 vals.append((f, core.camera_overscan(cam) if cam is not None else 0.0))
         finally:
@@ -2056,7 +2062,7 @@ class CaptureWindow(object):
         osc = vals[0][1]
         for f, v in vals[1:]:
             if abs(v - osc) > 1e-4:
-                return osc, ("カメラカットごとに Overscan が違います（F%d: %g%% / F%d: %g%%）。"
+                return osc, ("カメラの Overscan が範囲の途中で変わります（F%d: %g%% / F%d: %g%%）。"
                              "値をそろえるか、範囲を分けて撮ってください"
                              % (vals[0][0], osc * 100.0, f, v * 100.0))
         return osc, None

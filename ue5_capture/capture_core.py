@@ -248,7 +248,10 @@ def _camera_component(camera_actor):
 
 def camera_overscan(camera_actor):
     """カメラコンポーネントの Overscan（0〜1。0.1 = 視錐台を 10% 広げる）。無ければ 0。
-    シーケンサでキーが打たれていれば、いま評価されている値が返る。"""
+    シーケンサでキーが打たれていれば、いま評価されている値が返る。
+    CineCamera 以外は 0（MRQ 側で画角を広げる手段が filmback しか無いため対象外）。"""
+    if not isinstance(camera_actor, unreal.CineCameraActor):
+        return 0.0
     try:
         o = float(_camera_component(camera_actor).get_editor_property("overscan"))
     except Exception:

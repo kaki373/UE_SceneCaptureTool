@@ -551,7 +551,7 @@ def _overscan_ui():
         osc, err = win._seq_overscan(seq, 0, 48)
         res["seq"] = (osc, err)
         if ui.CaptureWindow._camera_cut_camera_for_frame(seq, 30) is not None:
-            assert abs(osc - 0.1) < 1e-6 and err and "F24" in err, res
+            assert abs(osc - 0.1) < 1e-6 and err and "F24" in err, res   # first frame of cut 2
             osc1, err1 = win._seq_overscan(seq, 0, 24)        # one cut only -> fine
             assert abs(osc1 - 0.1) < 1e-6 and err1 is None, (osc1, err1)
         else:

@@ -121,10 +121,7 @@ behind-matte) は SceneCapture2D で同フレームを撮る。
   (最高 / 高 / 標準 / 軽量) から選択する (6 章)。Quality モード (CRF) のみで、
   ビットレート指定モードは対象外。ffmpeg 後段エンコードは設計のみ (6.3、v1 未実装)。
 - MP4 の音声は含めない (`include_audio=False` 固定)。
-- Overscan はシーケンスモードでは **v1 未実装** (将来拡張)。実装する場合は
-  `unreal.MoviePipelineCameraSetting` の `override_camera_overscan` /
-  `overscan_percentage` による % 指定のみとする (5.5。カメラアクターの filmback には
-  触らない。px 指定はシーケンス途中でカメラが切り替わると破綻するため対象外)。
+- Overscan はカメラの Overscan（UE のカメラ設定）に従う（5.5。2026-11-17 実装）。ツール側の入力は無い。
 
 ---
 
@@ -501,15 +498,19 @@ engine/render_warm_up_count、`MoviePipelineGameOverrideSetting` の高品質設
 - `fog_off` は同じ実装 (start_console_commands に `r.Fog 0` / `r.VolumetricFog 0`、
   完了時に 1 へ復元) を使う。
 
-### 5.5 Overscan (% のみ。**v1 未実装** - 将来拡張用の設計)
+### 5.5 Overscan (カメラの Overscan に従う。2026-11-17 実装)
 
-```python
-if overscan > 0.0:
-    camset = cfg.find_or_add_setting_by_class(unreal.MoviePipelineCameraSetting)
-    camset.set_editor_property("override_camera_overscan", True)
-    camset.set_editor_property("overscan_percentage", float(overscan))
-```
-解像度は呼び出し側で W,H を (1+f) 倍して渡す (既存静止画と同じ規約)。
+MRQ はカメラの Overscan で広げた分を PNG / JPG / MP4 では切り落として書く (残るのは EXR の
+data window だけ)。`MoviePipelineCameraSetting.overscan_percentage` で上書きしても同じなので使わない。
+代わりに次の 3 つで実現する (`capture_mrq._start_pie_overscan` / `_apply_overscan_setting`、
+`capture_core.overscan_size` / `get_camera_settings`)。
+
+- 解像度は呼び出し側が (1+o) 倍して渡す (丸めは MRQ と同じ単精度の切り上げ)。
+- MRQ のカメラ Overscan は 0 で上書きし、PIE 側の CineCamera の filmback を (1+o) 倍にする。
+- SceneCapture 系は `get_camera_settings` の fov にカメラの Overscan が足される。
+
+値はレンダ範囲の頭のもの。カットごとに違う・キーで変化する場合は撮らない
+(`capture_ui._seq_overscan`)。CineCamera 以外と、filmback にキーがあるカメラは対象外。
 
 ### 5.6 進捗表示
 
@@ -887,7 +888,8 @@ PNG 連番 + MP4 + Depth AOV + テイクサブフォルダでレンダ」して�
 | ui: 設定 JSON (9 章のキー) | 実装済み | 保存 / 復元を確認 |
 | ui: 進捗ポーリングとキャンセル | 実装済み | 5.6 / 5.7 (キャンセル後の on_finished 発火は 5.7 の注記参照) |
 | ffmpeg 後段エンコード (6.3) | **未実装** | 設計のみ。将来拡張 (12 章) |
-| Overscan (5.5) / アセットコンボ (2.1) | **未実装** | 設計のみ。将来拡張 (12 章) |
+| Overscan (5.5) | 実装済み | カメラの Overscan に従う (2026-11-17) |
+| アセットコンボ (2.1) | **未実装** | 設計のみ。将来拡張 (12 章) |
 | ドキュメント更新 (README への Depth 制限記載ほか) | 実装済み | 7.3 / 7.5 の制限を明記 |
 
 ---
@@ -915,8 +917,6 @@ PNG 連番 + MP4 + Depth AOV + テイクサブフォルダでレンダ」して�
   などのプリセット拡張も可能。
 - **シーケンス選択コンボ** (2.1): Asset Registry 列挙による任意シーケンス指定
   (現状は Sequencer で開いているシーケンスのみ)。
-- **シーケンスモードの Overscan** (5.5 に設計済み・未実装):
-  `MoviePipelineCameraSetting` による % 指定。
 - **MP4 ビットレート指定モード**: 内蔵エンコーダの `VariableBitRate` +
   `average_bitrate_in_mbps` の UI 公開 (v1 は Quality モードのみ)。
 - **音声**: 内蔵 MP4 の `include_audio=True` 化と、シーケンスのオーディオトラック検証。
