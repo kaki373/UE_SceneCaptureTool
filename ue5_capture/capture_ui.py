@@ -2102,11 +2102,24 @@ class CaptureWindow(object):
         seq = self._current_sequence()
         if seq is None:
             return None
+        # 開いている Sequencer 経由ならスポーナブルも解決できる（いまの時刻 → 再生範囲の頭）
+        frames = []
+        try:
+            frames.append(int(unreal.LevelSequenceEditorBlueprintLibrary.get_current_time()))
+        except Exception:
+            pass
+        try:
+            frames.append(int(unreal.MovieSceneSequenceExtensions.get_playback_start(seq)))
+        except Exception:
+            pass
+        for f in frames:
+            cam = self._camera_cut_camera_for_frame(seq, f)
+            if cam is not None:
+                return cam
         import capture_mrq
         cams = capture_mrq._camera_cut_camera_actors(seq, core._get_editor_world())
         if not cams:
-            # スポーナブルはカメラカットから解決できないので、ワールド上の
-            # カメラ（list_cameras 側でスポーナブルも拾っている）で代替する。
+            # ここまでで解決できなければワールド上のカメラで代替する
             cams = core.list_cameras()
         return cams[0] if cams else None
 
