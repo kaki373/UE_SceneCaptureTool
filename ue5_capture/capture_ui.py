@@ -689,7 +689,7 @@ class CaptureWindow(object):
                     ).pack(anchor="w")
 
         # ---- 詳細設定 ----
-        advf = self._fold(body, "詳細設定（品質 / Overscan / VDB雲）")
+        advf = self._fold(body, "詳細設定（品質 / VDB雲）")
         r = self._row(advf, "品質")
         ttk.Label(r, text="ウォームアップ").pack(side="left")
         self.mrq_warmup_var = tk.StringVar(master=self.root, value="32")
@@ -701,25 +701,6 @@ class CaptureWindow(object):
         self.aa_var = tk.StringVar(master=self.root, value="2x")
         ttk.Combobox(r, textvariable=self.aa_var, values=["1x", "2x", "4x"],
                      state="readonly", width=4).pack(side="left", padx=(4, 0))
-        # Overscan（ON のとき % か 直接ピクセルで余白を追加。元フレームは中央維持・全パス共通）
-        r = self._row(advf, "Overscan")
-        self.overscan_on_var = tk.BooleanVar(master=self.root, value=False)
-        self._check(r, "ON", self.overscan_on_var,
-                    "画面の外側に余白を足してレンダする（元フレームは中央のまま・全素材共通）"
-                    ).pack(side="left")
-        self.overscan_mode_var = tk.StringVar(master=self.root, value="percent")
-        ttk.Radiobutton(r, text="%", variable=self.overscan_mode_var,
-                        value="percent").pack(side="left", padx=(10, 0))
-        self.overscan_var = tk.StringVar(master=self.root, value="0")
-        self._entry(r, self.overscan_var, 5).pack(side="left", padx=(2, 10))
-        ttk.Radiobutton(r, text="px", variable=self.overscan_mode_var,
-                        value="pixels").pack(side="left")
-        ttk.Label(r, text="X", style="Sub.TLabel").pack(side="left", padx=(6, 2))
-        self.overscan_x_var = tk.StringVar(master=self.root, value="0")
-        self._entry(r, self.overscan_x_var, 5).pack(side="left")
-        ttk.Label(r, text="Y", style="Sub.TLabel").pack(side="left", padx=(6, 2))
-        self.overscan_y_var = tk.StringVar(master=self.root, value="0")
-        self._entry(r, self.overscan_y_var, 5).pack(side="left")
         r = self._row(advf, "その他")
         self.mrq_camasp_var = tk.BooleanVar(master=self.root, value=True)
         self._check(r, "カメラのアスペクト", self.mrq_camasp_var).pack(side="left")
@@ -790,7 +771,13 @@ class CaptureWindow(object):
         self._check(r, "カメラのアスペクト", self.seq_camasp_var,
                     "カメラカットのカメラのアスペクト比から高さを自動で決める",
                     command=self._sync_seq_h).pack(side="left", padx=(10, 0))
+        # カメラの Overscan が入っている時だけ「Overscan 10% → 2112×1188」を出す（表示のみ）
+        self.seq_osc_var = tk.StringVar(master=self.root, value="")
+        self._tip(ttk.Label(r, textvariable=self.seq_osc_var, style="Val.TLabel"),
+                  "カメラの Overscan（UE のカメラ設定）の分だけ外側を足して撮る。"
+                  "値はレンダ範囲の頭のもの").pack(side="left", padx=(8, 0))
         self.seq_w_var.trace_add("write", lambda *a: self._sync_seq_h())
+        self.seq_h_var.trace_add("write", lambda *a: self._update_seq_osc())
 
         # ---- 出力先 ----
         outf = self._card(body, "出力先")
@@ -1158,18 +1145,10 @@ class CaptureWindow(object):
         if W < 16 or H < 16:
             self.status_var.set("MRQ: 解像度が不正です (%d×%d)" % (W, H))
             return False
-        # Overscan: ON のとき fx(横)/fy(縦) を決める。% は一律、px は X/Y 別。
-        # カメラの filmback を一時拡大して FOV を縦横独立に広げ、解像度も ×(1+f) に拡大。
-        fx = fy = 0.0
-        if self.overscan_on_var.get():
-            if self.overscan_mode_var.get() == "pixels":
-                fx = (max(0.0, self._float_var(self.overscan_x_var, 0.0)) / W) if W > 0 else 0.0
-                fy = (max(0.0, self._float_var(self.overscan_y_var, 0.0)) / H) if H > 0 else 0.0
-            else:
-                fx = fy = max(0.0, self._float_var(self.overscan_var, 0.0) / 100.0)
-        if fx > 0.0 or fy > 0.0:
-            W = int(round(W * (1.0 + fx)))
-            H = int(round(H * (1.0 + fy)))
+        # カメラの Overscan（UE のカメラ設定）が入っていれば、解像度を (1+o) 倍にして外側を足す。
+        # 画角は MRQ 側が overscan 引数で、SceneCapture 側が get_camera_settings で広げる
+        osc = core.camera_overscan(cam)
+        W, H = core.overscan_size(W, H, osc)
         warm = max(1, self._int_var(self.mrq_warmup_var, 32))
         ts = max(1, self._int_var(self.mrq_ts_var, 8))
         auto_rng_failed = False
@@ -1189,22 +1168,6 @@ class CaptureWindow(object):
             else:
                 auto_rng_failed = True
         self._save_ui_state()
-        # Overscan: filmback を一時拡大（全パスのレンダ前。MRQ完了後/失敗時に復元）。
-        _osc_fb = None
-        if fx > 0.0 or fy > 0.0:
-            try:
-                _osc_fb = core.set_camera_overscan_filmback(cam, fx, fy)
-            except Exception as e:
-                self.status_var.set("Overscan filmback 設定失敗: %s" % e)
-
-        def _restore_fb():
-            if _osc_fb is not None:
-                try:
-                    core.restore_camera_filmback(cam, _osc_fb[0], _osc_fb[1])
-                except Exception as e:
-                    unreal.log_warning("[SceneCapture] filmback 復元失敗: %s" % e)
-        # 途中で例外が出ても _run_guarded / _finalize が必ず戻す
-        self._restore_hooks.append(_restore_fb)
         # 名前本体（テンプレート解決）と通し番号。通常は次の番号を振り、設定違いを上書きしない。
         # 「上書き」ON ではこの名前の最新テイクの既存出力を消して同じ番号で出し直す。
         name_body = self._resolve_name(self.name_tpl_var.get(), cam, self._current_sequence())
@@ -1335,6 +1298,10 @@ class CaptureWindow(object):
         if vp_try and not core.viewport_pilots(cam):
             vp_try = False
             skip_notes.append("ビューポートのルック: ビューポートがこのカメラをパイロットしていないため MRQ 近似で撮影")
+        if vp_try and osc > 0.0:
+            # ビューポート撮影は広げた解像度と画角を保証できない
+            vp_try = False
+            skip_notes.append("ビューポートのルック: カメラに Overscan があるため MRQ 近似で撮影")
         vp = {"ok": False, "tmp": os.path.join(out, _VPLOOK_TMP)}
         try:
             # 前回の撮影がタイムアウト後に書いた一時ファイルの残り
@@ -1818,7 +1785,7 @@ class CaptureWindow(object):
             self.status_var.set("追加 MRQ レンダ中… (%s)" % j["base"])
             self.root.update()
             try:
-                capture_mrq.render_beauty(cam, out, W, H,
+                capture_mrq.render_beauty(cam, out, W, H, overscan=osc,
                                           image_format=j.get("fmt", "png"),
                                           # CloudMatte 系はライティング非依存のαのみ。
                                           # TS>1 だと空のサブフレームが平均されて
@@ -1944,7 +1911,7 @@ class CaptureWindow(object):
             self.status_var.set("MRQ Beauty レンダ中… (PIEに入ります / 完了まで待機)")
             self.root.update()
             try:
-                capture_mrq.render_beauty(cam, out, W, H, image_format=img_fmt,
+                capture_mrq.render_beauty(cam, out, W, H, overscan=osc, image_format=img_fmt,
                                           also_png=aux_png,
                                           light_pass=want_rlfull,
                                           temporal_samples=ts_main, warmup=warm,
@@ -2056,6 +2023,44 @@ class CaptureWindow(object):
                         return o
         return None
 
+    def _seq_overscan(self, seq, start, end):
+        """レンダ範囲 [start, end) で使うカメラの Overscan を (値, エラー文) で返す。
+        値は範囲の頭のカメラカットのもの。カットごとに値が違うと 1 つの解像度では撮れないので
+        エラーにする。プレイヘッドは元の位置へ戻す。"""
+        lib = unreal.LevelSequenceEditorBlueprintLibrary
+        frames = [int(start)]
+        try:
+            for tr in unreal.MovieSceneSequenceExtensions.find_tracks_by_exact_type(
+                    seq, unreal.MovieSceneCameraCutTrack) or []:
+                for sec in tr.get_sections():
+                    f = int(sec.get_start_frame())
+                    if start < f < end:
+                        frames.append(f)
+        except Exception as e:
+            unreal.log_warning("[SceneCapture] カメラカットの列挙に失敗: %s" % e)
+        try:
+            keep = lib.get_current_time()
+        except Exception:
+            keep = None
+        vals = []
+        try:
+            for f in sorted(set(frames)):
+                cam = self._sequence_camera_at(seq, f)
+                vals.append((f, core.camera_overscan(cam) if cam is not None else 0.0))
+        finally:
+            if keep is not None:
+                try:
+                    lib.set_current_time(keep)
+                except Exception:
+                    pass
+        osc = vals[0][1]
+        for f, v in vals[1:]:
+            if abs(v - osc) > 1e-4:
+                return osc, ("カメラカットごとに Overscan が違います（F%d: %g%% / F%d: %g%%）。"
+                             "値をそろえるか、範囲を分けて撮ってください"
+                             % (vals[0][0], osc * 100.0, f, v * 100.0))
+        return osc, None
+
     def _refresh_sequence(self):
         seq = self._current_sequence()
         if seq is None:
@@ -2071,27 +2076,41 @@ class CaptureWindow(object):
         except Exception:
             self.seq_name_var.set(seq.get_name())
         self._sync_seq_h()
+        self._update_seq_osc()
         self._update_name_preview()
 
     def _seq_camera_aspect(self):
         """現在のシーケンスのカメラカットに束縛されたカメラのアスペクト比。
         解決できなければ 0.0（Cine は filmback 由来、素の CameraActor は
         aspect_ratio プロパティ。どちらも aspect_ratio に反映される）。"""
-        seq = self._current_sequence()
-        if seq is None:
-            return 0.0
         try:
-            import capture_mrq
-            cams = capture_mrq._camera_cut_camera_actors(seq, core._get_editor_world())
-            if not cams:
-                # スポーナブルはカメラカットから解決できないので、ワールド上の
-                # カメラ（list_cameras 側でスポーナブルも拾っている）で代替する。
-                cams = core.list_cameras()
-            if cams:
-                return core.get_camera_settings(cams[0]).get("aspect_ratio", 0.0)
+            cam = self._seq_display_camera()
+            if cam is not None:
+                return core.get_camera_settings(cam).get("aspect_ratio", 0.0)
         except Exception:
             pass
         return 0.0
+
+    def _seq_display_camera(self):
+        """表示用（アスペクト・Overscan）のカメラ。プレイヘッドは動かさない。"""
+        seq = self._current_sequence()
+        if seq is None:
+            return None
+        import capture_mrq
+        cams = capture_mrq._camera_cut_camera_actors(seq, core._get_editor_world())
+        if not cams:
+            # スポーナブルはカメラカットから解決できないので、ワールド上の
+            # カメラ（list_cameras 側でスポーナブルも拾っている）で代替する。
+            cams = core.list_cameras()
+        return cams[0] if cams else None
+
+    def _update_seq_osc(self):
+        try:
+            self.seq_osc_var.set(self._overscan_note(
+                self._seq_display_camera(),
+                self._int_var(self.seq_w_var, 0), self._int_var(self.seq_h_var, 0)).strip())
+        except Exception:
+            self.seq_osc_var.set("")
 
     def _sync_seq_h(self, *a):
         """「カメラのアスペクト」ON のとき、シーケンスのカメラの aspect から
@@ -2432,6 +2451,7 @@ class CaptureWindow(object):
         if W < 16 or H < 16:
             self.status_var.set("シーケンスレンダ: 解像度が不正です (%d×%d)" % (W, H))
             return False
+        base_wh = (W, H)
         warm = max(1, self._int_var(self.seq_warm_var, 32))
         ts = max(1, self._int_var(self.seq_ts_var, 8))
         ext = unreal.MovieSceneSequenceExtensions
@@ -2448,6 +2468,14 @@ class CaptureWindow(object):
             ce_eff = ext.get_playback_end(seq)
         fr = ext.get_display_rate(seq)
         fps_num, fps_den = fr.numerator, max(fr.denominator, 1)
+        # カメラの Overscan（UE のカメラ設定）: レンダ範囲の頭の値で解像度を (1+o) 倍にする
+        # （MRQ と同じく解像度は途中で変えられない。画角は render_sequence の overscan 引数と
+        # get_camera_settings が広げる）
+        osc, osc_err = self._seq_overscan(seq, cs_eff, ce_eff)
+        if osc_err:
+            self.status_var.set("シーケンスレンダ: " + osc_err)
+            return False
+        W, H = core.overscan_size(W, H, osc)
 
         wants = {k: (pv.get(), mv.get()) for k, (pv, mv) in self.seq_out_vars.items()}
         if not any(p or m for p, m in wants.values()):
@@ -2458,6 +2486,9 @@ class CaptureWindow(object):
             return wants[key][0] or wants[key][1]
 
         seq_notes = []
+        if osc > 0.0:
+            seq_notes.append("カメラの Overscan %g%%: %d×%d → %d×%d"
+                             % ((osc * 100.0,) + base_wh + (W, H)))
         mp4_any = any(m for _, m in wants.values())
         ffmpeg = None
         if mp4_any:
@@ -2985,7 +3016,7 @@ class CaptureWindow(object):
                 try:
                     capture_mrq.render_sequence(
                         seq, out, rw, rh, name_body, take_str,
-                        do_png=True, do_mp4=False,
+                        do_png=True, do_mp4=False, overscan=osc,
                         temporal_samples=1, warmup=min(warm, 8),
                         custom_start=cs, custom_end=ce,
                         fog_off=seq_fog, on_done=cb, **kw)
@@ -3075,7 +3106,7 @@ class CaptureWindow(object):
             try:
                 capture_mrq.render_sequence(
                     seq, out, W, H, name_body, take_str,
-                    do_png=True, do_mp4=False,
+                    do_png=True, do_mp4=False, overscan=osc,
                     temporal_samples=1, warmup=warm,
                     custom_start=cs, custom_end=ce,
                     backing_actors=matte_prims, backing_white=True,
@@ -3106,7 +3137,7 @@ class CaptureWindow(object):
             try:
                 capture_mrq.render_sequence(
                     seq, out, W, H, name_body, take_str,
-                    do_png=True, do_mp4=False,
+                    do_png=True, do_mp4=False, overscan=osc,
                     temporal_samples=ts, warmup=warm,
                     custom_start=cs, custom_end=ce,
                     sky_matte=True, beauty_label="SkyMatte",
@@ -3137,7 +3168,7 @@ class CaptureWindow(object):
             try:
                 capture_mrq.render_sequence(
                     seq, out, W, H, name_body, take_str,
-                    do_png=True, do_mp4=False,
+                    do_png=True, do_mp4=False, overscan=osc,
                     temporal_samples=ts, warmup=warm,
                     custom_start=cs, custom_end=ce,
                     hidden_actors=matte_actors,
@@ -3210,7 +3241,7 @@ class CaptureWindow(object):
             try:
                 capture_mrq.render_sequence(
                     seq, out, W, H, name_body, take_str,
-                    do_png=True, do_mp4=False,
+                    do_png=True, do_mp4=False, overscan=osc,
                     temporal_samples=ts, warmup=warm,
                     custom_start=cs, custom_end=ce,
                     hidden_actors=list(matte_prims) + front_vols + front,
@@ -3249,7 +3280,7 @@ class CaptureWindow(object):
             self.root.update()
             capture_mrq.render_sequence(
                 seq, out, W, H, name_body, take_str,
-                do_png=True, do_mp4=False,
+                do_png=True, do_mp4=False, overscan=osc,
                 temporal_samples=ts, warmup=warm,
                 custom_start=cs, custom_end=ce,
                 depth_material=depth_mat, normal_material=normal_mat,
@@ -3604,8 +3635,9 @@ class CaptureWindow(object):
             asp = core.get_camera_settings(cam).get("aspect_ratio", 0.0)
             W = self._int_var(self.w_var, 0)
             if asp > 0.1 and W > 0:
-                self.cam_res_var.set("→ %d×%d  (%.3f:1)%s"
-                                     % (W, int(round(W / asp)), asp, note))
+                H = int(round(W / asp))
+                self.cam_res_var.set("→ %d×%d  (%.3f:1)%s%s"
+                                     % (W, H, asp, self._overscan_note(cam, W, H), note))
             elif asp > 0.1:
                 self.cam_res_var.set("(%.3f:1)%s" % (asp, note))
             else:
@@ -3613,6 +3645,14 @@ class CaptureWindow(object):
         except Exception as e:
             self.cam_res_var.set("(取得失敗)")
             unreal.log_warning("[SceneCapture] カメラ解像度表示の更新に失敗: %s" % e)
+
+    @staticmethod
+    def _overscan_note(cam, w, h):
+        """カメラに Overscan が入っている時の表示（例「  Overscan 10% → 2112×1188」）。無ければ空。"""
+        osc = core.camera_overscan(cam) if cam is not None else 0.0
+        if osc <= 0.0:
+            return ""
+        return "  Overscan %g%% → %d×%d" % ((round(osc * 100.0, 2),) + core.overscan_size(w, h, osc))
 
     def _resolve_name(self, template, camera, seq):
         """ファイル名テンプレートを 現在のレベル名 / カット番号 / カメラ / シーケンス で解決する。
@@ -3729,11 +3769,6 @@ class CaptureWindow(object):
                 "res_mode": self.res_mode.get(),
                 "w": self.w_var.get(), "h": self.h_var.get(),
                 "aa": self.aa_var.get(),
-                "overscan": self.overscan_var.get(),
-                "overscan_on": self.overscan_on_var.get(),
-                "overscan_mode": self.overscan_mode_var.get(),
-                "overscan_x": self.overscan_x_var.get(),
-                "overscan_y": self.overscan_y_var.get(),
                 "aspect_lock": self.aspect_lock_var.get(),
                 "out": self.out_var.get(),
                 "name_tpl": self.name_tpl_var.get(),
@@ -3817,12 +3852,6 @@ class CaptureWindow(object):
         _setvar(self.res_mode, "res_mode")
         _setvar(self.w_var, "w"); _setvar(self.h_var, "h")
         _setvar(self.aa_var, "aa")
-        _setvar(self.overscan_var, "overscan")
-        _setvar(self.overscan_on_var, "overscan_on")
-        if st.get("overscan_mode") in ("percent", "pixels"):
-            self.overscan_mode_var.set(st["overscan_mode"])
-        _setvar(self.overscan_x_var, "overscan_x")
-        _setvar(self.overscan_y_var, "overscan_y")
         _setvar(self.aspect_lock_var, "aspect_lock")
         _setvar(self.out_var, "out")
         if "name_tpl" in st:

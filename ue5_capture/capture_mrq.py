@@ -624,6 +624,8 @@ def _restore_saved_scene(st):
         _run("pie_levels", st["pie_levels"]["stop"])
     if st.get("pie_mblur"):
         _run("pie_mblur", st["pie_mblur"]["stop"])
+    if st.get("pie_overscan"):
+        _run("pie_overscan", st["pie_overscan"]["stop"])
     _run("hidden", _unhide)
     if st.get("matte"):
         _run("matte", lambda: _restore_matte_render_mode(st["matte"]))
@@ -754,6 +756,7 @@ def render_beauty(camera_actor, output_dir, width, height,
     _KEEP["restore"] = _restore_scene
     try:
         st["pie_levels"] = _start_pie_level_shower()
+        st["pie_overscan"] = _start_pie_overscan(overscan)
         if hidden_actors:
             st["hidden"] = _hide_actors(hidden_actors)
             # PIE 側は元々 hidden だったものも含めて全指定を隠す（LevelInstance 内は
@@ -912,12 +915,7 @@ def _start_render(sub, camera_actor, output_dir, width, height,
     except Exception as e:
         _warn("AA を TSR に設定できません（エンジン既定の AA で続行）: %s" % e)
 
-    # Overscan（元カメラを変えずレンダ時だけ余白を追加。解像度も増える＝周囲にピクセルを足す）
-    if overscan and float(overscan) > 0.0:
-        camset = cfg.find_or_add_setting_by_class(unreal.MoviePipelineCameraSetting)
-        camset.set_editor_property("override_camera_overscan", True)
-        camset.set_editor_property("overscan_percentage", float(overscan))
-        _log("overscan = %.1f%%" % (float(overscan) * 100.0))
+    _apply_overscan_setting(cfg, overscan)
 
     if viewport_look:
         _set_viewport_look_overrides(cfg)
@@ -1549,6 +1547,75 @@ def _start_pie_motion_blur_off():
     return state
 
 
+def _start_pie_overscan(overscan):
+    """カメラの Overscan を、広げた解像度の全面に写すための PIE 側ウォッチャ。
+    MRQ はカメラの Overscan で広げた分を PNG / JPG / MP4 では切り落として書く（残るのは EXR の
+    data window だけ。MoviePipelineOutputBase::ShouldCropOverscanImpl）。そこで MRQ の Overscan は
+    0 で上書きして（_apply_overscan_setting）、代わりに PIE 側の全 CineCamera の filmback を
+    (1+overscan) 倍にして視錐台を広げ、出力解像度は呼び側が広げて渡す。スポーナブルは後から
+    出るので毎 tick 見て、広げた後の値と違うカメラ（新しく出た・シーケンサが戻した）だけ広げる。
+    PIE は破棄されるので復元不要。overscan が 0 なら None。"""
+    o = float(overscan or 0.0)
+    if o <= 0.0:
+        return None
+    state = {"h": None, "seen": False, "done": {}}      # done: カメラのパス -> 広げた後の幅
+
+    def _stop():
+        h = state.pop("h", None)
+        if h is not None:
+            try:
+                unreal.unregister_slate_post_tick_callback(h)
+            except Exception:
+                pass
+
+    def _tick(dt):
+        try:
+            pie = unreal.get_editor_subsystem(
+                unreal.UnrealEditorSubsystem).get_game_world()
+        except Exception:
+            pie = None
+        if pie is None:
+            if state["seen"]:
+                if not state["done"]:
+                    _warn("Overscan: PIE 側に CineCamera が見つからず、画角を広げられませんでした")
+                _stop()        # PIE が終わった → 監視終了
+            return
+        state["seen"] = True
+        try:
+            for a in unreal.GameplayStatics.get_all_actors_of_class(pie, unreal.CineCameraActor):
+                key = a.get_path_name()
+                comp = a.get_editor_property("camera_component")
+                fb = comp.get_editor_property("filmback")
+                sw = float(fb.get_editor_property("sensor_width"))
+                if abs(sw - state["done"].get(key, -1.0)) < 1e-4:
+                    continue
+                fb.set_editor_property("sensor_width", sw * (1.0 + o))
+                fb.set_editor_property("sensor_height",
+                                       float(fb.get_editor_property("sensor_height")) * (1.0 + o))
+                comp.set_editor_property("filmback", fb)
+                if not state["done"]:
+                    _log("Overscan %.1f%%: PIE 側のカメラの filmback を広げた" % (o * 100.0))
+                state["done"][key] = float(comp.get_editor_property("filmback")
+                                           .get_editor_property("sensor_width"))
+        except Exception as e:
+            _core._warn_once("pie_overscan", "Overscan: PIE 側の設定に失敗: %s" % e)
+
+    state["h"] = unreal.register_slate_post_tick_callback(_tick)
+    state["stop"] = _stop
+    return state
+
+
+def _apply_overscan_setting(cfg, overscan):
+    """overscan > 0 のとき、MRQ がカメラの Overscan を使わないよう 0 で上書きする
+    （使わせると解像度をさらに広げたうえで切り落とす。_start_pie_overscan 参照）。"""
+    if not overscan or float(overscan) <= 0.0:
+        return
+    camset = cfg.find_or_add_setting_by_class(unreal.MoviePipelineCameraSetting)
+    camset.set_editor_property("override_camera_overscan", True)
+    camset.set_editor_property("overscan_percentage", 0.0)
+    _log("overscan = %.1f%%（解像度は呼び側で拡大済み）" % (float(overscan) * 100.0))
+
+
 def _start_pie_actor_hider(actors):
     """hidden_actors を PIE ワールド側でも隠すウォッチャ。LevelInstance 内包アクターは
     PIE で資産から再生成されるため、エディタ側の set_actor_hidden_in_game が伝搬しない
@@ -2031,7 +2098,7 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
                     backing_actors=None, backing_white=False, use_exr=False,
                     sky_matte=False, pp_materials_off=False,
                     image_format=None, also_png=False, viewport_look=False,
-                    exposure_offset_ev=None):
+                    exposure_offset_ev=None, overscan=0.0):
     """開いている/指定の LevelSequence を MRQ でレンダリング（非同期）。
     viewport_look=True は「ビューポートのルック」の MRQ 近似（render_beauty と同じ規則。
     カメラはカメラカットのカメラ、レベル可視性はシーケンス自身のまま）。
@@ -2096,6 +2163,7 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
     try:
         st["pie_levels"] = _start_pie_level_shower()
         st["pie_mblur"] = _start_pie_motion_blur_off()
+        st["pie_overscan"] = _start_pie_overscan(overscan)
         if matte_material is not None or matte_sil_material is not None:
             st["matte"] = _set_matte_render_mode(matte_actors)
         if hidden_actors:
@@ -2146,7 +2214,8 @@ def render_sequence(level_sequence, output_dir, width, height, name_body, take_s
                                       pp_materials_off=pp_materials_off,
                                       image_format=image_format, also_png=also_png,
                                       viewport_look=viewport_look,
-                                      exposure_offset_ev=exposure_offset_ev)
+                                      exposure_offset_ev=exposure_offset_ev,
+                                      overscan=overscan)
     except Exception:
         _restore_scene()
         if near_clip_cm is not None:
@@ -2169,7 +2238,7 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
                            geomask_material=None,
                            backing=False, use_exr=False, sky_matte=False,
                            pp_materials_off=False, image_format=None, also_png=False,
-                           viewport_look=False, exposure_offset_ev=None):
+                           viewport_look=False, exposure_offset_ev=None, overscan=0.0):
     queue = sub.get_queue()
     _backup_and_clear_queue(queue)
     job = queue.allocate_new_job(unreal.MoviePipelineExecutorJob)
@@ -2230,6 +2299,7 @@ def _start_sequence_render(sub, level_sequence, output_dir, width, height,
     out = cfg.find_or_add_setting_by_class(unreal.MoviePipelineOutputSetting)
     out.set_editor_property("output_directory", unreal.DirectoryPath(output_dir))
     out.set_editor_property("output_resolution", unreal.IntPoint(int(width), int(height)))
+    _apply_overscan_setting(cfg, overscan)
     # フレームレートはシーケンスの Display Rate を明示指定する（既定継承に任せず
     # 24fps 等を確実に反映。エンコード側も同じ値を使う）
     try:

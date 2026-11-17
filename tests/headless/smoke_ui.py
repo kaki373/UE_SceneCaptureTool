@@ -523,6 +523,49 @@ def _cut_lookup():
 step("_camera_cut_camera_for_frame / _sequence_camera_at", _cut_lookup)
 
 
+def _overscan_ui():
+    # the tool has no overscan inputs of its own: the camera's Overscan is the only source
+    assert not hasattr(win, "overscan_on_var") and not hasattr(win, "overscan_var")
+    p = win._settings_path()
+    win._save_ui_state()
+    with open(p, "r", encoding="utf-8") as f:
+        st = json.load(f)
+    assert not [k for k in st if k.startswith("overscan")], st.keys()
+    st.update({"overscan": "10", "overscan_on": True, "overscan_mode": "pixels",
+               "overscan_x": "64", "overscan_y": "36"})        # keys written by older versions
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(st, f)
+    win._load_ui_state()
+    comp = cam.camera_component
+    res = {"none": win._overscan_note(cam, 1920, 1080)}
+    assert res["none"] == ""
+    comp.set_editor_property("overscan", 0.1)
+    try:
+        res["note"] = win._overscan_note(cam, 1920, 1080)
+        assert "10%" in res["note"] and "2112×1188" in res["note"], res
+        win.cam_var.set("SmokeCam")
+        win._update_cam_res()
+        res["still_label"] = win.cam_res_var.get()
+        assert "Overscan 10%" in res["still_label"], res
+        # cam (cut 1) has Overscan 0.1, cam2 (cut 2) has none
+        osc, err = win._seq_overscan(seq, 0, 48)
+        res["seq"] = (osc, err)
+        if ui.CaptureWindow._camera_cut_camera_for_frame(seq, 30) is not None:
+            assert abs(osc - 0.1) < 1e-6 and err and "F24" in err, res
+            osc1, err1 = win._seq_overscan(seq, 0, 24)        # one cut only -> fine
+            assert abs(osc1 - 0.1) < 1e-6 and err1 is None, (osc1, err1)
+        else:
+            assert err is None, res          # headless fallback resolves one camera for all cuts
+    finally:
+        comp.set_editor_property("overscan", 0.0)
+        os.remove(p)             # do not leave settings for the next run
+    return res
+
+
+step("camera Overscan: no tool inputs / old settings keys ignored / label / per-cut mismatch stops",
+     _overscan_ui)
+
+
 def _vp_no_probe():
     # 露出合わせの試し撮り/参照撮影は廃止。静止画のビューポート撮影は「パイロット中」のときだけ
     assert not hasattr(win, "_seq_vp_calibrate") and not hasattr(ui, "_VPCAL_PROBE_DIR")

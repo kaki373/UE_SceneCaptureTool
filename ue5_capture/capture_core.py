@@ -20,6 +20,7 @@ UE の RenderTarget は全画素を Python から高速に読み取る API が�
 import os
 import re
 import math
+import struct
 import uuid
 import datetime
 
@@ -159,7 +160,6 @@ class CaptureSettings(object):
         self.objid_fill_alpha = False      # Fill + Object ID カバレッジをアルファにした RGBA も出力
         self.objid_hide_render = False     # Object ID 対象を非表示にして Fill をレンダリング
         self.do_behind_matte = False       # マット対象の向こう側だけ（窓抜き）。Beauty合成は MRQ 側
-        self.overscan = 0.0                # オーバースキャン率 f（FOVを(1+f)倍に広げる。解像度は呼び側で×(1+f)）
         self.fog_off = False               # True で Fog を OFF にして書き出す
 
         self.depth_bit = "16bit"           # "8bit"(PNG) / "16bit"(PNG) / "exr"(float)
@@ -246,25 +246,37 @@ def _camera_component(camera_actor):
     return camera_actor.camera_component
 
 
-def set_camera_overscan_filmback(camera_actor, fx, fy):
-    """カメラの filmback を 横×(1+fx)/縦×(1+fy) に拡大して overscan（縦横独立可）。
-    焦点距離は変えないので FOV が広がり、元フレームは中央に保たれる。元の (sw,sh) を返す。"""
-    comp = camera_actor.camera_component
-    fb = comp.get_editor_property("filmback")
-    sw = float(fb.get_editor_property("sensor_width"))
-    sh = float(fb.get_editor_property("sensor_height"))
-    fb.set_editor_property("sensor_width", sw * (1.0 + float(fx)))
-    fb.set_editor_property("sensor_height", sh * (1.0 + float(fy)))
-    comp.set_editor_property("filmback", fb)
-    return (sw, sh)
+def camera_overscan(camera_actor):
+    """カメラコンポーネントの Overscan（0〜1。0.1 = 視錐台を 10% 広げる）。無ければ 0。
+    シーケンサでキーが打たれていれば、いま評価されている値が返る。"""
+    try:
+        o = float(_camera_component(camera_actor).get_editor_property("overscan"))
+    except Exception:
+        return 0.0
+    return min(max(o, 0.0), 1.0)
 
 
-def restore_camera_filmback(camera_actor, sw, sh):
-    comp = camera_actor.camera_component
-    fb = comp.get_editor_property("filmback")
-    fb.set_editor_property("sensor_width", float(sw))
-    fb.set_editor_property("sensor_height", float(sh))
-    comp.set_editor_property("filmback", fb)
+def _f32(x):
+    return struct.unpack("f", struct.pack("f", float(x)))[0]
+
+
+def overscan_size(width, height, overscan):
+    """Overscan 込みの出力サイズ。MRQ（ScaleResolutionByOverscan）と同じく単精度で掛けて切り上げる
+    （カメラの値は単精度。倍精度で掛けると 1920×1.1 が 2112.000003 になり 1px 増える）。"""
+    o = min(max(float(overscan or 0.0), 0.0), 1.0)
+    if o <= 0.0:
+        return int(width), int(height)
+    scale = _f32(1.0 + _f32(o))
+    return (int(math.ceil(_f32(int(width) * scale))),
+            int(math.ceil(_f32(int(height) * scale))))
+
+
+def overscan_fov(fov_deg, overscan):
+    """水平 FOV を Overscan 分だけ広げる（視錐台＝tan(半角) を (1+o) 倍。エンジンと同じ式）。"""
+    o = float(overscan or 0.0)
+    if o <= 0.0:
+        return float(fov_deg)
+    return 2.0 * math.degrees(math.atan((1.0 + o) * math.tan(math.radians(float(fov_deg)) * 0.5)))
 
 
 # ----------------------------------------------------------------------------
@@ -494,9 +506,14 @@ def get_camera_settings(camera_actor):
                 asp = float(fb.get_editor_property("sensor_width")) / sh
         except Exception:
             pass
+    # field_of_view は Overscan を含まない（CineCamera は filmback と焦点距離だけから出す）。
+    # SceneCapture 系はここの fov だけを写すので、カメラの Overscan をここで足す
+    # （解像度は呼び側が overscan_size で広げる。MRQ 側は capture_mrq の overscan 引数）。
+    osc = camera_overscan(camera_actor)
     return {
         "transform": camera_actor.get_actor_transform(),
-        "fov": float(cam_comp.get_editor_property("field_of_view")),
+        "fov": overscan_fov(cam_comp.get_editor_property("field_of_view"), osc),
+        "overscan": osc,
         "aspect_ratio": asp,
         "post_process": cam_comp.get_editor_property("post_process_settings"),
     }
@@ -3678,8 +3695,7 @@ def run_capture(settings):
 
     cam = get_camera_settings(settings.camera_actor)
     w, h = _resolve_resolution(settings, cam)
-    # Overscan はカメラの filmback を呼び側で一時拡大して実現するため、ここでは何もしない
-    # （get_camera_settings が拡大後の FOV を読み、RT のアスペクトで縦横が決まる）。
+    # カメラの Overscan は get_camera_settings が fov に足す。解像度は呼び側が広げて渡す。
     ts = settings.take_suffix or _timestamp()
     spawned = []
     outputs = []

@@ -305,6 +305,61 @@ def _mrq_seq():
 
 
 step("MRQ _start_sequence_render job build (PNG+MP4, render intercepted)", _mrq_seq)
+
+
+def _mrq_overscan():
+    real = unreal.get_editor_subsystem(unreal.MoviePipelineQueueSubsystem)
+    fs = _FakeSub(real)
+
+    def _chk(cond, msg):
+        assert cond, msg
+
+    def _camset(o_still, o_seq):
+        out = []
+        for still in (True, False):
+            try:
+                if still:
+                    mrq._start_render(fs, cam, os.path.join(OUTD, "smoke_mrq_osc"), 704, 396,
+                                      False, "png", False, 1, 4, 8, "Smoke", None, None, o_still,
+                                      True, None)
+                else:
+                    mrq._start_sequence_render(
+                        fs, scene_seq, os.path.join(OUTD, "smoke_mrq_osc"), 704, 396,
+                        "Smoke", "001", True, False, 18, 4, 8, None, None,
+                        None, None, None, None, None,
+                        None, "Beauty", False, None, None, overscan=o_seq)
+                cfg = real.get_queue().get_jobs()[0].get_configuration()
+                cs = cfg.find_setting_by_class(unreal.MoviePipelineCameraSetting)
+                res = cfg.find_setting_by_class(
+                    unreal.MoviePipelineOutputSetting).get_editor_property("output_resolution")
+                out.append((None if cs is None else
+                            (cs.get_editor_property("override_camera_overscan"),
+                             cs.get_editor_property("overscan_percentage")), res.x, res.y))
+            finally:
+                mrq._KEEP.clear()
+                for j in list(real.get_queue().get_jobs()):
+                    real.get_queue().delete_job(j)
+                mrq._delete_temp_sequence()
+        return out
+
+    # overscan > 0: MRQ must ignore the camera's Overscan (it would enlarge and then crop);
+    # the caller's resolution is used as is
+    on = _camset(0.1, 0.1)
+    _chk(on == [((True, 0.0), 704, 396)] * 2, on)
+    off = _camset(0.0, 0.0)
+    _chk(all(c is None or c[0] is False for c, _, _ in off), off)
+    _chk(mrq._start_pie_overscan(0.0) is None, "watcher without overscan")
+    st = mrq._start_pie_overscan(0.1)
+    try:
+        _chk(st is not None and st["h"] is not None, st)
+    finally:
+        st["stop"]()
+    _chk("h" not in st, st)
+    return on, off
+
+
+step("camera Overscan: MRQ camera overscan overridden to 0 / PIE watcher start-stop",
+     _mrq_overscan)
 step("LevelSequenceEditorBlueprintLibrary.get_current_time (deprecated API, no seq open)",
      lambda: unreal.LevelSequenceEditorBlueprintLibrary.get_current_time())
 step("cloud_matte_holdout_ready()", mrq.cloud_matte_holdout_ready)

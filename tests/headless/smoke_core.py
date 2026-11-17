@@ -87,6 +87,39 @@ step("list_cameras() after spawn (expect ['SmokeCam'])",
      lambda: [c.get_actor_label() for c in core.list_cameras()])
 step("get_camera_settings",
      lambda: {k: v for k, v in core.get_camera_settings(cam).items() if k != "transform"})
+
+
+def _overscan_core():
+    import math
+    comp = cam.camera_component
+    # a freshly spawned camera reports the default 90 until a property edit recalculates it
+    comp.set_editor_property("overscan", 0.05)
+    comp.set_editor_property("overscan", 0.0)
+    base = float(comp.get_editor_property("field_of_view"))
+    assert core.camera_overscan(cam) == 0.0, core.camera_overscan(cam)
+    assert core.get_camera_settings(cam)["fov"] == base, (core.get_camera_settings(cam)["fov"], base)
+    comp.set_editor_property("overscan", 0.1)
+    try:
+        osc = core.camera_overscan(cam)
+        assert abs(osc - 0.1) < 1e-6, osc
+        # field_of_view must not include the overscan (get_camera_settings adds it)
+        fov1 = float(comp.get_editor_property("field_of_view"))
+        assert abs(fov1 - base) < 1e-4, (fov1, base)
+        cs = core.get_camera_settings(cam)
+        want = 2.0 * math.degrees(math.atan(1.1 * math.tan(math.radians(base) / 2.0)))
+        assert abs(cs["fov"] - want) < 1e-3 and abs(cs["overscan"] - 0.1) < 1e-6, cs["fov"]
+    finally:
+        comp.set_editor_property("overscan", 0.0)
+    assert core.overscan_size(1920, 1080, osc) == (2112, 1188), core.overscan_size(1920, 1080, osc)  # as MRQ
+    assert core.overscan_size(1920, 1080, 0.0) == (1920, 1080)
+    assert core.overscan_size(1000, 500, 0.0333) == (1034, 517)     # ceil, like MRQ
+    assert core.overscan_size(640, 360, 5.0) == (1280, 720)         # clamped to 1.0
+    assert core.overscan_fov(90.0, 1.0) > 126.8 and core.overscan_fov(90.0, 0.0) == 90.0
+    return base, want
+
+
+step("camera Overscan: camera_overscan / fov widened in get_camera_settings / overscan_size",
+     _overscan_core)
 step("is_volumetric_actor(cube)", lambda: core.is_volumetric_actor(cube))
 step("level_has_volumetrics()", core.level_has_volumetrics)
 
