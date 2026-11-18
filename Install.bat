@@ -6,7 +6,8 @@ rem  Supported engines: Unreal Engine 5.7 / 5.8
 rem
 rem  Usage:
 rem    Install.bat                          interactive
-rem    Install.bat "<dir>\Foo.uproject" ... configure these projects (drag and drop
+rem    Install.bat "<dir>\Foo.uproject" ... configure these projects (optional; a
+rem                                         double-click lists them to choose from;
 rem                                         works); the engine matching the
 rem                                         project's EngineAssociation is used
 rem    Install.bat "<engine root>"          force an engine, e.g.
@@ -121,7 +122,7 @@ echo UE Scene Capture Tool installer  v%VER%   (Unreal Engine 5.7 / 5.8)
 echo.
 echo   Install.bat                         interactive
 echo   Install.bat "path\Foo.uproject"     enable the plugins in this project
-echo                                       (drag and drop a .uproject onto Install.bat)
+echo                                       (optional: a double-click lists the projects)
 echo   Install.bat "engine root"           force an engine, e.g. "D:\UE_5.8"
 echo   Install.bat --yes [--no-pause]      unattended
 echo   Install.bat --dry-run               show what would be done, write nothing
@@ -1026,8 +1027,27 @@ def check_project_engine(uproject, ready_versions):
             % (assoc, SUPPORTED_LABEL))
     elif v not in ready_versions:
         out("  [注意] このプロジェクトは UE %s 用ですが、そのエンジンにはライブラリを"
-            "入れていません。Install.bat にこの .uproject をドロップして"
-            "実行し直してください。" % assoc)
+            "入れていません。Install.bat を実行し直し、エンジンの確認で"
+            "「これらにもライブラリを入れますか」に y で答えてください。" % assoc)
+
+
+def pick_uproject():
+    """ファイル選択ダイアログで .uproject を選ばせる。出せなければパスを入力させる。"""
+    try:
+        import tkinter
+        from tkinter import filedialog
+        root = tkinter.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        try:
+            p = filedialog.askopenfilename(
+                parent=root, title="プロジェクトの .uproject を選ぶ",
+                filetypes=[("Unreal Project", "*.uproject")])
+        finally:
+            root.destroy()
+        return os.path.normpath(p) if p else ""
+    except Exception:
+        return ask(".uproject のパスを入力: ", "").strip().strip('"')
 
 
 def setup_projects(engines, explicit, tool_dir, ready_versions):
@@ -1038,18 +1058,16 @@ def setup_projects(engines, explicit, tool_dir, ready_versions):
     out("")
 
     projects = find_projects(engines, explicit)
-    if not projects:
-        out("プロジェクトが見つかりませんでした。")
-        out("あとで Install.bat に .uproject をドラッグ＆ドロップすれば設定できます。")
-        return "skip"
 
     if explicit:
         want = {os.path.normcase(os.path.normpath(x)) for x in explicit}
         targets = [p for p, _n in projects if os.path.normcase(p) in want]
     else:
-        out("設定するプロジェクトを選んでください（プラグインが無効だと"
-            "ツールは動きません）:")
-        rows = []
+        rows, need = [], []
+        if projects:
+            out("このPCで最近開いたプロジェクト:")
+        else:
+            out("最近開いたプロジェクトは見つかりませんでした。")
         for i, (path, note) in enumerate(projects, 1):
             _d, state = project_plugin_state(path)
             if state is None:
@@ -1058,24 +1076,48 @@ def setup_projects(engines, explicit, tool_dir, ready_versions):
                 mark = "設定済み"
             else:
                 mark = "要設定"
+                need.append(path)
             rows.append(path)
             assoc = project_association(path) or "?"
             out("  %2d) [%s] %s  (%s / EngineAssociation=%s)" % (i, mark, path, note, assoc))
         out("")
-        out("  番号をカンマ区切りで指定 / a=すべて / 空 Enter=スキップ")
-        a = ask("選択 [空=スキップ]: ", "").lower()
-        if not a:
-            out("スキップしました。")
-            return "skip"
-        if a == "a":
-            targets = rows
+        if need:
+            out("[要設定] のプロジェクトでは、プラグインを有効にするまでメニューが出ません。")
+            out("  このツールを使うプロジェクトの番号（カンマ区切り）/ f=一覧に無い"
+                " .uproject を選ぶ / s=何もしない")
+            prompt = "選択: "
         else:
-            targets = []
-            for tok in re.split(r"[,\s]+", a):
-                try:
-                    targets.append(rows[int(tok) - 1])
-                except Exception:
-                    pass
+            if projects:
+                out("どれも設定済みです。そのまま Enter で完了します。")
+            out("  f=一覧に無い .uproject を選ぶ / Enter=何もしない")
+            prompt = "選択 [Enter=何もしない]: "
+        targets = []
+        for _try in range(2):                          # 入力が来ない環境で回り続けない
+            a = ask(prompt, "").strip().strip('"')
+            low = a.lower()
+            if low == "f":
+                a = pick_uproject()
+                low = a.lower()
+            if low.endswith(".uproject"):              # パスの貼り付けも受ける
+                if os.path.isfile(a):
+                    targets = [os.path.normpath(a)]
+                    break
+                out("  見つかりません: %s" % a)
+                continue
+            if low == "a":
+                targets = rows
+            else:
+                for tok in re.split(r"[,\s]+", low):
+                    if tok.isdigit() and 1 <= int(tok) <= len(rows):
+                        targets.append(rows[int(tok) - 1])
+            if targets or low == "s" or not need or AUTO_YES:
+                break
+            out("  番号か f か s を入れてください。")
+        if not targets:
+            if need:
+                out("スキップしました。")
+                return "skip"
+            return "ok" if projects else "skip"
 
     if not targets:
         out("対象なし。")

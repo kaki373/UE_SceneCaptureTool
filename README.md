@@ -91,8 +91,8 @@ python.exe を使う:
 （ローカルでも共有ドライブでも可。日本語やスペースを含むパスも可）。
 
 ```
-Install.bat                                # 対話（プロジェクトは一覧から選ぶ）
-Install.bat "<dir>\Foo.uproject"           # .uproject をドラッグ＆ドロップしてもよい
+Install.bat                                # ダブルクリックでよい（プロジェクトは一覧から選ぶ。一覧に無ければ f でファイルを選ぶ）
+Install.bat "<dir>\Foo.uproject"           # プロジェクトを引数で渡す（省略可）
 Install.bat --yes --no-pause               # 無人実行（.uproject 指定が無ければプロジェクト設定はスキップ）
 Install.bat "C:\Program Files\Epic Games\UE_5.8"   # エンジンを明示指定
 Install.bat --dry-run                      # 何をするかだけ表示（何も書き込まない）
